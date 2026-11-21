@@ -182,7 +182,7 @@ grep -qF 'harness/soak/verdict.sh --dir "$OUT" --page "$PAGE" --drive-min "$DRIV
 # --- page=real's page source ---------------------------------------------------------------------
 check "the web job holds no secret" '.jobs.web | tojson | contains("secrets.") | not'
 check "it builds seazn.club at the plan's web_sha, without credentials" \
-  '[.jobs.web.steps[] | select(.with.repository == "onryde/seazn.club")] | length == 1
+  '[.jobs.web.steps[] | select(.with.repository == "seazn-club/seazn.club")] | length == 1
    and .[0].with.ref == "${{ needs.plan.outputs.web_sha }}" and .[0].with["persist-credentials"] == false'
 check "web_sha's default is 40 hex" '((.on // .["true"]).workflow_dispatch.inputs.web_sha.default | test("^[0-9a-f]{40}$"))'
 args="$(jq -r '.jobs.plan.steps[] | select(.id == "args") | .run' "$W/wf.json")"

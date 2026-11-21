@@ -267,7 +267,7 @@ fn the_vendored_contract_is_the_one_web_pins() {
     );
     let pins: Value =
         serde_json::from_str(&std::fs::read_to_string(root().join("VENDORED.json")).unwrap()).unwrap();
-    assert_eq!(pins["source"], "onryde/seazn.club");
+    assert_eq!(pins["source"], "seazn-club/seazn.club");
     let commit = pins["commit"].as_str().unwrap();
     assert!(
         commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),

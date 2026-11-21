@@ -9,7 +9,7 @@ A blob line is BuildKit's progress line `#17 sha256:<digest> 1.86GB / 1.86GB 543
 are decimal (1 GB = 10^9 bytes, docker/go-units' HumanSize), and the line belongs to the step whose
 start and end hold its timestamp.
 
-Usage: cache_timing.py [--repo onryde/seazn.club.compositor] RUN_ID [RUN_ID ...]
+Usage: cache_timing.py [--repo seazn-club/seazn.club.compositor] RUN_ID [RUN_ID ...]
        cache_timing.py --self-test     (check.yml)
 """
 
@@ -114,7 +114,7 @@ def self_test():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default="onryde/seazn.club.compositor")
+    ap.add_argument("--repo", default="seazn-club/seazn.club.compositor")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("runs", nargs="*")
     a = ap.parse_args()

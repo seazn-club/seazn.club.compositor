@@ -87,7 +87,7 @@
 # otherwise: a stale RELAY_REGISTRY in the operator's shell would set RELAY_IMAGE at another host.
 set -euo pipefail
 
-REPO=onryde/seazn.club.compositor
+REPO=seazn-club/seazn.club.compositor
 SERVER=https://github.com
 self=${BASH_SOURCE[0]}
 

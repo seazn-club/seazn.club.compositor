@@ -212,7 +212,7 @@ expect_red "(4) deploy-prod's CEF bump gate deleted" 'deploy-prod.yml (CEF bump 
 fresh; edit "$W/wf/$STG" '          load: true
           push: false' '          load: true
           push: false
-          cache-from: type=registry,ref=ghcr.io/onryde/seazn-relay-cache:cef-x'
+          cache-from: type=registry,ref=ghcr.io/seazn-club/seazn-relay-cache:cef-x'
 expect_red "(5) deploy-stg reads seazn-relay-cache" 'deploy-stg.yml names the CI build cache'
 
 # (6) target: relay-test-hooks in deploy-stg.yml.
@@ -1256,7 +1256,7 @@ B_NEW='{"m":"main build of c"}' B_OLD='{"m":"main build of a"}' B_PROD='{"m":"re
 B_ANY='{"m":"some other push"}' B_SQ='{"m":"a squat"}' B_GONE='{"m":"deleted since"}' B_MISSING='{"m":"never pushed"}'
 D_NEW=sha256:$(sha_hex "$B_NEW") D_OLD=sha256:$(sha_hex "$B_OLD") D_PROD=sha256:$(sha_hex "$B_PROD")
 D_ANY=sha256:$(sha_hex "$B_ANY") D_SQ=sha256:$(sha_hex "$B_SQ") D_GONE=sha256:$(sha_hex "$B_GONE") D_MISSING=sha256:$(sha_hex "$B_MISSING")
-REPO=onryde/seazn.club.compositor
+REPO=seazn-club/seazn.club.compositor
 WFURL=https://github.com/$REPO/.github/workflows
 ID_STG="$WFURL/deploy-stg.yml@refs/heads/main"
 READ_TOKEN='FlyV1 fm2_fakeReadToken7f3a+/=,x'
@@ -1296,7 +1296,7 @@ state() {
 run_step() {
   local script=$1; shift
   if (cd "${STEP_DIR:-$g}" && env -i PATH="$W/bin:$PATH" HOME="$W" RUNNER_TEMP="$W/rt" GITHUB_STEP_SUMMARY="$W/summary" \
-    GITHUB_OUTPUT="$W/output" GITHUB_REPOSITORY=onryde/seazn.club.compositor GITHUB_RUN_ID=999 GITHUB_SERVER_URL=https://github.com \
+    GITHUB_OUTPUT="$W/output" GITHUB_REPOSITORY=seazn-club/seazn.club.compositor GITHUB_RUN_ID=999 GITHUB_SERVER_URL=https://github.com \
     GITHUB_REF=refs/heads/main GITHUB_SHA="$H" STATE="$STATE" RELAY_REGISTRY="$REG" GH_TOKEN=fake-gh \
     EXPECT_PUSH=fake-stg-push "$@" \
     bash --noprofile --norc -eo pipefail "$script") > "$W/step.out" 2>&1; then rc=0; else rc=$?; fi
@@ -1563,7 +1563,7 @@ git clone -q "$g" "$W/step-notags"; git -C "$W/step-notags" tag -l | xargs git -
 git clone -q "$g" "$W/main-at-c"; git -C "$W/main-at-c" update-ref refs/heads/main "$C"
 git clone -q "$g" "$W/step-c"; git -C "$W/step-c" remote set-url origin "$W/main-at-c"
 # Each track step's own check of the old tag (the PR #94 review's item 3), as its argv is logged.
-RE_PROD_TAGS='^https://github\.com/onryde/seazn\.club\.compositor/\.github/workflows/deploy-prod\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+RE_PROD_TAGS='^https://github\.com/seazn-club/seazn\.club\.compositor/\.github/workflows/deploy-prod\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
 # The track steps: each moves its tag to the DIGEST it is given (the record check's output), never to what
 # TAG names now (here a squat moved the sha's, or the release's, tag first); only when this build is the
 # newest (stg: main's tip; prod: the highest release tag); and after checking the old tag is main's own.
@@ -2163,8 +2163,8 @@ refused_before_web "P17 (I-4): prod refuses a digest whose only record is stg's 
 # tag's current digest verifies as main's build, field by field like a pin (P17's), plus the commit's
 # place on main and its CEF bump gate. Base state: :beta names $OLD's build (D_OLD), :stable v1.2.3's.
 track_value="$REG/seazn-relay-stg:beta" stable_value="$REG/seazn-relay-prod:stable"
-RE_STG='^https://github\.com/onryde/seazn\.club\.compositor/\.github/workflows/deploy-stg\.yml@refs/heads/main$'
-RE_PROD='^https://github\.com/onryde/seazn\.club\.compositor/\.github/workflows/deploy-prod\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+RE_STG='^https://github\.com/seazn-club/seazn\.club\.compositor/\.github/workflows/deploy-stg\.yml@refs/heads/main$'
+RE_PROD='^https://github\.com/seazn-club/seazn\.club\.compositor/\.github/workflows/deploy-prod\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
 # TR1: stg, the happy path.
 state; promote_run -- stg --track beta
 if [ "$rc" -eq 0 ] && has "$STATE/log" "flyctl secrets set RELAY_IMAGE=$track_value -a seazn-club-stg --stage (token none)" \
