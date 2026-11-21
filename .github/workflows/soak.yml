@@ -264,7 +264,7 @@ jobs:
           ref: ${{ needs.plan.outputs.sha }}
       - uses: actions/checkout@v4
         with:
-          repository: onryde/seazn.club
+          repository: seazn-club/seazn.club
           ref: ${{ needs.plan.outputs.web_sha }}
           path: web
           persist-credentials: false

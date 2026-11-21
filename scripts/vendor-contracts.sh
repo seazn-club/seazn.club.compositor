@@ -14,6 +14,6 @@ cp -R "$tmp/docs/contracts/." "$here/contracts/"
 # LC_ALL=C: the pin order is byte order on every machine.
 ( cd "$here/contracts" && find . -type f ! -name VENDORED.json | LC_ALL=C sort | while read -r f; do
     printf '    "%s": "%s",\n' "${f#./}" "$(shasum -a 256 "$f" | cut -d' ' -f1)"; done ) > "$tmp/pins"
-{ echo '{'; echo "  \"source\": \"onryde/seazn.club\","; echo "  \"commit\": \"$sha\","; echo '  "files": {';
+{ echo '{'; echo "  \"source\": \"seazn-club/seazn.club\","; echo "  \"commit\": \"$sha\","; echo '  "files": {';
   sed '$ s/,$//' "$tmp/pins"; echo '  }'; echo '}'; } > "$here/contracts/VENDORED.json"
 echo "vendored $(grep -c '": "' "$tmp/pins") files at $sha"
