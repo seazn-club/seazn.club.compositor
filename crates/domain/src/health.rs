@@ -3,6 +3,7 @@
 //! `None` until it is known, never defaulted (plan: "omitted when not measured, never sent as 0").
 use std::fmt;
 
+use crate::input_link::GiveUp;
 use crate::ladder::Rung;
 use crate::lifecycle::ExitReason;
 use crate::programme::ProgrammePhase;
@@ -111,4 +112,6 @@ pub struct HealthReport {
     pub phase_channel: Option<PhaseChannel>,
     /// `Some` on a `Stopped` beat only: the drain's or the exit's reason. `None` in every other state.
     pub exit: Option<ExitInfo>,
+    /// The last camera generation the input link gave up, and why (C2, S4); `None` until one is.
+    pub input_give_up: Option<GiveUp>,
 }

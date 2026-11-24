@@ -59,6 +59,7 @@ fn periodic(mark: u32) -> HealthReport {
         heartbeat_failures: mark,
         phase_channel: None,
         exit: None,
+        input_give_up: None,
     }
 }
 
@@ -74,7 +75,7 @@ fn final_beat(mark: u32) -> HealthReport {
 }
 
 fn beat(h: HealthReport) -> ControlRequest {
-    ControlRequest::Heartbeat(h, Measured::default())
+    ControlRequest::Heartbeat(h, Box::<Measured>::default())
 }
 
 /// What each completed beat carried: its mark, whether it was a final beat, and its moment ids.

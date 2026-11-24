@@ -39,6 +39,16 @@ pub const COMPOSITOR_FAKE_SPONSOR_LINE: &str = "COMPOSITOR_FAKE_SPONSOR_LINE";
 /// with it off.
 pub const RELAY_AIRINGS: &str = "RELAY_AIRINGS";
 
+/// C2 (S4): `1` puts the camera as the relay receives it on the heartbeat: why the last camera
+/// generation was given up (`inputGiveUpReason`, `inputGiveUpGen`) and the camera's received rates
+/// (`inputReceivedFps`, `inputReceivedKbps`). Off unless set, as `RELAY_AIRINGS` is and for the same
+/// reason: web's heartbeat is strict (its zod schema and the contract's `additionalProperties:
+/// false`), so a beat carrying them before web declares the keys (web task T44) is a 400 and the
+/// whole beat is lost. Web's runner copies it into each Machine's env only once T44 ships. The log
+/// lines (`input give up`, `input received`) are written whatever it says. Unset, empty or `0` is
+/// off; anything else is refused (78). Read in both modes.
+pub const RELAY_INPUT_BEAT: &str = "RELAY_INPUT_BEAT";
+
 /// Owed 82, a `test-hooks` build only (C14 case 16; owner option A, 2026-10-24): a count, `N`. The
 /// live graphics adapter's next `N` retired CEF teardowns never return (`hold_next_teardowns`), so
 /// the reaper kills and counts each as leaked as it would a real stuck one. Unset, empty or `0` holds
@@ -128,6 +138,8 @@ pub struct Env {
     pub hooks: TestHooks,
     /// `RELAY_AIRINGS`: the beats carry the sponsor airings (R4 task SC1).
     pub airings: bool,
+    /// `RELAY_INPUT_BEAT`: the beats carry the camera's keys (C2, S4).
+    pub input_beat: bool,
 }
 
 // The token prints as `****` (AGENTS.md §7); a fake start-failure text may carry a planted credential.
@@ -140,6 +152,7 @@ impl fmt::Debug for Env {
             .field("deadline_ms", &self.deadline_ms)
             .field("drivers", &self.drivers)
             .field("airings", &self.airings)
+            .field("input_beat", &self.input_beat)
             .finish_non_exhaustive()
     }
 }
@@ -219,6 +232,11 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
         Some("1") => true,
         Some(_) => return Err(EnvError::Invalid(RELAY_AIRINGS)),
     };
+    let input_beat = match get(RELAY_INPUT_BEAT).as_deref() {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(_) => return Err(EnvError::Invalid(RELAY_INPUT_BEAT)),
+    };
     Ok(Env {
         session_id,
         job_token,
@@ -229,6 +247,7 @@ pub fn parse(get: impl Fn(&str) -> Option<String>, release: bool) -> Result<Env,
         fake,
         hooks: test_hooks(&get)?,
         airings,
+        input_beat,
     })
 }
 

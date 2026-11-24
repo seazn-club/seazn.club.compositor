@@ -66,7 +66,7 @@ use crate::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
 use crate::health::{
     BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
 };
-use crate::input_link::{BuildFacts, InputAction, InputLink, InputState, LossReason, NudgeView};
+use crate::input_link::{BuildFacts, GiveUp, InputAction, InputLink, InputState, LossReason, NudgeView};
 use crate::ladder::{Ladder, Rung};
 use crate::lifecycle::{ExitReason, Lifecycle};
 use crate::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -321,6 +321,12 @@ impl Supervisor {
 
     pub fn input_generation(&self) -> u64 {
         self.input.generation()
+    }
+
+    /// The last camera generation the input link gave up, and why (C2, S4): the driver's log line
+    /// reads it, and the beat carries it (`HealthReport::input_give_up`).
+    pub fn input_give_up(&self) -> Option<GiveUp> {
+        self.input.last_give_up()
     }
 
     /// The input link's phone-live nudge as it stands (Owed 108 fix (b)): read by the driver's log
@@ -765,6 +771,7 @@ impl Supervisor {
             heartbeat_failures: self.heartbeat_failures,
             phase_channel: self.phase_channel,
             exit,
+            input_give_up: self.input.last_give_up(),
         }
     }
 }

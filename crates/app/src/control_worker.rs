@@ -41,7 +41,7 @@ use crate::ports::{
 /// The final-beat slot: the drain's beat, then a fatal error's during the drain.
 const FINAL_SLOT: usize = 2;
 
-type Beat = (HealthReport, Measured);
+type Beat = (HealthReport, Box<Measured>);
 
 /// The worker's count of final beats posted (their call returned), and the condvar `flush` waits on.
 #[derive(Default)]

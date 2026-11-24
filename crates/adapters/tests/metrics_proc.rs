@@ -224,6 +224,110 @@ fn the_beats_fps_is_the_frames_out_of_the_encoder_over_the_beat_window() {
     assert_eq!(checked, 3);
 }
 
+/// C2 (S4), the camera as received: the rates over the beat window from `CameraTotals` at chosen
+/// instants. Frames written over the window are its fps; bytes received over it, × 8 / 1000, rounded,
+/// its kbit/s. The first sample opens the window and reads nothing; a window with nothing received is
+/// a measured 0; a sample with no totals reads nothing and opens the window again. Each expected rate
+/// is the test's own rise over the test's own window.
+#[test]
+fn the_camera_rates_are_the_totals_rise_over_the_beat_window() {
+    use adapters::metrics_proc::CameraTotals;
+    use std::time::{Duration, Instant};
+    let mut m = ProcMetrics::new(Arc::new(Stats::default()));
+    let t0 = Instant::now();
+    let w = Duration::from_millis(2 * domain::config::OUTPUT_FPS_MIN_WINDOW_MS.max(1_000));
+    let secs = w.as_secs_f64();
+    let tot = |frames_written, bytes_received| {
+        Some(CameraTotals {
+            frames_written,
+            bytes_received,
+        })
+    };
+    let mut checked = 0;
+    assert_eq!(
+        m.camera_rates(t0, tot(100, 1_000_000)),
+        (None, None),
+        "the window opens"
+    );
+    let (fps, kbps) = m.camera_rates(t0 + w, tot(160, 1_500_000));
+    assert_eq!(fps, Some(60.0 / secs));
+    assert_eq!(kbps, Some((500_000.0 * 8.0 / 1_000.0 / secs).round() as u64));
+    assert_ne!(
+        fps,
+        Some(60.0),
+        "setup: a window that is not 1 s tells a rate from a count"
+    );
+    checked += 1;
+    assert_eq!(
+        m.camera_rates(t0 + 2 * w, tot(160, 1_500_000)),
+        (Some(0.0), Some(0)),
+        "nothing received for a window is a measured 0"
+    );
+    checked += 1;
+    assert_eq!(m.camera_rates(t0 + 3 * w, None), (None, None), "no totals");
+    assert_eq!(
+        m.camera_rates(t0 + 4 * w, tot(200, 2_000_000)),
+        (None, None),
+        "the window opens again"
+    );
+    checked += 2;
+    // No camera reader (fake mode): the sample carries neither rate.
+    let s = ProcMetrics::new(Arc::new(Stats::default())).sample();
+    assert_eq!((s.input_received_fps, s.input_received_kbps), (None, None));
+    checked += 1;
+    eprintln!("camera rate samples checked: {checked}");
+    assert_eq!(checked, 5);
+}
+
+/// C2 (S4), the seam: a reader `with_camera` is read by the real sampler, once a sample. Totals that
+/// rise between two samples a window apart come out as rates; the bracket of the test's clock reads
+/// bounds each, as `the_beats_fps_…` does.
+#[test]
+fn the_sampler_reads_the_camera_reader_once_a_sample() {
+    use adapters::metrics_proc::CameraTotals;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    let frames = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicU64::new(0));
+    let (f, r) = (Arc::clone(&frames), Arc::clone(&reads));
+    let mut m = ProcMetrics::new(Arc::new(Stats::default())).with_camera(move || {
+        r.fetch_add(1, Ordering::Relaxed);
+        let n = f.load(Ordering::Relaxed);
+        CameraTotals {
+            frames_written: n,
+            bytes_received: n * 1_000,
+        }
+    });
+    let after = Instant::now();
+    let first = m.sample();
+    let before = Instant::now();
+    assert_eq!(
+        (first.input_received_fps, first.input_received_kbps),
+        (None, None)
+    );
+    frames.store(50, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(
+        domain::config::OUTPUT_FPS_MIN_WINDOW_MS + 300,
+    ));
+    let b = Instant::now();
+    let s = m.sample();
+    let a = Instant::now();
+    let (shortest, longest) = ((b - before).as_secs_f64(), (a - after).as_secs_f64());
+    let fps = s.input_received_fps.expect("a window of at least the minimum");
+    assert!((50.0 / longest..=50.0 / shortest).contains(&fps), "{fps}");
+    let kbps = s.input_received_kbps.expect("a window of at least the minimum") as f64;
+    let (lo, hi) = (
+        50_000.0 * 8.0 / 1_000.0 / longest,
+        50_000.0 * 8.0 / 1_000.0 / shortest,
+    );
+    assert!(
+        (lo.floor()..=hi.ceil()).contains(&kbps),
+        "{kbps} outside {lo}..{hi}"
+    );
+    assert_eq!(reads.load(Ordering::Relaxed), 2, "one read a sample");
+    eprintln!("camera reader samples checked: 2");
+}
+
 /// proc(5)'s layout, with a command name that holds spaces and a `)` (fields read after the last).
 #[test]
 fn proc_stat_fields_are_read_after_the_last_paren() {

@@ -37,6 +37,7 @@ fn periodic(mark: u32) -> HealthReport {
         heartbeat_failures: mark,
         phase_channel: None,
         exit: None,
+        input_give_up: None,
     }
 }
 
@@ -50,7 +51,7 @@ fn final_beat(mark: u32, reason: ExitReason) -> HealthReport {
 }
 
 fn beat(h: HealthReport) -> ControlRequest {
-    ControlRequest::Heartbeat(h, Measured::default())
+    ControlRequest::Heartbeat(h, Box::<Measured>::default())
 }
 
 fn marks(log: &PlaneLog) -> Vec<(u32, bool)> {
