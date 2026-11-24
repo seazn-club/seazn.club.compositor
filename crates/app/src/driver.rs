@@ -14,7 +14,9 @@
 //!   refused (the driver owns the tick), and a wiring effect with no session (an inbound
 //!   `BootstrapOk`) exits as a fatal error.
 //! - **The phase** is published after every `decide` that changed it, with a rising `seq` from
-//!   `(Waiting, 0)` (amendment 2026-10-15).
+//!   `(Waiting, 0)` (amendment 2026-10-15), and logged first, once a change: `programme phase
+//!   from=<a> to=<b> seq=<n>`, in the beat's `programmePhase` words (C2, S3). The domain's edge beat
+//!   puts the change on the next beat (`Thresholds::phase_beat_gap_ms`).
 //! - **The log** gets one line per hide (`overlay hidden reason=<r> gen=<g>`), one per sink swap
 //!   before the port call (`sink swap reason=first|error|connect_timeout|egress_stalled gen=<g>`,
 //!   Owed 87 and Owed 94: what ended the sink before it; the port's own `sink swap gen=<g> target=…`
@@ -345,8 +347,14 @@ impl Driver {
         self.phone_live(before, self.supervisor.input_nudge());
         let phase = self.supervisor.programme_phase();
         if phase != self.phase {
-            self.phase = phase;
+            let from = std::mem::replace(&mut self.phase, phase);
             self.phase_seq += 1;
+            self.ports.log.info(&format!(
+                "programme phase from={} to={} seq={}",
+                phase_word(from),
+                phase_word(phase),
+                self.phase_seq
+            ));
             self.ports.phase.publish(phase, self.phase_seq);
         }
         for e in d.effects {
@@ -607,6 +615,18 @@ fn swap_name(r: SwapReason) -> &'static str {
         SwapReason::Error => "error",
         SwapReason::ConnectTimeout => "connect_timeout",
         SwapReason::EgressStalled => "egress_stalled",
+    }
+}
+
+/// The programme phase as the log names it: the beat's `programmePhase` words (the contract's enum),
+/// so a line and a beat read alike (C2, S3).
+fn phase_word(p: ProgrammePhase) -> &'static str {
+    match p {
+        ProgrammePhase::Waiting => "waiting",
+        ProgrammePhase::Live => "live",
+        ProgrammePhase::Frozen => "frozen",
+        ProgrammePhase::Reconnecting => "reconnecting",
+        ProgrammePhase::Final => "final",
     }
 }
 

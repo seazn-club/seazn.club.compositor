@@ -506,6 +506,85 @@ fn phase_is_published_on_change_only_with_a_rising_seq() {
     assert!(ticks > 0 && checked > 0);
 }
 
+/// C2 (S3), through the real driver: each published phase change writes one line, `programme phase
+/// from=<a> to=<b> seq=<n>`, in the words the beat's `programmePhase` uses (the contract's enum), and
+/// the next beat the driver requests carries it within the edge-beat gap and a tick, not a cadence
+/// later. Both profiles (ADR 0005).
+#[test]
+fn a_phase_change_is_logged_once_and_rides_the_next_beat_through_the_driver() {
+    let t = th();
+    let gap = t.phase_beat_gap_ms();
+    let mut checked = 0;
+    for output in [OutputProfile::P720, OutputProfile::P1080] {
+        let period = output.frame_period_ms().ceil() as u64;
+        let mut sim = Sim::new(
+            t.clone(),
+            SessionConfig {
+                output,
+                ..session_720p()
+            },
+        );
+        // Frames until Live, a stop past the slate, frames back past a return.
+        let stop = SESSION_AT + t.resume_after_ms + 1_000;
+        let back = stop + t.slate_after_ms + 1_000;
+        let end = back + t.resume_after_ms + 2_000;
+        let mut events = vec![(SESSION_AT, ev(Event::InputConnected { gen: 1 }))];
+        events.extend(every(SESSION_AT, stop, period, || frame(1)));
+        events.extend(every(back, end, period, || frame(1)));
+        sim.drive(end, events);
+
+        let changes: Vec<(u64, ProgrammePhase)> = sim
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Phase(p, _) => Some(p),
+                _ => None,
+            })
+            .zip(sim.times_of(|c| matches!(c, Call::Phase(..))))
+            .map(|(p, at)| (at, p))
+            .collect();
+        use ProgrammePhase::{Frozen, Live, Reconnecting};
+        assert_eq!(
+            changes.iter().map(|c| c.1).collect::<Vec<_>>(),
+            vec![Live, Frozen, Reconnecting, Live],
+            "setup: the walk"
+        );
+        let lines: Vec<String> = sim
+            .log
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("programme phase "))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "programme phase from=waiting to=live seq=1",
+                "programme phase from=live to=frozen seq=2",
+                "programme phase from=frozen to=reconnecting seq=3",
+                "programme phase from=reconnecting to=live seq=4",
+            ],
+            "{output:?}"
+        );
+        let beat_times = sim.times_of(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))));
+        let beats = beats_in(&sim.calls());
+        for &(at, p) in &changes {
+            let i = beat_times
+                .iter()
+                .position(|&b| b >= at)
+                .unwrap_or_else(|| panic!("{output:?}: no beat after the change to {p:?} at {at}"));
+            assert!(
+                beat_times[i] - at <= gap + period,
+                "{output:?}: the change to {p:?} at {at} waited for the beat at {}",
+                beat_times[i]
+            );
+            assert_eq!(beats[i].programme_phase, p, "{output:?}: the beat carries it");
+            checked += 1;
+        }
+    }
+    eprintln!("phase changes checked through the driver: {checked}");
+    assert_eq!(checked, 8);
+}
+
 /// Drives a booted 720p session through an `Ending` reply at 20, one tick per call, until the drain.
 /// Returns the instant of the drain's tick, the indices pushed in the hold, and the log length at 20.
 fn hold_until_drain(d: &mut Driver, log: &Log) -> (u64, Vec<u64>, usize) {

@@ -328,6 +328,22 @@ pub const FRAME_GRAB_WAIT_MS: Ms = 1_000;
 /// encode takes milliseconds, so this only bounds a stuck encoder.
 pub const FRAME_ENCODE_WAIT_MS: Ms = 2_000;
 
+impl Thresholds {
+    /// C2 (S3), derived: the least time between two heartbeats once a programme phase change asks
+    /// for one before the cadence's (the "edge beat"). It is `resume_after_ms`, the shortest stay the
+    /// programme table guarantees the reconnecting slate: a return needs that long of frames, all
+    /// after the slate went up (the slate goes up `slate_after_ms` after the last frame, past
+    /// `frozen_after_ms`, so the next frame starts a new run). The slate's entry comes
+    /// `slate_after_ms − frozen_after_ms` after a freeze, which is longer. So a slate's entry and its
+    /// exit each beat on their own tick when the beat before them did, and a phase that flaps faster
+    /// costs at most one beat a gap (1 000 ms today: one beat a second at most, against the cadence's
+    /// one in five), each carrying the phase of its tick. A change the gap holds beats on the first
+    /// tick the gap allows. The pins: `the_phase_beat_gap_lets_a_slates_entry_and_exit_each_beat`.
+    pub fn phase_beat_gap_ms(&self) -> Ms {
+        self.resume_after_ms
+    }
+}
+
 impl Default for Thresholds {
     fn default() -> Self {
         let (output_backoff_base_ms, output_connect_timeout_ms) = (500, 5_000);
@@ -455,6 +471,28 @@ mod tests {
             let worst = t.slate_after_ms as f64 + p.frame_period_ms();
             assert!(worst <= 3_100.0, "{p:?}: slate at {worst} ms");
         }
+    }
+
+    // C2 (S3): the edge beat's gap is the reconnecting slate's shortest stay, so its entry and exit
+    // each beat on their own tick; it is under the cadence (or no edge beat would ever come early)
+    // and above 0 (or a flapping phase would beat every tick).
+    #[test]
+    fn the_phase_beat_gap_lets_a_slates_entry_and_exit_each_beat() {
+        let t = Thresholds::default();
+        let gap = t.phase_beat_gap_ms();
+        assert!(gap > 0, "a flap would beat every tick");
+        assert!(
+            gap <= t.resume_after_ms,
+            "the slate's exit, a return's length after its entry"
+        );
+        assert!(
+            gap <= t.slate_after_ms - t.frozen_after_ms,
+            "the slate's entry, after the freeze"
+        );
+        assert!(
+            gap < t.heartbeat_interval_ms,
+            "an edge beat comes before the cadence's"
+        );
     }
 
     #[test]

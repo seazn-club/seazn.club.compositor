@@ -268,6 +268,9 @@ pub struct Supervisor {
     phase_channel: Option<PhaseChannel>,
     heartbeat_interval_ms: Ms,
     next_beat_at: Ms,
+    /// The last beat `beat_if_due` sent, and the programme phase it carried (C2, S3): a phase that
+    /// has moved since beats once `phase_beat_gap_ms` has passed since it.
+    last_beat: Option<(Ms, ProgrammePhase)>,
     deadline_at: Ms,
     output_ever_connected: bool,
     heartbeat_failures: u32,
@@ -298,6 +301,7 @@ impl Supervisor {
             phase_channel: None,
             heartbeat_interval_ms: hb,
             next_beat_at: 0,
+            last_beat: None,
             deadline_at: Ms::MAX,
             output_ever_connected: false,
             heartbeat_failures: 0,
@@ -441,10 +445,18 @@ impl Supervisor {
         self.next_beat_at = now;
     }
 
-    /// The beat, on the first tick at or after it is due.
+    /// The beat, on the first tick at or after it is due, or on a tick whose programme phase differs
+    /// from the last beat's once `phase_beat_gap_ms` has passed since it (C2, S3: the "edge beat", so
+    /// web reads a change on the next beat, not up to a cadence later). Either restarts the cadence.
+    /// The gap bounds a flapping phase to one beat a gap (`Thresholds::phase_beat_gap_ms`).
     fn beat_if_due(&mut self, now: Ms, fx: &mut Vec<Effect>) {
-        if now >= self.next_beat_at {
+        let phase = self.programme.phase();
+        let edge = self
+            .last_beat
+            .is_some_and(|(at, sent)| sent != phase && elapsed(now, at) >= self.t.phase_beat_gap_ms());
+        if now >= self.next_beat_at || edge {
             fx.push(Effect::SendHeartbeat(self.health(now)));
+            self.last_beat = Some((now, phase));
             self.next_beat_at = now.saturating_add(self.heartbeat_interval_ms);
         }
     }
