@@ -3213,6 +3213,29 @@ libx264 probe, core 165 r3222, through ffmpeg).
    when a request comes a frame or two later: the request is not throttled, and the 1- or 2-frame
    GOP of fact 5 comes back. Witness: `a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor`
    (`programme_output.rs`); its `sliced-threads=false` mutant runs only on CI.
+8. **A request before the encoder's first frame turns every later one off** (CI on PR #109, check
+   run of 2026-11-24; amended the same day). GstVideoEncoder reads a frame's running time against
+   its output segment (`gstvideoencoder.c` 1596-1598), which it sets only when the segment event
+   goes out with the first frame it finishes (1045). x264enc's `min-pts` moves the first frame's PTS
+   on by 1 000 h (`gstx264enc.c` 1418; `gstvideoencoder.c` 1574-1583), so frame 0 is checked at a
+   running time of 1 000 h. Any request queued before it (stamped at any R, or none) is matched
+   there, and `last_force_key_unit_request` becomes 1 000 h (1696). With the floor set, every later
+   request is then throttled (1600-1607) for the encoder's life: each later output waits for the
+   GOP's own keyframe, up to 3 s. CI saw it in four tests whose first sink was swapped in before
+   the first frame (a file sink can send at once): the second sink's file started at the GOP's
+   keyframe, 24 frames late (`swap_sink_starts_new_file_…`: 42 frames for 66), or never (the
+   failed-output test's second sink: an empty file), and a later sink's bitrate read 552 kbps
+   against the 1 000 floor. `last_key_unit` is set after the segment goes out (2565), so it is right
+   from frame 0. On stg an RTMP sink can send only after its publish is accepted, by which time the
+   encoder has made frames, so the trap needs a first connect faster than the first frame.
+   **The fix:** nothing is asked before the ring has taken any video. x264's first frame is a
+   keyframe, and every video entry comes after that reconnect point, so the first frame starts the
+   stream (`Feeder::run`, which logs `output gen=<g>: no keyframe is asked: the ring has taken no
+   video yet, …`). Witness: `swap_sink_starts_new_file_at_keyframe_without_rebuilding_programme`
+   (its second sink holds the floor's 66 frames, within `OWED84_KEY_WAIT_TICKS`, where the GOP's
+   own keyframe gives 42); the four tests' first swaps wait for that line
+   (`swap_before_the_first_frame`), so a request made there reds at the swap. The red CI run on
+   `214f674` is this mutant's kill.
 
 **Changes** (C1, branch `fix/seazn-live-gop-pull`).
 
@@ -3222,10 +3245,12 @@ libx264 probe, core 165 r3222, through ffmpeg).
   `forced_keyframe_min_frames` (66). A GOP less the floor is 24 frames, over the 16 Owed 84's
   programme tests need (`OWED84_MARGIN_TICKS` + `OWED84_KEY_WAIT_TICKS`), pinned in `config`.
 - **The stamped request** (the C1 review's I1): the feeder asks with the running time 1 ns after the
-  newest video the ring has taken (`RingState::newest_video`; 0 before any), so a keyframe the
+  newest video the ring has taken (`RingState::newest_video`; before any, nothing is asked: fact 8),
+  so a keyframe the
   encoder makes after the reconnect point, its own or another swap's, serves the swap, and none is
-  forced a floor after it (fact 4). It also settles the first sink's frame-0 race: a sink that asks
-  after frame 0 was made but before it reached the ring starts at frame 0. Witness:
+  forced a floor after it (fact 4). It also settles the first sink's frame-0 race: a sink that finds
+  the ring empty after frame 0 was made but before it reached the ring asks nothing and starts at
+  frame 0 (fact 8). Witness:
   `a_keyframe_made_after_the_reconnect_point_serves_the_swap_and_none_is_forced_a_floor_on`. The
   feeder's taken line now follows each ask (the C1 review's m4: `the keyframe request was taken at
   try N; a keyframe from running time R serves it`), and the tests wait on it.
@@ -3233,7 +3258,10 @@ libx264 probe, core 165 r3222, through ffmpeg).
   `OUTPUT_GAP_BUDGET_MS` = F-004's 15 s (`YOUTUBE_KEPT_GAP_MS`) + the floor = 17 200, and the
   recovery model (`tests/links.rs`) ends each recovery the floor after the new sink's first bytes.
   `output_egress_flat_ms` takes the floor back out and stays 9 000 (hung detection does not move).
-  The harness's `BUDGET_OUTPUT_RECONNECT_MS` = spec §6's 5 000 + the floor = 7 200. Kept at 15 s:
+  The harness's `BUDGET_OUTPUT_RECONNECT_MS` = spec §6's 5 000 + the floor = 7 200. lib.jq's
+  error-to-swap bound reads the spec's 5 000 as stated (`spec_output_reconnect_ms`; CI on PR #109):
+  a swap is built after the back-off, before any keyframe, so the floor would only loosen it, and the
+  7.2 s bound pushed case 12's at-the-budget fixture's error before the sink's own timeout. Kept at 15 s:
   the process restart's budget (spec §6, "Output back ≤15 s") and the hang hook's hold (30 s).
 - x264enc: `key-int-max` = `gop_frames()`, `option-string` gains `scenecut=0`, and
   `min-force-key-unit-interval` = the floor. Bitrate, VBV and HRD are unchanged (D2, Owed 109).
