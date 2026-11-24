@@ -785,11 +785,14 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
     );
 }
 
-/// C3's case 20: netem loss 20 s to 60 s (`dropped` packets), then a `pause_ms` pause at 70 s that
-/// the stall rule gives up at its bound from the camera's gap and, `taken_back`, the domain takes
-/// back when the camera's first frame returns (the driver's lines, as `logfacts` reads them).
-fn camera_gop_loss(pause_ms: i64, dropped: u64, taken_back: bool) -> World {
+/// C3's case 20: netem loss 20 s to 60 s (`dropped` packets), then a `pause_ms` pause at 70 s. As CI
+/// run 45480676592 read it: the compositor's first pull, before MediaMTX has the camera, is given up
+/// `error` at boot, so generation 2 is live at the pause. The stall rule gives it up `give_up_after`
+/// ms after the pause mark (the camera's last frame arrives a latency after it, then the stall) and,
+/// `taken_back`, the domain takes it back when the camera's first frame returns.
+fn camera_gop_loss_at(pause_ms: i64, dropped: u64, taken_back: bool, give_up_after: i64) -> World {
     let mut w = World::new(100);
+    w.line(w.at(-7.0), "input give up gen=1 reason=error");
     let (a, b) = (w.at(20.0), w.at(60.0));
     w.mark("impair", a, Value::Null);
     w.mark(
@@ -804,23 +807,33 @@ fn camera_gop_loss(pause_ms: i64, dropped: u64, taken_back: bool) -> World {
     w.mark("pause", p, json!({"pause_ms": pause_ms}));
     w.mark("resume", r, Value::Null);
     w.camera_gaps.push((p + 30, r + 30));
-    let stall = w.ms("input_stall_after_ms");
-    let gave_up = p + 30 + stall;
-    if pause_ms > stall {
-        w.line(gave_up, "input give up gen=1 reason=stalled");
+    if pause_ms > w.ms("input_stall_after_ms") {
+        w.line(p + give_up_after, "input give up gen=2 reason=stalled");
         if taken_back {
-            w.line(r + 60, "input take back gen=1");
+            w.line(r.max(p + give_up_after) + 300, "input take back gen=2");
         }
     }
     w
 }
 
+/// The case's own pause (stall + half the first back-off) and CI's latency (1 300 ms, run
+/// 45480676592's glass-to-glass p50) before the stall.
+fn camera_gop_loss(pause_ms: i64, dropped: u64, taken_back: bool) -> World {
+    let stall = World::new(1).ms("input_stall_after_ms");
+    camera_gop_loss_at(pause_ms, dropped, taken_back, 1_300 + stall)
+}
+
+fn gop_pause() -> i64 {
+    let t = World::new(1);
+    t.ms("input_stall_after_ms") + t.ms("input_backoff_base_ms") / 2
+}
+
 #[test]
 fn camera_gop_loss_takes_the_camera_back_and_reds_without_the_take_back_or_its_window() {
-    // The brief's 5.2 s, which the case drives.
+    let pause = gop_pause();
     assert_pass(
         &judge(
-            &camera_gop_loss(5_200, 400, true),
+            &camera_gop_loss(pause, 400, true),
             "camera-gop-loss",
             "",
             "gop-good",
@@ -831,7 +844,7 @@ fn camera_gop_loss_takes_the_camera_back_and_reds_without_the_take_back_or_its_w
     // No take-back line: the domain rebuilt instead.
     assert_fails(
         &judge(
-            &camera_gop_loss(5_200, 400, false),
+            &camera_gop_loss(pause, 400, false),
             "camera-gop-loss",
             "",
             "gop-noback",
@@ -843,7 +856,7 @@ fn camera_gop_loss_takes_the_camera_back_and_reds_without_the_take_back_or_its_w
     // Nothing dropped: the loss never happened.
     assert_fails(
         &judge(
-            &camera_gop_loss(5_200, 0, true),
+            &camera_gop_loss(pause, 0, true),
             "camera-gop-loss",
             "",
             "gop-nodrop",
@@ -869,8 +882,26 @@ fn camera_gop_loss_takes_the_camera_back_and_reds_without_the_take_back_or_its_w
         );
         checked += 1;
     }
+    // A give-up outside its window: before the stall could have elapsed, and at the decode wait (the
+    // bytes extension wrongly in force), each from thresholds.json.
+    for (tag, after) in [
+        ("gop-early", t.ms("input_stall_after_ms") - 1),
+        ("gop-decodewait", t.ms("input_decode_wait_ms")),
+    ] {
+        assert_fails(
+            &judge(
+                &camera_gop_loss_at(pause, 400, true, after),
+                "camera-gop-loss",
+                "",
+                tag,
+            ),
+            "gave_up_at_the_pause",
+            tag,
+        );
+        checked += 1;
+    }
     eprintln!("camera-gop-loss worlds judged: {checked}");
-    assert_eq!(checked, 5);
+    assert_eq!(checked, 7);
 }
 
 /// Kicks at 20 s, 40 s, ... 120 s; each costs the input `reconnect_ms`; the alert from `alert_from`
