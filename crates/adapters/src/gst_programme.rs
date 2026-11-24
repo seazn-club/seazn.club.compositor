@@ -911,7 +911,9 @@ impl ProgrammeOutput for GstProgramme {
         // asks the encoder for one then, from its own thread. The encoder makes it at once, or at
         // `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later (F-036), or
         // none, when it has made one at or after `serves_from` already: the GOP's own keyframe,
-        // encoded after the reconnect point, starts the stream (the C1 review's I1).
+        // encoded after the reconnect point, starts the stream (the C1 review's I1). Before the ring
+        // has taken any video the feeder asks nothing: the encoder's first frame is the keyframe
+        // (`gst_output::KeyRequest`; CI on PR #109).
         let parser_src = r.parser_src.clone();
         #[cfg(feature = "test-hooks")]
         let refusals = Arc::clone(&self.key_refusals);

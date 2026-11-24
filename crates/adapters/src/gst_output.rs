@@ -90,7 +90,9 @@ pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// The argument is the running time from which a keyframe serves (the reconnect point's: just after
 /// the newest video the ring has taken, `RingState::newest_video`): GstVideoEncoder makes none when
 /// it has already made one at or after it (F-036, the C1 review's I1), so a GOP's own keyframe
-/// encoded after the reconnect point starts the stream with no forced one a floor behind it.
+/// encoded after the reconnect point starts the stream with no forced one a floor behind it. Never
+/// asked before the ring has taken any video (`Feeder::run`): the encoder's first frame is a keyframe
+/// anyway, and a request it matched there would hold every later one off for the encoder's life.
 pub(crate) type KeyRequest = Arc<dyn Fn(gst::ClockTime) -> bool + Send + Sync>;
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -652,6 +654,23 @@ impl Feeder {
         };
         let mut pick = Picker::new(reconnect);
         let mut ask = KeyAsk::default();
+        // F-036 (CI on PR #109): before the ring has taken any video, nothing is asked. x264's first
+        // frame is a keyframe, and every video entry comes after the reconnect point, so that frame
+        // starts the stream. A request there would also be matched on that frame at a running time
+        // 1 000 h too late: GstVideoEncoder 1.24.2 reads a frame's running time against its OUTPUT
+        // segment (`gst_video_encoder_chain`, gstvideoencoder.c 1596-1598), which is set only when
+        // the segment goes out with the first frame (`gst_video_encoder_push_event`, 1045), while
+        // x264enc's min-pts has moved that frame's PTS on by 1 000 h (gstx264enc.c 1418; 1574-1583).
+        // The 1 000 h becomes `last_force_key_unit_request` (1696), and the floor then throttles
+        // every later forced keyframe (1600-1607) until the encoder stops: each later sink waits for
+        // the GOP's own keyframe, up to 3 s.
+        if serves_from.is_none() {
+            self.shared.log(&format!(
+                "output gen={}: no keyframe is asked: the ring has taken no video yet, so the \
+                 encoder's first frame, a keyframe, starts the stream",
+                self.gen
+            ));
+        }
         self.ask_key(&mut ask, serves_from);
         loop {
             match self.next() {
@@ -675,9 +694,13 @@ impl Feeder {
     }
 
     /// Asks the encoder for a keyframe, one from `serves_from` on, unless it has taken a request
-    /// already. The take is logged (the C1 review's m4: the line follows the ask, so a reader of it
-    /// knows the request is with the encoder).
-    fn ask_key(&self, ask: &mut KeyAsk, serves_from: gst::ClockTime) {
+    /// already or there is nothing to ask (`None`: no video yet, `run`). The take is logged (the C1
+    /// review's m4: the line follows the ask, so a reader of it knows the request is with the
+    /// encoder).
+    fn ask_key(&self, ask: &mut KeyAsk, serves_from: Option<gst::ClockTime>) {
+        let Some(serves_from) = serves_from else {
+            return;
+        };
         if ask.taken {
             return;
         }
@@ -712,12 +735,12 @@ impl Feeder {
 
     /// Waits, taking nothing, until the sink can send (`Gate`), and returns the reconnect point: the
     /// seq of the first entry encoded after it (`run` then asks for the keyframe), and the running
-    /// time a keyframe serves from (1 ns after the newest video the ring has taken, or 0 before any:
-    /// every video entry encoded later is at or after it). `None`: retired,
+    /// time a keyframe serves from (1 ns after the newest video the ring has taken; `None` before
+    /// any, when nothing is asked: `run`). `None` in all: retired,
     /// the ring is another generation's, or both encoders ended first. That last is the programme's
     /// drain reaching a sink that never connected: nothing is owed to it (whatever the ring holds
     /// predates any connect), so `release_unsent`.
-    fn reconnect_point(&self) -> Option<(u64, gst::ClockTime)> {
+    fn reconnect_point(&self) -> Option<(u64, Option<gst::ClockTime>)> {
         let since = Instant::now();
         loop {
             if self.retired.load(Ordering::SeqCst) {
@@ -729,9 +752,7 @@ impl Feeder {
                     return None;
                 }
                 let first = r.next_seq;
-                let serves_from = r
-                    .newest_video
-                    .map_or(gst::ClockTime::ZERO, |t| t + gst::ClockTime::from_nseconds(1));
+                let serves_from = r.newest_video.map(|t| t + gst::ClockTime::from_nseconds(1));
                 let held = r.entries.iter().filter(|e| e.video).count();
                 drop(r);
                 self.shared.log(&format!(
