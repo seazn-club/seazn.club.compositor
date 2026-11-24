@@ -8,7 +8,8 @@
 //! ```
 //!
 //! - **Back-off.** `attempt` counts consecutive failures, and failure number f waits `delay(f - 1)`:
-//!   1, 2, 4, 8, 10, 10 s (PDF failure table), retried forever. A first decoded frame resets it.
+//!   1, 2, 4, 4, 4 s (the PDF failure table's 1 s base, capped at 4 s by F-036), retried forever. A
+//!   first decoded frame resets it.
 //! - **Generations.** Every build starts a new generation, and every adapter event carries the
 //!   generation of the pipeline that sent it. An event from any other generation is ignored, so a late
 //!   `InputLost` from a torn-down pipeline cannot knock down the healthy new one.
@@ -439,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_failures_follow_the_pdf_backoff_1_2_4_8_10_10() {
+    fn consecutive_failures_back_off_1_2_4_then_hold_at_the_f036_cap() {
         let th = t();
         let mut l = InputLink::new();
         let mut now = 0;
@@ -455,13 +456,13 @@ mod tests {
             let gen = l.generation();
             l.on_lost(now, gen, LossReason::Error, &th); // fails instantly
         }
-        // The PDF's sequence, from the config's numbers: base, doubling, capped.
+        // The sequence, from the config's numbers: base, doubling, capped.
         let (base, cap) = (th.input_backoff_base_ms, th.input_backoff_cap_ms);
         let want: Vec<Ms> = (0..6).map(|a| (base << a).min(cap)).collect();
         assert_eq!(
             want,
-            vec![1_000, 2_000, 4_000, 8_000, 10_000, 10_000],
-            "PDF: 1 s → 10 s"
+            vec![1_000, 2_000, 4_000, 4_000, 4_000, 4_000],
+            "the PDF's 1 s base, capped at 4 s (F-036, C2)"
         );
         let rounded: Vec<Ms> = gaps.iter().map(|g| g / 10 * 10).collect();
         assert_eq!(rounded, want);
@@ -1024,6 +1025,16 @@ mod tests {
         }
     }
 
+    /// The numbers F-032 computed its schedule with: F-002's 5 s connect timeout and the PDF's 10 s
+    /// back-off cap (F-036 then moved both: 9 s, and 4 s in C2). A check of F-032's own instants runs
+    /// on it, so they stay F-032's.
+    fn at_f032() -> Thresholds {
+        Thresholds {
+            input_backoff_cap_ms: 10_000,
+            ..at_f002()
+        }
+    }
+
     /// Ticks `l` from `from` (the 10 ms grid, the stall rule read against `last`) to the first tick
     /// after which it backs off a later attempt (a count above 1), and returns that tick; bounded by
     /// two whole capped steps.
@@ -1346,16 +1357,17 @@ mod tests {
 
     /// A phone that never returns: after the rule's one rebuild each build times out, and the builds
     /// re-run the back-off's steps from the base. Derived from `backoff::delay` and the connect
-    /// timeout, at today's (F-036's 9 s) and at F-002's 5 s, and at 5 s held against F-032's own
-    /// schedule, which it computed there (the drop + 31.9, 38.9, 47.9, 60.9, 75.9; today's +37, +52,
-    /// +67, +82). The bound over many horizons is swept in `tests/hold_end.rs`.
+    /// timeout, at today's (F-036's 9 s, the 4 s cap) and at F-002's 5 s, and on F-032's own numbers
+    /// (5 s and the 10 s cap) held against the schedule it computed there (the drop + 31.9, 38.9, 47.9,
+    /// 60.9, 75.9; today's +37, +52, +67, +82). The bound over many horizons is swept in
+    /// `tests/hold_end.rs`.
     #[test]
     fn a_phone_that_never_returns_gets_the_backoffs_steps_once_more() {
         let mut checked = 0;
-        for (th, f032) in [(t(), false), (at_f002(), true)] {
+        for (th, f032) in [(t(), false), (at_f002(), false), (at_f032(), true)] {
             checked += never_returns(&th, f032);
         }
-        assert_eq!(checked, 2, "timeouts checked: {checked}");
+        assert_eq!(checked, 3, "timeouts checked: {checked}");
     }
 
     fn never_returns(th: &Thresholds, f032: bool) -> usize {

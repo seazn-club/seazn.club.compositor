@@ -56,7 +56,7 @@ These apply to every task. Values are copied from the spec and ADRs.
 - **Programme thresholds:** Frozen at 0.5 s with no frame; slate at 3 s; back to live after 1 s of
   continuous frames. The score layer is on in every state.
 - **Input backoff:** 1 s → 10 s cap, retried forever. A kick alert fires at **more than** 3 kicks in
-  5 min.
+  5 min. (Amended 2026-11-24, C2: the cap is 4 s, F-036 D4.)
 - **Output:** stall when no bytes are acked for 5 s. Reconnect within 5 s. Encoded ring buffer 2 s,
   dropping the oldest.
 - **Queues:** decoded video 1 s, audio 400 ms. All leaky, dropping the oldest. Nothing unbounded,

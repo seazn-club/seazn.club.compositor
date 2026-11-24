@@ -2116,9 +2116,12 @@ fn a_connect_timeout_abandons_each_generation_once_through_the_driver() {
     let mut sim = Sim::new(t.clone(), session_720p());
     let mut checked = 0;
     let mut built = SESSION_AT;
+    // Each wait ends on the tick grid, up to a period late, and there are two (the timeout, then the
+    // back-off): at the 4 s cap (F-036, C2) the third rebuild lands just past the bare sum.
+    let late = 2 * OutputProfile::P720.frame_period_ms().ceil() as u64;
     for gen in 1..=3u64 {
         let next = sim.tick_until(
-            built + t.input_connect_timeout_ms + t.input_backoff_cap_ms,
+            built + t.input_connect_timeout_ms + t.input_backoff_cap_ms + late + 1,
             rebuilt(gen + 1),
         );
         let at = sim.times_of(abandoned(gen));
