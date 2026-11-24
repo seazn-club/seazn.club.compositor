@@ -285,17 +285,20 @@ fn a_slates_entry_and_exit_each_beat_on_their_own_tick() {
 }
 
 /// The gap against the programme's own behaviour (C2 review, m3): the reconnecting slate's shortest
-/// stay, read off the real supervisor. The camera stops for exactly `slate_after_ms`, so its frames
-/// return on the slate's first ticks, and the stay from the slate's entry to the return to Live is
-/// the shortest the table allows. It is at least the gap, so the exit beats on its own tick too.
+/// stay, read off the real supervisor. The camera stops for `slate_after_ms` and one tick, so its
+/// frames return on the slate's first ticks, and the stay from the slate's entry to the return to
+/// Live is the shortest the table allows. It is at least the gap, so the exit beats on its own tick
+/// too. (Exactly `slate_after_ms` put the return on the threshold's own tick at a 33 ms step once
+/// the slate moved to 4.5 s, the owner's ruling of 2026-11-24: the frame comes before the tick, so
+/// no slate went up. The extra tick makes the walk the same on every grid.)
 #[test]
 fn a_slates_shortest_stay_is_at_least_the_gap() {
     let th = Thresholds::default();
     let gap = th.phase_beat_gap_ms();
-    let sc = [(true, 2_000), (false, th.slate_after_ms), (true, 4_000)];
-    let span = 2_000 + th.slate_after_ms + 4_000;
     let mut checked = 0;
     for step in steps() {
+        let sc = [(true, 2_000), (false, th.slate_after_ms + step), (true, 4_000)];
+        let span = 2_000 + th.slate_after_ms + step + 4_000;
         let seen = drive(&th, th.heartbeat_interval_ms, step, &sc, span);
         let entry = seen
             .changes

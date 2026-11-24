@@ -19,6 +19,8 @@
 //!   `programme started`; and `app::driver`'s `sink swap reason=<r> gen=<g>` just before the swap
 //!   line (Owed 87, PR #57);
 //! - `adapters::gst_output`: `output gen=<g> error: <text>` (a sink's bus error);
+//! - `app::driver` (C2 S4, C3 S2): `input give up gen=<g> reason=<r>` (each camera generation given
+//!   up) and `input take back gen=<g>` (a given-up generation taken back, C3's camera-gop-loss case);
 //! - `app::driver` (Owed 86, the honest beat): `output fps beat=<fps> floor=<floor>` each beat, and
 //!   the starvation alarm's `output starvation alarm raised fps=<fps> floor=<floor>` and
 //!   `output starvation alarm cleared fps=<fps> recovered=<level>` (C14 case 6);
@@ -127,6 +129,14 @@ pub struct Hidden {
 /// `stall`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SwapReasonLine {
+    pub at_ms: i64,
+    pub gen: u64,
+    pub reason: String,
+}
+
+/// `input give up gen=<g> reason=<r>` (C2, S4): one camera generation given up, the reason one word.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GiveUpLine {
     pub at_ms: i64,
     pub gen: u64,
     pub reason: String,
@@ -290,6 +300,10 @@ pub struct LogFacts {
     /// the sink is retired (gst_output.rs's `Watch`), so a swap whose outgoing sink logged none was
     /// not the error path's (C14 fix round 3).
     pub output_errors: Vec<GenAt>,
+    /// `input give up gen=<g> reason=<r>`: each camera generation given up (C2, S4).
+    pub input_give_ups: Vec<GiveUpLine>,
+    /// `input take back gen=<g>`: each given-up camera generation taken back (C3, S2).
+    pub input_take_backs: Vec<GenAt>,
     /// `output gen=<g>: the sink can send after <n> ms; …` (gst_output.rs's publish gate, Owed 84):
     /// the sink's publish was accepted, so it sends from here (case 17's measure, the PR #65
     /// review's m-4: a publish under a trickle is Owed 88's write-stall path).
@@ -404,6 +418,19 @@ fn swap_reason(msg: &str, at_ms: i64) -> Option<SwapReasonLine> {
         return None;
     }
     Some(SwapReasonLine {
+        at_ms,
+        gen: g.parse().ok()?,
+        reason: reason.to_owned(),
+    })
+}
+
+/// `input give up gen=<g> reason=<r>`: the whole message, one word for the reason.
+fn give_up(msg: &str, at_ms: i64) -> Option<GiveUpLine> {
+    let (g, reason) = msg.strip_prefix("input give up gen=")?.split_once(" reason=")?;
+    if reason.is_empty() || reason.contains(' ') {
+        return None;
+    }
+    Some(GiveUpLine {
         at_ms,
         gen: g.parse().ok()?,
         reason: reason.to_owned(),
@@ -636,6 +663,10 @@ pub fn log_facts(text: &str) -> LogFacts {
             }
         } else if let Some(r) = swap_reason(m, at_ms) {
             f.sink_swap_reasons.push(r);
+        } else if let Some(g) = gen_after(m, "input take back gen=") {
+            f.input_take_backs.push(ga(g));
+        } else if let Some(u) = give_up(m, at_ms) {
+            f.input_give_ups.push(u);
         } else if let Some(g) = output_error(m) {
             f.output_errors.push(ga(g));
         } else if let Some(g) = sink_publish(m) {
@@ -1476,6 +1507,68 @@ mod tests {
             f.lines
         );
         assert_eq!(pinned, 3);
+    }
+
+    // C3: the camera's give-ups and take-backs, with near misses that are neither, and their producer
+    // in the driver pinned, so a reworded line reds here, not on CI.
+    #[test]
+    fn a_camera_give_up_and_take_back_are_read_with_their_generation() {
+        let mut log = String::new();
+        let lines = [
+            (5_000, "input give up gen=1 reason=stalled"),
+            (5_300, "input take back gen=1"),
+            (9_000, "input give up gen=1 reason=stalled"),
+            (10_000, "input give up gen=2 reason=connect_timeout"),
+            // Near misses.
+            (11_000, "input give up gen=x reason=stalled"),
+            (11_100, "input give up gen=3 reason="),
+            (11_200, "input give up gen=3 reason=two words"),
+            (11_300, "input give up gen=3"),
+            (11_400, "input take back gen=y"),
+            (11_500, "input taken back gen=4"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        assert_eq!(
+            f.input_give_ups
+                .iter()
+                .map(|u| (u.at_ms - NOON_MS, u.gen, u.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (5_000, 1, "stalled"),
+                (9_000, 1, "stalled"),
+                (10_000, 2, "connect_timeout")
+            ]
+        );
+        assert_eq!(
+            f.input_take_backs
+                .iter()
+                .map(|t| (t.at_ms - NOON_MS, t.gen))
+                .collect::<Vec<_>>(),
+            vec![(5_300, 1)]
+        );
+        let driver = std::fs::read_to_string(format!("{}/../app/src/driver.rs", env!("CARGO_MANIFEST_DIR")))
+            .expect("driver.rs");
+        let mut pinned = 0;
+        for producer in [
+            "\"input give up gen={} reason={}\",",
+            "p.log.info(&format!(\"input take back gen={gen}\"));",
+        ] {
+            assert_eq!(
+                driver.matches(producer).count(),
+                1,
+                "the line changed: {producer}"
+            );
+            pinned += 1;
+        }
+        eprintln!(
+            "camera lines checked: {}, facts read: {}, producers pinned: {pinned}",
+            lines.len(),
+            f.input_give_ups.len() + f.input_take_backs.len()
+        );
+        assert_eq!(pinned, 2);
     }
 
     #[test]

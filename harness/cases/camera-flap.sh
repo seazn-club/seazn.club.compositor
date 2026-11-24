@@ -6,7 +6,11 @@
 # thresholds.json): long enough to slate, short of the input's stall rule, so every flap is the same
 # flap (the PR #52 review's I5). The brief's "every 5 s" made each pause 5 s, which IS
 # input_stall_after_ms: some flaps rebuilt the input and some did not, and CI read 900 to 3 733 ms
-# (a false premise, `docs/_INDEX.md`). fake-camera's resume starts with a key frame
+# (a false premise, `docs/_INDEX.md`). Since the owner's 4.5 s slate (2026-11-24, C3) the pause is
+# 4 750 ms, 250 ms from each rule (it was 4 000, 1 000 ms each side): the slate's entry is judged on
+# the strip and the stall's on the log. The drive's sleep and curl lengthen each pause by ~120 ms
+# (CI run 45480676592: a 5 200 ms pause marked 5 319 ms), so the stall side keeps ~130 ms
+# (a flap past it would log `input give up … reason=stalled`). fake-camera's resume starts with a key frame
 # (`camera::Schedule::take_key_due`), so a decoder's wait for one is not the product's hold-off.
 #
 # Hysteresis from the strip, never the beats (a 5 s beat cannot see a 1 s rule): every resume holds

@@ -142,6 +142,20 @@ pub enum Event {
     InputMedia {
         gen: u64,
     },
+    /// A decoded video frame of input generation `gen` reached the adapter's shut gate after the
+    /// domain gave that generation up (C3, S2; Owed 49): the adapter sends it once an abandon, the
+    /// first such frame. Inside the back-off the link takes the generation back
+    /// (`InputLink::on_again`, `Effect::TakeBackInput`); anything else changes nothing.
+    InputAgain {
+        gen: u64,
+    },
+    /// The current input build's source byte count, decoded or not (C3, S2 item 2): C08 reads it
+    /// from the input port once per `tick_due` that ran a tick, as it reads CEF's health. The link
+    /// reads a rise as "bytes still arrive" (`InputLink::on_bytes`).
+    InputBytes {
+        gen: u64,
+        total: u64,
+    },
     /// Web's phone-live edge counter, read from a heartbeat's reply that carries one (`phoneLiveEdge`,
     /// Owed 108 fix (b); C08 sends it after that reply's `HeartbeatReply`). The input link reads the
     /// first value as a baseline and each increase as one nudge (`InputLink::on_phone_live_edge`).
@@ -210,6 +224,12 @@ pub enum Effect {
     /// which still comes as `Event::InputError` while the build runs (Owed 108). Pushed once a
     /// generation, on the Running tick that decided it; a loss the adapter reported owes none.
     AbandonInput {
+        gen: u64,
+    },
+    /// The domain took input generation `gen` back (C3, S2): a build it gave up delivered a frame
+    /// inside its back-off, so the adapter re-opens that build's gate (`InputSource::take_back`)
+    /// and no rebuild follows. Pushed by the `InputAgain` that decided it.
+    TakeBackInput {
         gen: u64,
     },
     /// Build sink generation `gen`; `reason` is what ended the one before it (Owed 87): C08 logs
@@ -327,6 +347,12 @@ impl Supervisor {
     /// reads it, and the beat carries it (`HealthReport::input_give_up`).
     pub fn input_give_up(&self) -> Option<GiveUp> {
         self.input.last_give_up()
+    }
+
+    /// Every give-up the input link has made (C3): the driver's log line reads its rise, since a
+    /// taken-back generation can be given up again with the same generation and reason.
+    pub fn input_give_ups(&self) -> u64 {
+        self.input.give_ups()
     }
 
     /// The input link's phone-live nudge as it stands (Owed 108 fix (b)): read by the driver's log
@@ -582,6 +608,12 @@ impl Supervisor {
             Event::InputLost { gen, reason } => self.input.on_lost(now, gen, reason, &t),
             Event::InputError { gen, facts } => self.on_input_error(now, gen, facts),
             Event::InputMedia { gen } => self.input.on_media(gen),
+            Event::InputAgain { gen } => {
+                if let Some(a) = self.input.on_again(now, gen) {
+                    fx.push(input_effect(a));
+                }
+            }
+            Event::InputBytes { gen, total } => self.input.on_bytes(now, gen, total),
             Event::PhoneLiveEdge { count } => self.input.on_phone_live_edge(count),
             Event::OutputProgress {
                 gen,
@@ -648,6 +680,7 @@ impl Supervisor {
             Event::InputLost { gen, reason: r } => self.input.on_lost(now, gen, r, &t),
             Event::InputError { gen, facts } => self.on_input_error(now, gen, facts),
             Event::InputMedia { gen } => self.input.on_media(gen),
+            Event::InputBytes { gen, total } => self.input.on_bytes(now, gen, total),
             // The hold ticks no link (C06), so a nudge latched here acts on nothing.
             Event::PhoneLiveEdge { count } => self.input.on_phone_live_edge(count),
             Event::OutputProgress {
@@ -679,7 +712,10 @@ impl Supervisor {
             // clock. An overrun changes nothing: the hold is ≤ final_hold_ms. CEF's health asks for
             // nothing here (C11b): the hold already ends the process with exit 0, and a restart would
             // cut the Final card short to boot a process for a session that is over.
+            // Nothing is taken back in the hold (C3): as nothing is rebuilt there, the Final card
+            // stays on air and the given-up build stays shut.
             Event::HeartbeatReply(Desired::Ending)
+            | Event::InputAgain { .. }
             | Event::CefHealth(_)
             | Event::Signal(SignalKind::Int)
             | Event::EncoderOverrun
@@ -781,6 +817,7 @@ fn input_effect(a: InputAction) -> Effect {
     match a {
         InputAction::Rebuild { gen } => Effect::RebuildInput { gen },
         InputAction::Abandon { gen } => Effect::AbandonInput { gen },
+        InputAction::TakeBack { gen } => Effect::TakeBackInput { gen },
     }
 }
 
@@ -2432,6 +2469,8 @@ mod tests {
             input_backoff_cap_ms: 10_037,
             input_connect_timeout_ms: 5_041,
             input_stall_after_ms: 5_051,
+            input_decode_wait_ms: 8_053,
+            input_bytes_fresh_ms: 1_187,
             input_srt_latency_ms: 1_181,
             input_hold_end_after_ms: 20_021,
             kick_alert_count: 3,
@@ -2478,6 +2517,8 @@ mod tests {
             th.input_backoff_cap_ms,
             th.input_connect_timeout_ms,
             th.input_stall_after_ms,
+            th.input_decode_wait_ms,
+            th.input_bytes_fresh_ms,
             th.input_hold_end_after_ms,
             th.kick_window_ms,
             th.output_backoff_base_ms,
@@ -2502,7 +2543,7 @@ mod tests {
         let mut unique = ms.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 27, "setup: every Ms threshold distinct");
+        assert_eq!(unique.len(), 29, "setup: every Ms threshold distinct");
         let base = th.bootstrap_backoff_base_ms;
         assert!(
             2 * base < th.bootstrap_backoff_cap_ms && 4 * base > th.bootstrap_backoff_cap_ms,

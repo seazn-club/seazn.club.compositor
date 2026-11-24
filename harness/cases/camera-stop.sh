@@ -1,7 +1,7 @@
 # shellcheck shell=bash disable=SC2034,SC2016 # sourced by run-case.sh; jq filters keep their $ (SC2016)
 # Case 1, camera-stop (C14 brief): the camera pauses at 20 s and resumes at 30 s; 50 s live.
 #
-# The slate begins within BUDGET_SLATE_AFTER_LOSS_MS of the last pre-pause frame, and the camera's
+# The slate begins within budget_slate_after_loss_ms (thresholds.json) of the last pre-pause frame, and the camera's
 # return is judged in camera time: `suppressed_ms`, the camera time after the resume the programme
 # never showed. The brief's wall form (the first strip frame after the resume against the camera's
 # first post-resume emit) includes the glass-to-glass latency, which the budget does not (a false

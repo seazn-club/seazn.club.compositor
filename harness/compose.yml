@@ -18,6 +18,8 @@
 #   CAMERA_TS_ALIGNMENT               packets per buffer at the camera's mux, 1 to 7 (default 7,
 #                                     media.rs's SRT payload; 1, Owed 81's candidate, lost the
 #                                     video at every reader: F-029)
+#   CAMERA_GOP_MS                     the camera's keyframe interval, ms (default 1000; 3000 is the
+#                                     capture app's GOP, C3's camera-gop-loss case)
 name: seazn-harness
 
 networks:
@@ -78,6 +80,8 @@ services:
       - ${CAMERA_AUDIO:-on}
       - --ts-alignment
       - ${CAMERA_TS_ALIGNMENT:-7}
+      - --gop-ms
+      - ${CAMERA_GOP_MS:-1000}
     volumes:
       - ${HARNESS_OUT:?}:/out
 

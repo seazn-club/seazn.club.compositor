@@ -54,13 +54,17 @@ These apply to every task. Values are copied from the spec and ADRs.
 - **Output:** 720p30 by default (`1280×720`, 30 fps, 4000 kbps), with a 1080p30 flag (`1920×1080`,
   30 fps, 6000 kbps). CEF always renders the page at `1920×1080`.
 - **Programme thresholds:** Frozen at 0.5 s with no frame; slate at 3 s; back to live after 1 s of
-  continuous frames. The score layer is on in every state.
+  continuous frames. The score layer is on in every state. (Amended 2026-11-24, C3: the owner's
+  ruling "keep the frozen picture, 4.5 s slate": the slate is at 4.5 s, its budget 4.6 s.)
 - **Input backoff:** 1 s → 10 s cap, retried forever. A kick alert fires at **more than** 3 kicks in
   5 min. (Amended 2026-11-24, C2: the cap is 4 s, F-036 D4.)
 - **Output:** stall when no bytes are acked for 5 s. Reconnect within 5 s. Encoded ring buffer 2 s,
   dropping the oldest.
 - **Queues:** decoded video 1 s, audio 400 ms. All leaky, dropping the oldest. Nothing unbounded,
-  anywhere.
+  anywhere. (Amended 2026-11-24, C3, S5: the queue before the camera's video decoder holds
+  compressed access units and is no longer leaky. A drop there loses a reference mid-GOP and freezes
+  the picture to the next keyframe, so it blocks the source instead, bounded by
+  `CAMERA_VIDEO_QUEUE_MS`; libsrt's own too-late drop is then the one loss on the input leg.)
 - **Memory and CPU:** 1 GB soft limit (alert), 2 GB hard. The OOM order kills CEF before the encoder.
   CEF is capped at about 600 MB and recycled every 2 h. CPU ≤70 % sustained.
 - **Machine:** Fly `performance-4x`, 8 GB, region `lhr`, restart `on-failure` with `max_retries: 2`,

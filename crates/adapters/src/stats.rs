@@ -45,6 +45,70 @@ impl ReceivedBytes {
     }
 }
 
+/// The camera's losses before the picture (C3, S5 item 1), process totals that only grow: every
+/// `GstInput` the process builds adds to one (`GstInput::with_loss_counts`), and `ProcMetrics` reads
+/// it once a beat (`CameraTotals`).
+///
+/// - `withheld_spans`: spans in which compressed video kept entering the camera's decoder and no
+///   picture came out for at least `Thresholds::frozen_after_ms` (the programme freezes from there):
+///   the decoder withholding pictures to the next keyframe after a lost reference, with
+///   `output-corrupt=false` (Owed 48). Counted when the picture returns (`WithheldSpans`); a build
+///   given up mid-span does not count it (the give-up's reason says why it went).
+/// - `queue_overruns`: the queue before the camera's decoder was full (its `overrun` signal), so the
+///   source blocked behind it (C3, S5 item 2: the queue no longer drops).
+#[derive(Debug, Default)]
+pub struct InputLoss {
+    withheld_spans: AtomicU64,
+    queue_overruns: AtomicU64,
+}
+
+impl InputLoss {
+    pub fn add_withheld_span(&self) {
+        self.withheld_spans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_queue_overrun(&self) {
+        self.queue_overruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn withheld_spans(&self) -> u64 {
+        self.withheld_spans.load(Ordering::Relaxed)
+    }
+
+    pub fn queue_overruns(&self) -> u64 {
+        self.queue_overruns.load(Ordering::Relaxed)
+    }
+}
+
+/// One camera build's decoder, watched for withheld pictures (`InputLoss::withheld_spans`): an access
+/// unit into the decoder opens a span if none is open; a picture out closes it, and the span counts
+/// when it lasted at least `min`. A camera that goes silent opens no span (no unit arrives), and its
+/// first unit back is decoded at once, so the silence never reads as withholding.
+#[derive(Debug, Clone, Copy)]
+pub struct WithheldSpans {
+    min: Duration,
+    /// When the first unit since the last picture went in; `None` with no unit waiting.
+    open: Option<Instant>,
+}
+
+impl WithheldSpans {
+    pub fn new(min: Duration) -> Self {
+        Self { min, open: None }
+    }
+
+    /// A compressed access unit went into the decoder at `at`.
+    pub fn on_unit(&mut self, at: Instant) {
+        self.open.get_or_insert(at);
+    }
+
+    /// A decoded picture came out at `at`: true when it closed a withheld span.
+    pub fn on_picture(&mut self, at: Instant) -> bool {
+        self.open
+            .take()
+            .is_some_and(|from| at.saturating_duration_since(from) >= self.min)
+    }
+}
+
 /// A window's length (the field definitions above: "the last complete 1 s window").
 pub const STATS_WINDOW: Duration = Duration::from_secs(1);
 
@@ -342,7 +406,67 @@ impl BeatRate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::config::OutputProfile;
+    use domain::config::{OutputProfile, Thresholds};
+
+    // C3 (S5 item 1): the spans the decoder withheld, in sequence: a normal frame (units then a picture
+    // a few ms later), a withheld span at the bound exactly and 1 ms under it, a silence then a prompt
+    // picture, two spans in a row, and a picture with no unit before it. The bound is the programme's
+    // freeze (`frozen_after_ms`), from the domain's own declaration.
+    #[test]
+    fn a_span_counts_when_units_went_in_and_no_picture_came_out_for_the_freeze() {
+        let min = ms(Thresholds::default().frozen_after_ms);
+        let t0 = Instant::now();
+        let mut w = WithheldSpans::new(min);
+        let mut checked = 0;
+        // Normal decoding: one unit, its picture 30 ms later.
+        w.on_unit(t0);
+        assert!(!w.on_picture(t0 + ms(30)), "a normal frame");
+        checked += 1;
+        // Units for exactly the bound, no picture: counted at the picture.
+        let a = t0 + ms(100);
+        for k in 0..20 {
+            w.on_unit(a + ms(k * 33));
+        }
+        assert!(w.on_picture(a + min), "withheld for the bound");
+        checked += 1;
+        // 1 ms under it: not counted.
+        let b = a + min + ms(10);
+        w.on_unit(b);
+        w.on_unit(b + ms(200));
+        assert!(!w.on_picture(b + min - ms(1)), "1 ms under");
+        checked += 1;
+        // A silence (no unit) of 5 s, then a unit decoded at once: not withholding.
+        let c = b + ms(5_000);
+        w.on_unit(c);
+        assert!(!w.on_picture(c + ms(20)), "a silence");
+        checked += 1;
+        // Two spans in a row: each counts once.
+        let d = c + ms(100);
+        let mut n = 0;
+        for i in 0..2u64 {
+            let from = d + ms(i * 2_000);
+            w.on_unit(from);
+            w.on_unit(from + ms(400));
+            n += usize::from(w.on_picture(from + ms(900)));
+        }
+        assert_eq!(n, 2, "two spans");
+        checked += 1;
+        // A picture with no unit before it (none open): nothing.
+        assert!(!w.on_picture(d + ms(10_000)), "nothing open");
+        checked += 1;
+        eprintln!("withheld-span steps checked: {checked}");
+        assert_eq!(checked, 6);
+    }
+
+    #[test]
+    fn the_loss_counts_only_grow_from_zero() {
+        let l = InputLoss::default();
+        assert_eq!((l.withheld_spans(), l.queue_overruns()), (0, 0));
+        l.add_withheld_span();
+        l.add_queue_overrun();
+        l.add_queue_overrun();
+        assert_eq!((l.withheld_spans(), l.queue_overruns()), (1, 2));
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)

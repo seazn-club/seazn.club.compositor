@@ -9,7 +9,12 @@ use crate::time::Ms;
 pub struct Thresholds {
     /// PDF robustness state machine: "no frame 0.5 s" → Frozen.
     pub frozen_after_ms: Ms,
-    /// PDF state machine "no frame 3 s" → Reconnecting slate; timing budget "slate ≤ 3.1 s".
+    /// PDF state machine "no frame 3 s" → Reconnecting slate; timing budget "slate ≤ 3.1 s". The
+    /// owner's ruling, 2026-11-24 (C3, S5 item 3: "keep the frozen picture, 4.5 s slate"): 4.5 s. The
+    /// phone publishes a 3 s GOP (C1, F-036), and with `avdec_h264`'s `output-corrupt=false` (Owed 48)
+    /// a lost reference holds the last good picture until the next keyframe, up to one GOP; at 3 s the
+    /// slate went up on every such freeze. One phone GOP and a 1.5 s margin, so a freeze that ends at
+    /// the GOP's keyframe never slates. The budget moves with it (`slate_budget_ms`).
     pub slate_after_ms: Ms,
     /// PDF: "a return to live requires 1 s of continuous frames".
     pub resume_after_ms: Ms,
@@ -31,10 +36,30 @@ pub struct Thresholds {
     /// relay gave up six connects in a row while the camera was back.
     pub input_connect_timeout_ms: Ms,
     /// Spec §6 "reconnect forever": a Running input that delivers no frame for this long is treated as
-    /// a Stalled loss and rebuilt. Set after the 3 s slate so the viewer sees the slate first. F-002
+    /// a Stalled loss and rebuilt. Set after the slate so the viewer sees the slate first (the slate
+    /// moved to 4.5 s by the owner's ruling of 2026-11-24, and this stays: `stall_comes_after_the_slate`
+    /// pins the gap at a tick at least, and the take-back (C3, S2) makes a stall that ends inside the
+    /// back-off cost no rebuild). F-002
     /// confirmed it is needed: CF holds a silent, encrypted playback socket open indefinitely after the
     /// phone stops publishing.
     pub input_stall_after_ms: Ms,
+    /// C3 (S2 item 2): while bytes still leave the camera's SRT source (`input_bytes_fresh_ms`) and no
+    /// frame decodes, a Running input is waiting on its decoder, not on a dead socket, so the stall
+    /// rule waits this long instead of `input_stall_after_ms`. Derived (`input_decode_wait_ms`): the
+    /// stall and one phone GOP (`CAMERA_GOP_MS`). With `output-corrupt=false` (Owed 48) a lost
+    /// reference withholds every frame to the next keyframe, and a lost keyframe to the one after
+    /// it: up to two GOPs (6 s) from the last good frame, which this clears; a decoder wedged with
+    /// bytes still arriving is rebuilt here, 3 s later than a silent one. A silent socket is never
+    /// extended: Cloudflare's held broadcast carries no byte (F-032) and a dead pull none (F-002).
+    pub input_decode_wait_ms: Ms,
+    /// C3 (S2 item 2): bytes "still arrive" while the build's source byte count rose within this
+    /// long. One SRT latency (`input_srt_latency_ms`, F-002's 1 000 ms): libsrt's live mode hands
+    /// each packet on a latency after it was sent, so a sender that still publishes moves the count
+    /// many times inside it (a 1 316 B payload per SRT packet; the phone's audio alone fills several
+    /// a second), and a whole latency with no byte is a sender gone quiet. The driver reads the
+    /// count once per tick (C08), well inside it (`TICK_WIDEST_MS`). C3's choice: the stg counters
+    /// read it (Owed 111).
+    pub input_bytes_fresh_ms: Ms,
     /// C10: the SRT receive latency the input pipeline asks of CF Input A's playback (`srtsrc`
     /// `latency`, in its URI). The POC's `INPUT_LATENCY_MS` (1 000). F-002 measured every CF reader
     /// at 1 000 ms: 0 packets lost or retransmitted in 120 s, the first AU at 2.22–3.89 s, and an
@@ -243,6 +268,37 @@ pub const FORCED_KEYFRAME_MARGIN_MS: Ms = 200;
 /// time, the stream's own clock: a wall-clock rule cannot see when the last keyframe was encoded.
 pub const FORCED_KEYFRAME_MIN_INTERVAL_MS: Ms = CF_KEYFRAME_INTERVAL_MIN_MS + FORCED_KEYFRAME_MARGIN_MS;
 
+/// The phone's GOP: the capture app publishes a keyframe every 3 s (the C1 brief; F-036, the same
+/// 2 s edge `PROGRAMME_GOP_MS` moved off). The camera side's, not ours: the decode wait reads it
+/// (`input_decode_wait_ms`), and the owner's 4.5 s slate is one of it and a margin.
+pub const CAMERA_GOP_MS: Ms = 3_000;
+
+/// C3 (S5 item 2): the most compressed camera video the queue before the decoder holds, as running
+/// time. The queue no longer leaks: a dropped access unit loses a reference mid-GOP, and with
+/// `output-corrupt=false` (Owed 48) the picture then freezes to the next keyframe, up to a whole phone
+/// GOP; a full queue blocks the source instead, and libsrt's too-late drop is the one loss left on the
+/// leg. The bound: one phone GOP (`CAMERA_GOP_MS`), so a decoder that waits a GOP for its keyframe
+/// still has room, and one SRT latency (`input_srt_latency_ms`, F-002's 1 000 ms), the burst
+/// libsrt releases after a network pause. A decoder wedged past it blocks the pull, and the stall
+/// rule rebuilds it (the bytes stop with it, so no decode wait extends it). A full queue blocks
+/// tsdemux, so the camera's audio stops with its video until the decoder drains or the rebuild.
+// `+ 1_000` is `input_srt_latency_ms` (a `const` cannot read `Thresholds::default()`):
+// `the_camera_video_queue_holds_a_phone_gop_and_one_srt_latency` pins the two equal.
+pub const CAMERA_VIDEO_QUEUE_MS: Ms = CAMERA_GOP_MS + 1_000;
+
+/// C3 (the C3 review's minor): the same queue's byte cap, GStreamer's own `max-size-bytes` default
+/// (10 MiB) set explicitly. Time is the bound (`CAMERA_VIDEO_QUEUE_MS`; the queue's buffer cap is
+/// off, since its default 200 would cut the bound to 3.3 s at 60 fps); the bytes are the backstop
+/// for buffers with no timestamp, and hold the 4 s at up to 20 Mbit/s.
+pub const CAMERA_VIDEO_QUEUE_BYTES: u32 = 10 * 1024 * 1024;
+
+/// C3 (S2 item 2), derived in one place: the stall rule's bound while bytes still arrive, the stall
+/// and one phone GOP (`Thresholds::input_decode_wait_ms`'s doc). A const fn, so the default and the
+/// config test read the same terms.
+pub const fn input_decode_wait_ms(input_stall_after_ms: Ms) -> Ms {
+    input_stall_after_ms + CAMERA_GOP_MS
+}
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -328,7 +384,19 @@ pub const FRAME_GRAB_WAIT_MS: Ms = 1_000;
 /// encode takes milliseconds, so this only bounds a stuck encoder.
 pub const FRAME_ENCODE_WAIT_MS: Ms = 2_000;
 
+/// The PDF's timing budget "slate ≤ 3.1 s" against its own 3 s threshold: the 100 ms the tick that
+/// sees the threshold may take. The owner's ruling of 2026-11-24 moved the threshold to 4.5 s and
+/// kept this slack, so the budget is the threshold and this (`Thresholds::slate_budget_ms`).
+pub const SLATE_BUDGET_SLACK_MS: Ms = 3_100 - 3_000;
+
 impl Thresholds {
+    /// The slate's budget (spec §6 "slate after camera loss", amended 2026-11-24 with the owner's
+    /// ruling): the reconnecting slate is on air at most this long after the last camera frame. The
+    /// threshold and the PDF's slack (`SLATE_BUDGET_SLACK_MS`), so a move of the threshold moves it.
+    pub fn slate_budget_ms(&self) -> Ms {
+        self.slate_after_ms + SLATE_BUDGET_SLACK_MS
+    }
+
     /// C2 (S3), derived: the least time between two heartbeats once a programme phase change asks
     /// for one before the cadence's (the "edge beat"). It is `resume_after_ms`, the shortest stay the
     /// programme table guarantees the reconnecting slate: a return needs that long of frames, all
@@ -348,15 +416,18 @@ impl Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         let (output_backoff_base_ms, output_connect_timeout_ms) = (500, 5_000);
+        let (input_stall_after_ms, input_srt_latency_ms) = (5_000, 1_000);
         Self {
             frozen_after_ms: 500,
-            slate_after_ms: 3_000,
+            slate_after_ms: 4_500,
             resume_after_ms: 1_000,
             input_backoff_base_ms: 1_000,
             input_backoff_cap_ms: 4_000,
             input_connect_timeout_ms: 9_000,
-            input_stall_after_ms: 5_000,
-            input_srt_latency_ms: 1_000,
+            input_stall_after_ms,
+            input_decode_wait_ms: input_decode_wait_ms(input_stall_after_ms),
+            input_bytes_fresh_ms: input_srt_latency_ms,
+            input_srt_latency_ms,
             input_hold_end_after_ms: 20_000,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
@@ -455,23 +526,41 @@ mod tests {
 
     const BOTH_MODES: [OutputProfile; 2] = [OutputProfile::P720, OutputProfile::P1080];
 
+    // The PDF state machine's frozen and resume numbers; the slate is the owner's ruling of
+    // 2026-11-24 ("keep the frozen picture, 4.5 s slate"): one 3 s phone GOP (C1, F-036) and a margin.
     #[test]
     fn programme_thresholds_match_the_pdf_state_machine() {
         let t = Thresholds::default();
         assert_eq!(
             (t.frozen_after_ms, t.slate_after_ms, t.resume_after_ms),
-            (500, 3_000, 1_000)
+            (500, 4_500, 1_000)
+        );
+        let phone_gop = 3_000;
+        assert!(
+            t.slate_after_ms > phone_gop,
+            "a freeze to the next keyframe must not slate"
         );
     }
 
-    // In both modes (ADR 0005) a tick may land one frame late, and the slate is still on screen by 3.1 s.
+    // In both modes (ADR 0005) a tick may land one frame late, and the slate is still on screen inside
+    // its budget: the PDF's 3.1 s for a 3 s threshold, so the threshold and 100 ms (4.6 s since the
+    // owner's ruling of 2026-11-24).
     #[test]
-    fn slate_lands_inside_the_3_1_s_budget_with_one_frame_of_tick_jitter() {
+    fn slate_lands_inside_its_budget_with_one_frame_of_tick_jitter() {
         let t = Thresholds::default();
+        assert_eq!(SLATE_BUDGET_SLACK_MS, 100, "the PDF's 3.1 s against its 3 s");
+        assert_eq!(
+            t.slate_budget_ms(),
+            4_500 + 100,
+            "the ruling's 4.5 s and the PDF's slack"
+        );
+        let mut checked = 0;
         for p in BOTH_MODES {
             let worst = t.slate_after_ms as f64 + p.frame_period_ms();
-            assert!(worst <= 3_100.0, "{p:?}: slate at {worst} ms");
+            assert!(worst <= t.slate_budget_ms() as f64, "{p:?}: slate at {worst} ms");
+            checked += 1;
         }
+        assert_eq!(checked, BOTH_MODES.len());
     }
 
     // C2 (S3): the edge beat's gap lets the slate's entry beat after a freeze; it is under the cadence
@@ -494,12 +583,26 @@ mod tests {
         );
     }
 
+    // The stall rule fires after the slate is on air: the slate goes up on the first tick at or past
+    // `slate_after_ms`, at most `TICK_WIDEST_MS` late, and the stall is read on a tick too, so the
+    // slate is on screen at least one tick before the input is given up. With the 4.5 s slate (the
+    // owner's ruling, 2026-11-24) the gap is 500 ms, a tick and more; the stall default stays 5 s.
     #[test]
-    fn input_stall_rebuild_comes_after_the_slate() {
+    fn stall_comes_after_the_slate() {
         let t = Thresholds::default();
         assert!(
             t.input_stall_after_ms > t.slate_after_ms,
             "viewers see the slate before the input is torn down"
+        );
+        assert!(
+            t.input_stall_after_ms >= t.slate_after_ms + TICK_WIDEST_MS,
+            "the slate is on air a tick before the stall: {} − {}",
+            t.input_stall_after_ms,
+            t.slate_after_ms
+        );
+        assert_eq!(
+            t.input_stall_after_ms, 5_000,
+            "spec §6's stall, unmoved by the slate ruling"
         );
     }
 
@@ -610,6 +713,51 @@ mod tests {
         assert!(t.input_connect_timeout_ms > brief_estimate);
         assert!(t.input_connect_timeout_ms > f032_slowest + (gop_now - gop_then));
         assert!(t.input_hold_end_after_ms > t.input_stall_after_ms + t.input_connect_timeout_ms);
+    }
+
+    // C3 (S2 item 2), each term from its source, written here: the stall rule's 5 s (spec §6), the
+    // phone's 3 s GOP (the C1 brief), and the worst decoder wait with `output-corrupt=false`, a lost
+    // keyframe, so two GOPs from the last good frame. The extension clears that wait, stays short of
+    // the hold-end gate with a whole connect after it (F-032: a hold-end close must still read as one),
+    // and is the stall's own bound when no byte arrives (the fresh window is under the stall).
+    #[test]
+    fn the_decode_wait_clears_a_lost_keyframe_and_keeps_the_hold_end_gate() {
+        let t = Thresholds::default();
+        let (stall, phone_gop) = (5_000, 3_000);
+        assert_eq!(CAMERA_GOP_MS, phone_gop, "the C1 brief's 3 s");
+        assert_eq!(t.input_decode_wait_ms, stall + phone_gop, "the stall and one GOP");
+        assert!(t.input_decode_wait_ms > t.input_stall_after_ms);
+        assert!(t.input_decode_wait_ms >= 2 * phone_gop, "a lost keyframe's wait");
+        assert!(t.input_hold_end_after_ms > t.input_decode_wait_ms + t.input_connect_timeout_ms);
+    }
+
+    // C3 (S5 item 2): the camera's pre-decoder queue holds one phone GOP and one SRT latency, each
+    // from its source (the C1 brief's 3 s, F-002's 1 000 ms), and so more than a whole lost
+    // keyframe's GOP; it is under the stall, so a queue that fills (a wedged decoder) is rebuilt by
+    // the stall rule well after it, and the hung-decoder probe's 3 s (adapters input.rs) fits in it.
+    #[test]
+    fn the_camera_video_queue_holds_a_phone_gop_and_one_srt_latency() {
+        let t = Thresholds::default();
+        assert_eq!(CAMERA_VIDEO_QUEUE_MS, 3_000 + 1_000);
+        assert_eq!(CAMERA_VIDEO_QUEUE_MS, CAMERA_GOP_MS + t.input_srt_latency_ms);
+        assert!(t.input_srt_latency_ms > 0, "so the queue holds more than a GOP");
+        assert!(CAMERA_VIDEO_QUEUE_MS < t.input_stall_after_ms);
+        // The byte backstop holds the whole bound at 20 Mbit/s (a phone's 1080p ceiling), so the
+        // time bound is the one that acts.
+        assert_eq!(CAMERA_VIDEO_QUEUE_BYTES, 10_485_760, "GStreamer queue's default");
+        assert!(u64::from(CAMERA_VIDEO_QUEUE_BYTES) * 8 * 1_000 / CAMERA_VIDEO_QUEUE_MS >= 20_000_000);
+    }
+
+    // C3 (S2 item 2): bytes count as still arriving for one SRT latency (F-002's 1 000 ms). The window
+    // is read once per tick, so it holds several ticks, and it is under the stall, so a sender gone
+    // quiet before the stall bound is stalled at the plain bound.
+    #[test]
+    fn the_bytes_window_is_one_srt_latency_and_under_the_stall() {
+        let t = Thresholds::default();
+        assert_eq!(t.input_bytes_fresh_ms, 1_000, "F-002's SRT latency");
+        assert_eq!(t.input_bytes_fresh_ms, t.input_srt_latency_ms);
+        assert!(t.input_bytes_fresh_ms > 2 * TICK_WIDEST_MS);
+        assert!(t.input_bytes_fresh_ms < t.input_stall_after_ms);
     }
 
     // C10: the SRT latency is the one every F-002 reader used (1 000 ms), so the measured first-frame

@@ -182,6 +182,8 @@ fn full_measured() -> Measured {
         camera_frames_replaced: Some(57),
         input_received_fps: Some(29.9),
         input_received_kbps: Some(3_500),
+        input_withheld_spans: Some(4),
+        input_queue_overruns: Some(2),
     }
 }
 
@@ -461,6 +463,8 @@ fn a_measured_zero_is_sent_as_zero() {
         // Not on a default beat (C2, S4): `the_camera_keys_stay_off_a_default_beat…`.
         input_received_fps: Some(0.0),
         input_received_kbps: Some(0),
+        input_withheld_spans: Some(0),
+        input_queue_overruns: Some(0),
     };
     let wire = heartbeat_wire(&report(), &m);
     let mut checked = 0;
@@ -585,7 +589,8 @@ fn the_camera_keys_stay_off_a_default_beat_and_the_vendored_contract_refuses_the
         .expect("the heartbeat's properties")
         .clone();
     let proposed = proposed_input_keys();
-    assert_eq!(proposed.len(), 4, "the proposal's keys: {:?}", proposed.keys());
+    // C2's four and C3's two (S5: the loss totals).
+    assert_eq!(proposed.len(), 6, "the proposal's keys: {:?}", proposed.keys());
     let mut checked = 0;
     for r in all_give_up_reasons() {
         let h = HealthReport {
@@ -595,6 +600,8 @@ fn the_camera_keys_stay_off_a_default_beat_and_the_vendored_contract_refuses_the
         let m = Measured {
             input_received_fps: Some(30.0),
             input_received_kbps: Some(2_500),
+            input_withheld_spans: Some(3),
+            input_queue_overruns: Some(1),
             ..Measured::default()
         };
         let wire = heartbeat_wire(&h, &m);
@@ -672,11 +679,16 @@ fn an_input_beat_writes_the_proposed_keys_and_only_their_words() {
         &Measured {
             input_received_fps: Some(0.0),
             input_received_kbps: Some(0),
+            input_withheld_spans: Some(0),
+            input_queue_overruns: Some(0),
             ..Measured::default()
         },
     );
     assert_eq!(zero["inputReceivedFps"].as_f64(), Some(0.0));
     assert_eq!(zero["inputReceivedKbps"], 0);
+    // C3 (S5): the loss totals, a measured zero as 0.
+    assert_eq!(zero["inputWithheldSpans"], 0);
+    assert_eq!(zero["inputQueueOverruns"], 0);
     let bad = heartbeat_wire_input(
         &report(),
         &Measured {
@@ -1372,8 +1384,10 @@ impl World {
                 Effect::DrainOutput => self.pending.push(Event::OutputDrained),
                 Effect::SendHeartbeat(h) => self.beats.push(h),
                 Effect::Exit(c) => self.exit = Some(c),
-                // The input connects at once here, so no generation is given up (C10b).
+                // The input connects at once here, so no generation is given up (C10b), and none is
+                // taken back (C3).
                 Effect::AbandonInput { .. }
+                | Effect::TakeBackInput { .. }
                 | Effect::FetchSession
                 | Effect::StartProgramme
                 | Effect::HideOverlay { .. }

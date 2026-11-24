@@ -380,7 +380,8 @@ fn camera_drop_repeats_then_slates_through_the_real_driver() {
         now += 33;
     }
     let stop = now;
-    while now < stop + 4_000 {
+    // Past the slate's threshold (4.5 s since the owner's ruling of 2026-11-24), from the default.
+    while now < stop + th().slate_after_ms + 1_000 {
         d.tick_due(now);
         now += 33;
     }
@@ -430,8 +431,11 @@ fn phase_is_published_on_change_only_with_a_rising_seq() {
     let period = OutputProfile::P720.frame_period_ms().round() as u64;
     // Spec §5's walk: frames until Live, a stop past frozen_after_ms then slate_after_ms, frames past
     // resume_after_ms, an Ending reply, then the hold and the drain.
+    // The stop ends halfway between the slate and the stall rule (harness case 2's pause), so the
+    // slate goes up and generation 1 is never given up: since the owner's 4.5 s slate (2026-11-24)
+    // a second past the slate is past the 5 s stall.
     let stop = SESSION_AT + t.resume_after_ms + 1_000;
-    let back = stop + t.slate_after_ms + 1_000;
+    let back = stop + (t.slate_after_ms + t.input_stall_after_ms) / 2;
     let ending = back + t.resume_after_ms + 500;
     let back_until = ending + 500;
     // The camera connects first (C10b: frames of an input given up at its connect timeout count for
@@ -524,9 +528,10 @@ fn a_phase_change_is_logged_once_and_rides_the_next_beat_through_the_driver() {
                 ..session_720p()
             },
         );
-        // Frames until Live, a stop past the slate, frames back past a return.
+        // Frames until Live, a stop past the slate (and short of the stall rule, which a second past
+        // the 4.5 s slate would reach), frames back past a return.
         let stop = SESSION_AT + t.resume_after_ms + 1_000;
-        let back = stop + t.slate_after_ms + 1_000;
+        let back = stop + (t.slate_after_ms + t.input_stall_after_ms) / 2;
         let end = back + t.resume_after_ms + 2_000;
         let mut events = vec![(SESSION_AT, ev(Event::InputConnected { gen: 1 }))];
         events.extend(every(SESSION_AT, stop, period, || frame(1)));
@@ -1731,18 +1736,21 @@ fn camera_frames_replaced_is_logged_once_a_beat_with_the_beats_rise() {
     assert_eq!(want.len(), script.len() + 1);
 }
 
-/// The camera's two rates as a sample carries them: fps, kbit/s.
-type Rates = (Option<f64>, Option<u64>);
+/// The camera's two rates as a sample carries them: fps, kbit/s; and (C3, S5) its two loss totals,
+/// withheld spans and queue overruns.
+type Rates = (Option<f64>, Option<u64>, Option<u64>, Option<u64>);
 
-/// A `Metrics` whose camera rates (C2, S4) the test sets between beats.
+/// A `Metrics` whose camera rates (C2, S4) and loss totals (C3) the test sets between beats.
 struct ScriptedReceived(Arc<Mutex<Rates>>);
 
 impl Metrics for ScriptedReceived {
     fn sample(&mut self) -> Measured {
-        let (fps, kbps) = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let (fps, kbps, withheld, overruns) = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
         Measured {
             input_received_fps: fps,
             input_received_kbps: kbps,
+            input_withheld_spans: withheld,
+            input_queue_overruns: overruns,
             ..metrics()
         }
     }
@@ -1754,7 +1762,7 @@ impl Metrics for ScriptedReceived {
 #[test]
 fn the_camera_as_received_is_logged_once_a_beat_when_measured() {
     let log = Log::default();
-    let rates = Arc::new(Mutex::new((None, None)));
+    let rates = Arc::new(Mutex::new((None, None, None, None)));
     let set = |r: Rates| *rates.lock().unwrap_or_else(PoisonError::into_inner) = r;
     let mut p = ports(&log, metrics());
     p.metrics = Box::new(ScriptedReceived(Arc::clone(&rates)));
@@ -1764,13 +1772,26 @@ fn the_camera_as_received_is_logged_once_a_beat_when_measured() {
     let lines = || lines_starting(&log, "input received");
     let mut at = next_beat(&mut d, &log);
     assert!(lines().is_empty(), "not measured: no line");
-    let script: [(Rates, Option<&str>); 6] = [
-        ((Some(29.97), Some(2_500)), Some("fps=30.0 kbps=2500")),
-        ((Some(0.0), Some(0)), Some("fps=0.0 kbps=0")),
-        ((Some(12.0), None), Some("fps=12.0 kbps=-")),
-        ((None, Some(800)), Some("fps=- kbps=800")),
-        ((Some(f64::NAN), None), None),
-        ((None, None), None),
+    let script: [(Rates, Option<&str>); 9] = [
+        ((Some(29.97), Some(2_500), None, None), Some("fps=30.0 kbps=2500")),
+        ((Some(0.0), Some(0), None, None), Some("fps=0.0 kbps=0")),
+        ((Some(12.0), None, None, None), Some("fps=12.0 kbps=-")),
+        ((None, Some(800), None, None), Some("fps=- kbps=800")),
+        ((Some(f64::NAN), None, None, None), None),
+        ((None, None, None, None), None),
+        // C3 (S5): the loss totals follow when measured, `-` for the one not; alone they still log.
+        (
+            (Some(30.0), Some(2_000), Some(3), Some(1)),
+            Some("fps=30.0 kbps=2000 withheld_spans=3 queue_overruns=1"),
+        ),
+        (
+            (None, None, Some(0), Some(0)),
+            Some("fps=- kbps=- withheld_spans=0 queue_overruns=0"),
+        ),
+        (
+            (None, None, None, Some(2)),
+            Some("fps=- kbps=- withheld_spans=- queue_overruns=2"),
+        ),
     ];
     let mut want = Vec::new();
     for (r, line) in script {
@@ -1781,13 +1802,13 @@ fn the_camera_as_received_is_logged_once_a_beat_when_measured() {
         }
         assert_eq!(lines(), want, "the beat at {at}: {r:?}");
     }
-    set((Some(1.0), Some(1)));
+    set((Some(1.0), Some(1), None, None));
     assert_eq!(d.step(ev(Event::Signal(SignalKind::Term)), at + 1), None);
     assert_eq!(d.step(ev(Event::OutputDrained), at + 2), Some(0));
     want.push("input received fps=1.0 kbps=1".to_owned());
     assert_eq!(lines(), want, "the final beat's line");
     eprintln!("input received beats checked: {}", script.len() + 1);
-    assert_eq!(want.len(), 5);
+    assert_eq!(want.len(), 8);
 }
 
 /// A `Metrics` whose `fps` (the real output rate, Owed 86) the test sets between beats.

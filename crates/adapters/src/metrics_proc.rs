@@ -10,6 +10,7 @@
 //! | `camera_frames_replaced` | `Stats::snapshot()`, unchanged; logged by the driver, never on the wire (Owed 90) |
 //! | `input_received_fps` | the camera as the relay receives it (C2, S4): the decoded camera frames the input wrote into the programme's camera slot since the last sample (`FrameStore::camera_written`, which counts only an open gate's), over the wall time since it (`BeatRate`); absent until a window has both ends, and absent with no camera reader (`with_camera`) |
 //! | `input_received_kbps` | the bytes out of the camera pull's `srtsrc`, every build's, decoded or not (`ReceivedBytes`), since the last sample, over the wall time since it, × 8 / 1000, rounded (`BeatRate`); absent as above |
+//! | `input_withheld_spans`, `input_queue_overruns` | the camera's losses before the picture (C3, S5; `InputLoss`), process totals as the camera reader reads them, once a sample; absent with no camera reader |
 //! | `memory()` (not a `Measured` field) | the last sample's `/proc/<pid>/status` read of this process (`VmRSS`, `RssAnon`, `RssFile`, `RssShmem`, `Threads`: the read `mem_mb` already makes) and the CEF child poll's last PSS by kind (`with_cef`); logged by the driver once a minute, never on the wire (the soak's memory split) |
 //! | `measured_latency_ms` | never: it needs SEI (F-003), so it is omitted, never 0 |
 //!
@@ -155,6 +156,10 @@ pub struct CameraTotals {
     pub frames_written: u64,
     /// Bytes out of the camera pull's `srtsrc`, every build's (`ReceivedBytes`).
     pub bytes_received: u64,
+    /// The decoder's withheld spans, every build's (C3, S5; `InputLoss`).
+    pub withheld_spans: u64,
+    /// The pre-decoder queue's overruns, every build's (C3, S5; `InputLoss`).
+    pub queue_overruns: u64,
 }
 
 /// Reads the camera's totals (`with_camera`).
@@ -236,6 +241,9 @@ impl Metrics for ProcMetrics {
         let fps = self.rate.sample(now, s.encoded_frames);
         let camera = self.camera.as_ref().map(|read| read());
         let (input_received_fps, input_received_kbps) = self.camera_rates(now, camera);
+        // C3 (S5): totals, not rates: passed on as read, absent with no camera reader.
+        let input_withheld_spans = camera.map(|c| c.withheld_spans);
+        let input_queue_overruns = camera.map(|c| c.queue_overruns);
         let tree = process_tree(self.root);
         let ticks: BTreeMap<ProcKey, u64> = tree
             .iter()
@@ -278,6 +286,8 @@ impl Metrics for ProcMetrics {
             camera_frames_replaced: s.camera_frames_replaced,
             input_received_fps,
             input_received_kbps,
+            input_withheld_spans,
+            input_queue_overruns,
         }
     }
 

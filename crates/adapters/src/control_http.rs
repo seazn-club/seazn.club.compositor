@@ -170,7 +170,8 @@ pub fn heartbeat_wire_with(report: &HealthReport, measured: &Measured, airings: 
 }
 
 /// `heartbeat_wire` with the camera's keys on (C2, S4; `RELAY_INPUT_BEAT`): `inputGiveUpReason`,
-/// `inputGiveUpGen`, `inputReceivedFps` and `inputReceivedKbps`, each when known.
+/// `inputGiveUpGen`, `inputReceivedFps` and `inputReceivedKbps`, and (C3, S5) `inputWithheldSpans`
+/// and `inputQueueOverruns`, each when known.
 pub fn heartbeat_wire_input(report: &HealthReport, measured: &Measured) -> Value {
     wire(
         report,
@@ -268,6 +269,13 @@ fn wire(
         }
         if let Some(n) = measured.input_received_kbps {
             put("inputReceivedKbps", int(n));
+        }
+        // C3 (S5 item 1): the camera's loss totals, under the same flag.
+        if let Some(n) = measured.input_withheld_spans {
+            put("inputWithheldSpans", int(n));
+        }
+        if let Some(n) = measured.input_queue_overruns {
+            put("inputQueueOverruns", int(n));
         }
     }
     // The exit keys ride only a `stopped` beat (the contract's if/then; web answers 400 otherwise).

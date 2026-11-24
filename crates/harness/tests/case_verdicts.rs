@@ -785,6 +785,125 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
     );
 }
 
+/// C3's case 20: netem loss 20 s to 60 s (`dropped` packets), then a `pause_ms` pause at 70 s. As CI
+/// run 45480676592 read it: the compositor's first pull, before MediaMTX has the camera, is given up
+/// `error` at boot, so generation 2 is live at the pause. The stall rule gives it up `give_up_after`
+/// ms after the pause mark (the camera's last frame arrives a latency after it, then the stall) and,
+/// `taken_back`, the domain takes it back when the camera's first frame returns.
+fn camera_gop_loss_at(pause_ms: i64, dropped: u64, taken_back: bool, give_up_after: i64) -> World {
+    let mut w = World::new(100);
+    w.line(w.at(-7.0), "input give up gen=1 reason=error");
+    let (a, b) = (w.at(20.0), w.at(60.0));
+    w.mark("impair", a, Value::Null);
+    w.mark(
+        "netem_in",
+        b,
+        json!({"leg": "in", "present": true, "sent_bytes": 30_000_000,
+        "sent_pkts": 25_000, "dropped": dropped}),
+    );
+    w.mark("clear", b + 20, Value::Null);
+    let p = w.at(70.0);
+    let r = p + pause_ms;
+    w.mark("pause", p, json!({"pause_ms": pause_ms}));
+    w.mark("resume", r, Value::Null);
+    w.camera_gaps.push((p + 30, r + 30));
+    if pause_ms > w.ms("input_stall_after_ms") {
+        w.line(p + give_up_after, "input give up gen=2 reason=stalled");
+        if taken_back {
+            w.line(r.max(p + give_up_after) + 300, "input take back gen=2");
+        }
+    }
+    w
+}
+
+/// The case's own pause (stall + half the first back-off) and CI's latency (1 300 ms, run
+/// 45480676592's glass-to-glass p50) before the stall.
+fn camera_gop_loss(pause_ms: i64, dropped: u64, taken_back: bool) -> World {
+    let stall = World::new(1).ms("input_stall_after_ms");
+    camera_gop_loss_at(pause_ms, dropped, taken_back, 1_300 + stall)
+}
+
+fn gop_pause() -> i64 {
+    let t = World::new(1);
+    t.ms("input_stall_after_ms") + t.ms("input_backoff_base_ms") / 2
+}
+
+#[test]
+fn camera_gop_loss_takes_the_camera_back_and_reds_without_the_take_back_or_its_window() {
+    let pause = gop_pause();
+    assert_pass(
+        &judge(
+            &camera_gop_loss(pause, 400, true),
+            "camera-gop-loss",
+            "",
+            "gop-good",
+        ),
+        "gop-good",
+    );
+    let mut checked = 1;
+    // No take-back line: the domain rebuilt instead.
+    assert_fails(
+        &judge(
+            &camera_gop_loss(pause, 400, false),
+            "camera-gop-loss",
+            "",
+            "gop-noback",
+        ),
+        "taken_back",
+        "gop-noback",
+    );
+    checked += 1;
+    // Nothing dropped: the loss never happened.
+    assert_fails(
+        &judge(
+            &camera_gop_loss(pause, 0, true),
+            "camera-gop-loss",
+            "",
+            "gop-nodrop",
+        ),
+        "fault_applied",
+        "gop-nodrop",
+    );
+    checked += 1;
+    // A pause the take-back cannot answer, at each edge of its window (the stall itself, and the
+    // stall plus the first back-off), each from thresholds.json.
+    let t = World::new(1);
+    for (tag, pause) in [
+        ("gop-atstall", t.ms("input_stall_after_ms")),
+        (
+            "gop-pastwindow",
+            t.ms("input_stall_after_ms") + t.ms("input_backoff_base_ms"),
+        ),
+    ] {
+        assert_fails(
+            &judge(&camera_gop_loss(pause, 400, true), "camera-gop-loss", "", tag),
+            "pause_in_window",
+            tag,
+        );
+        checked += 1;
+    }
+    // A give-up outside its window: before the stall could have elapsed, and at the decode wait (the
+    // bytes extension wrongly in force), each from thresholds.json.
+    for (tag, after) in [
+        ("gop-early", t.ms("input_stall_after_ms") - 1),
+        ("gop-decodewait", t.ms("input_decode_wait_ms")),
+    ] {
+        assert_fails(
+            &judge(
+                &camera_gop_loss_at(pause, 400, true, after),
+                "camera-gop-loss",
+                "",
+                tag,
+            ),
+            "gave_up_at_the_pause",
+            tag,
+        );
+        checked += 1;
+    }
+    eprintln!("camera-gop-loss worlds judged: {checked}");
+    assert_eq!(checked, 7);
+}
+
 /// Kicks at 20 s, 40 s, ... 120 s; each costs the input `reconnect_ms`; the alert from `alert_from`
 /// kicks on.
 fn reader_kicked(reconnect_ms: i64, alert_from: usize) -> World {
@@ -6643,8 +6762,8 @@ fn every_case_file_is_judged_here() {
     }
     eprintln!("case files checked: {n}; not chaos cases: {not_chaos}");
     assert_eq!(
-        n, 19,
-        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24), case 18 (Owed 94) and case 19 (Owed 99)"
+        n, 20,
+        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24), case 18 (Owed 94), case 19 (Owed 99) and case 20 (C3, camera-gop-loss)"
     );
     // Every name excused is a file, so the list cannot hide a renamed or a deleted case.
     assert_eq!(not_chaos, NOT_CHAOS.len(), "a NOT_CHAOS name with no case file");

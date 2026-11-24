@@ -233,6 +233,14 @@ pub struct Measured {
     /// The bytes out of the camera's SRT source over the beat window, every build's, decoded or not,
     /// in kbit/s rounded (C2, S4): `inputReceivedKbps`, under the same flag.
     pub input_received_kbps: Option<u64>,
+    /// The camera's withheld spans, this process (C3, S5 item 1; the input adapter's loss counts):
+    /// spans with compressed video into the decoder and no picture out for at least the programme's
+    /// freeze. A total that only grows; the driver adds it to the `input received` line, and the
+    /// heartbeat carries it as `inputWithheldSpans` under `RELAY_INPUT_BEAT`.
+    pub input_withheld_spans: Option<u64>,
+    /// The times the queue before the camera's decoder was full and blocked the source, this process
+    /// (C3, S5 item 1): `inputQueueOverruns`, as above.
+    pub input_queue_overruns: Option<u64>,
 }
 
 /// This process's memory from `/proc/self/status` (the soak's memory split). Each field is absent
@@ -358,10 +366,31 @@ pub trait ControlPlane: Send {
 /// programme is dropped too (so none of it goes on air), and the next `rebuild` tears it down. The adapter keeps no copy of those rules. A `gen` that is not the
 /// current build's (one already rebuilt past, or after `stop`) changes nothing, and so does a second
 /// call. It never blocks the loop: it closes a gate.
+///
+/// `take_back` (C3, S2) is the domain's word that it took generation `gen` back: the build it gave
+/// up delivered a frame at its shut gate inside the back-off (the adapter reports the first such
+/// frame as `Event::InputAgain`), so its gate re-opens and its frames reach the programme again, with
+/// no rebuild. A build reported lost since the abandon (its first error), a `gen` that is not the
+/// current build's, and a build whose gate is open change nothing: the domain's stall rule or the
+/// reported loss then rebuilds as before. It never blocks the loop.
+///
+/// `bytes` (C3, S2 item 2) is the current build's count of bytes out of its SRT source, decoded or
+/// not, with its generation; `None` with no build, or where nothing counts them (the fake mode). C08
+/// reads it once per `tick_due` that ran a tick and hands it to the domain (`Event::InputBytes`),
+/// which decides from it; it must not block: it reads a counter.
 pub trait InputSource: Send {
     fn rebuild(&mut self, gen: u64, spec: &InputSpec);
     fn abandon(&mut self, gen: u64);
+    fn take_back(&mut self, gen: u64);
+    fn bytes(&self) -> Option<InputBytes>;
     fn stop(&mut self);
+}
+
+/// The current camera build's source byte count (`InputSource::bytes`, C3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputBytes {
+    pub gen: u64,
+    pub total: u64,
 }
 
 /// The programme pipeline (C09): never rebuilt. `push` hands it tick `index`'s choice, and it

@@ -31,14 +31,14 @@ use adapters::gst_input::GstInput;
 use adapters::gst_programme::GstProgramme;
 use adapters::metrics_proc::{CameraTotals, ProcMetrics};
 use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp, RELAY_PHASE_PORT};
-use adapters::stats::{ReceivedBytes, Stats};
+use adapters::stats::{InputLoss, ReceivedBytes, Stats};
 use app::airings::Airings;
 use app::control_worker;
 use app::driver::Driver;
 use app::frame_grab::{self, FrameGrabs, FrameWorker};
 use app::ports::{
-    ControlPlane, ControlQueue, FrameTap, FrameUpload, GraphicsRenderer, Inbound, InputSource, InputSpec,
-    Metrics, PhasePublisher, Ports, ProgrammeOutput, TargetSpec,
+    ControlPlane, ControlQueue, FrameTap, FrameUpload, GraphicsRenderer, Inbound, InputBytes, InputSource,
+    InputSpec, Metrics, PhasePublisher, Ports, ProgrammeOutput, TargetSpec,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use domain::airings::{AiringLine, AiringSource, AiringStyle};
@@ -262,6 +262,16 @@ impl InputSource for LazyInput {
         }
     }
 
+    fn take_back(&mut self, gen: u64) {
+        if let Some(input) = &mut self.built {
+            input.take_back(gen);
+        }
+    }
+
+    fn bytes(&self) -> Option<InputBytes> {
+        self.built.as_ref().and_then(|input| input.bytes())
+    }
+
     fn stop(&mut self) {
         self.stopped = true;
         if let Some(input) = &mut self.built {
@@ -472,6 +482,8 @@ struct Media {
 struct Camera {
     frames: FrameStore,
     received: Arc<ReceivedBytes>,
+    /// C3 (S5): the decoder's withheld spans and the pre-decoder queue's overruns, every build's.
+    loss: Arc<InputLoss>,
 }
 
 impl Camera {
@@ -479,6 +491,8 @@ impl Camera {
         CameraTotals {
             frames_written: self.frames.camera_written(),
             bytes_received: self.received.total(),
+            withheld_spans: self.loss.withheld_spans(),
+            queue_overruns: self.loss.queue_overruns(),
         }
     }
 }
@@ -510,14 +524,17 @@ fn live_media(
     let camera = Camera {
         frames: frames.clone(),
         received: Arc::new(ReceivedBytes::default()),
+        loss: Arc::new(InputLoss::default()),
     };
     let (input_tx, input_log, input_t) = (tx.clone(), log.clone(), t.clone());
     let received = Arc::clone(&camera.received);
+    let loss = Arc::clone(&camera.loss);
     let build: InputBuilder = Box::new(move |p: &OutputProfile| -> Box<dyn InputSource> {
         Box::new(
             GstInput::new(frames.clone(), input_tx.clone(), &input_t, p.width, p.height)
                 .with_log(input_log.adapter_sink())
-                .with_received_bytes(Arc::clone(&received)),
+                .with_received_bytes(Arc::clone(&received))
+                .with_loss_counts(Arc::clone(&loss)),
         )
     });
     Media {

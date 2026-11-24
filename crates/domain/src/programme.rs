@@ -2,13 +2,14 @@
 //! robustness state machine (spec §3.3, §4.2):
 //!
 //! ```text
-//! Waiting --1 s continuous--> Live --0.5 s no frame--> Frozen --3 s no frame--> Reconnecting
+//! Waiting --1 s continuous--> Live --0.5 s no frame--> Frozen --4.5 s no frame--> Reconnecting
 //!                              ^ <------frames resume----- |                        |
 //!                              +-----------------1 s continuous---------------------+
 //! ```
 //!
 //! The PDF scheduler paragraph's "Repeat up to 1 s" is superseded by this machine (spec §3.3): the
-//! last frame repeats from 0.5 s with no frame until the 3 s slate.
+//! last frame repeats from 0.5 s with no frame until the slate (`slate_after_ms`: the PDF's 3 s, 4.5 s
+//! since the owner's ruling of 2026-11-24, one 3 s phone GOP and a margin).
 //!
 //! A `FrameChoice` picks the VIDEO layer only; the overlay is composited over every choice. Audio is
 //! not a programme choice: the track runs on in every phase with no PTS gap, real input audio or
@@ -282,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn freezes_after_half_second_then_slates_within_3_1_s_budget() {
+    fn freezes_after_half_second_then_slates_within_its_budget() {
         let out = drive(&[(0, 5_000)], 10_000);
         let last_frame = out
             .iter()
@@ -298,8 +299,8 @@ mod tests {
             frozen - last_frame
         );
         assert!(
-            slate - last_frame <= 3_100,
-            "PDF budget: slate ≤ 3.1 s, got +{}",
+            slate - last_frame <= t().slate_budget_ms(),
+            "the slate's budget (the PDF's 3.1 s, moved with the owner's 4.5 s slate): got +{}",
             slate - last_frame
         );
     }
@@ -408,7 +409,10 @@ mod tests {
             m.on_tick(now, &th);
         }
         assert_eq!(m.phase(), Live);
-        assert_eq!(m.on_tick(2_000 + 4_000, &th), Slate(SlateKind::Reconnecting));
+        assert_eq!(
+            m.on_tick(2_000 + th.slate_after_ms + 1_000, &th),
+            Slate(SlateKind::Reconnecting)
+        );
     }
 
     // ---- the empty case and the initial state ----
@@ -471,7 +475,11 @@ mod tests {
         let last = th.resume_after_ms;
         let mut m = live(&th);
         assert_eq!(m.on_tick(last + th.frozen_after_ms + 1, &th), Repeat);
-        assert_eq!(m.on_tick(last + th.slate_after_ms - 1, &th), Repeat, "3 s − 1 ms");
+        assert_eq!(
+            m.on_tick(last + th.slate_after_ms - 1, &th),
+            Repeat,
+            "the slate's threshold − 1 ms"
+        );
         assert_eq!(
             m.on_tick(last + th.slate_after_ms, &th),
             Slate(SlateKind::Reconnecting)
@@ -666,8 +674,8 @@ mod tests {
     }
 
     // ---- loss while already lost ----
-    // Frozen, then one frame: back to Live at once (PDF "frames resume"), and the 3 s slate clock
-    // restarts from that frame. A slate at "3 s after the first loss" would be wrong here.
+    // Frozen, then one frame: back to Live at once (PDF "frames resume"), and the slate clock restarts
+    // from that frame. A slate at "the threshold after the first loss" would be wrong here.
     #[test]
     fn a_single_frame_while_frozen_goes_live_and_restarts_the_slate_clock() {
         let th = t();

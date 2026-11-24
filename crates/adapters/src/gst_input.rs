@@ -2,7 +2,7 @@
 //! rebuilt on every `rebuild(gen, spec)`, so the programme pipeline never sees a reconnect:
 //!
 //! ```text
-//! srtsrc uri=<srt_uri> → tsdemux ┬→ queue(leaky, 1 s) → h264parse → avdec_h264 → videoconvertscale
+//! srtsrc uri=<srt_uri> → tsdemux ┬→ queue(blocking, 4 s) → h264parse → avdec_h264 → videoconvertscale
 //!                                │     → I420 W×H, PAR 1/1, BT.709 → appsink(video)
 //!                                └→ queue(leaky, 400 ms) → aacparse → avdec_aac → audioconvert
 //!                                      → audioresample → S16LE 48 kHz stereo → appsink(audio)
@@ -94,13 +94,11 @@ use std::sync::Condvar;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 #[cfg(feature = "test-hooks")]
 use std::thread;
-#[cfg(feature = "test-hooks")]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use app::ports::{redacted_origin, Inbound, InputSource, InputSpec};
+use app::ports::{redacted_origin, Inbound, InputBytes, InputSource, InputSpec};
 use crossbeam_channel::Sender;
-use domain::config::Thresholds;
+use domain::config::{Thresholds, CAMERA_VIDEO_QUEUE_BYTES, CAMERA_VIDEO_QUEUE_MS};
 use domain::input_link::{BuildFacts, LossReason};
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -115,11 +113,14 @@ pub use crate::input_threads::WorkerCounts;
 use crate::input_threads::{role_counts, task_counts};
 use crate::input_threads::{task_pool, TaskRole, BUILDS};
 use crate::redact::{percent_encoded, Scrubber};
-use crate::stats::ReceivedBytes;
+use crate::stats::{InputLoss, ReceivedBytes, WithheldSpans};
 
-/// The leaky queue before the video decoder holds at most 1 s (plan, Global Constraints: "decoded video
-/// 1 s … leaky, dropping the oldest"; the C10 brief puts it between the demuxer and the decoder).
-pub const VIDEO_QUEUE_NS: u64 = 1_000_000_000;
+/// The queue before the video decoder holds at most `CAMERA_VIDEO_QUEUE_MS` of compressed video and
+/// then BLOCKS the source, never drops (C3, S5 item 2; the plan's "All leaky" amended 2026-11-24): a
+/// dropped access unit loses a reference mid-GOP, and the picture freezes to the next keyframe. The
+/// decoded side still drops whole pictures (the appsink's two), and the stall rule covers a decoder
+/// wedged past the bound. Was 1 s, leaky (the C10 brief).
+pub const VIDEO_QUEUE_NS: u64 = CAMERA_VIDEO_QUEUE_MS * 1_000_000;
 /// The leaky queue before the audio decoder holds at most 400 ms (plan: "audio 400 ms").
 pub const AUDIO_QUEUE_NS: u64 = 400_000_000;
 /// Each appsink keeps at most two samples and drops the oldest (C10 brief, Step 3).
@@ -176,6 +177,8 @@ struct Shared {
     last_frame_gen: AtomicU64,
     /// Generations the domain gave up (`abandon`, C10b) while their gate was open.
     abandoned: AtomicU64,
+    /// Generations the domain took back (`take_back`, C3) whose gate this adapter re-opened.
+    taken_back: AtomicU64,
     /// Test hook: each teardown waits this many ms before its `set_state(NULL)` (0: none).
     #[cfg(feature = "test-hooks")]
     reaper_delay_ms: AtomicU64,
@@ -216,6 +219,21 @@ impl Shared {
         *open = None;
         *locked(&self.given_up) = Some(build);
         Some(self.frames.clear_audio())
+    }
+
+    /// The domain took `build` back (C3, S2): re-opens its gate when it is the build given up and the
+    /// gate is shut, under the same locks in the same order as `give_up`. False otherwise: an error
+    /// after the abandon cleared the mark (`error_of`), or a retire shut it (`shut`), and that build is
+    /// not reopened.
+    fn reopen(&self, build: u64) -> bool {
+        let mut open = locked(&self.gate);
+        let mut given_up = locked(&self.given_up);
+        if open.is_some() || *given_up != Some(build) {
+            return false;
+        }
+        *given_up = None;
+        *open = Some(build);
+        true
     }
 
     /// No build passes and none is given up: the gate for a retire (`rebuild`, `stop`, the drop).
@@ -334,6 +352,10 @@ pub struct GstInput {
     events_dropped: u64,
     /// The bytes every build's `srtsrc` has put out (C2, S4; `with_received_bytes`).
     received: Arc<ReceivedBytes>,
+    /// The camera's losses before the picture (C3, S5; `with_loss_counts`).
+    loss: Arc<InputLoss>,
+    /// A withheld span's least length: the programme's freeze (`Thresholds::frozen_after_ms`).
+    withheld_min: Duration,
 }
 
 /// One generation's pipeline.
@@ -342,8 +364,10 @@ struct Live {
     /// The gate's key for this build (`Shared::gate`).
     build: u64,
     /// When the domain gave this build up (`abandon`), until its first video sample after that is
-    /// logged (Owed 49).
+    /// logged (Owed 49) and reported to the domain (`InputAgain`, C3).
     abandoned_at: Arc<Mutex<Option<Instant>>>,
+    /// This build's bytes out of `srtsrc`, decoded or not (C3, S2 item 2: `InputSource::bytes`).
+    bytes: Arc<AtomicU64>,
     pipeline: gst::Pipeline,
     /// Ends the build's thread: it then tears the pipeline down.
     stop: Arc<AtomicBool>,
@@ -377,6 +401,7 @@ impl GstInput {
                 gate_dropped: AtomicU64::new(0),
                 last_frame_gen: AtomicU64::new(0),
                 abandoned: AtomicU64::new(0),
+                taken_back: AtomicU64::new(0),
                 #[cfg(feature = "test-hooks")]
                 reaper_delay_ms: AtomicU64::new(0),
                 #[cfg(feature = "test-hooks")]
@@ -391,6 +416,8 @@ impl GstInput {
             refused_rebuilds: 0,
             events_dropped: 0,
             received: Arc::new(ReceivedBytes::default()),
+            loss: Arc::new(InputLoss::default()),
+            withheld_min: Duration::from_millis(t.frozen_after_ms),
         };
         input.preload();
         input
@@ -400,6 +427,13 @@ impl GstInput {
     /// (`ProcMetrics::with_camera`). Call it before the first `rebuild`.
     pub fn with_received_bytes(mut self, received: Arc<ReceivedBytes>) -> Self {
         self.received = received;
+        self
+    }
+
+    /// Counts the camera's withheld spans and pre-decoder queue overruns into `loss` (C3, S5 item 1),
+    /// shared with the metrics (`ProcMetrics::with_camera`). Call it before the first `rebuild`.
+    pub fn with_loss_counts(mut self, loss: Arc<InputLoss>) -> Self {
+        self.loss = loss;
         self
     }
 
@@ -481,6 +515,11 @@ impl GstInput {
     /// Generations the domain gave up (`abandon`) while their gate was open.
     pub fn abandoned(&self) -> u64 {
         self.shared.abandoned.load(Ordering::SeqCst)
+    }
+
+    /// Generations the domain took back (`take_back`) whose gate re-opened (C3).
+    pub fn taken_back(&self) -> u64 {
+        self.shared.taken_back.load(Ordering::SeqCst)
     }
 
     /// `rebuild` calls refused (after `stop`).
@@ -648,26 +687,51 @@ impl GstInput {
             .ok_or("the source's byte probe was refused")?;
         // C2 (S4): every byte out of the source, counted for the beat's `inputReceivedKbps`. A probe
         // of its own, for the build's life: the media probe above removes itself.
+        // C3 (S2 item 2): the same bytes, this build's alone, for the domain's "bytes still arrive".
         let received = Arc::clone(&self.received);
+        let bytes = Arc::new(AtomicU64::new(0));
+        let build_bytes = Arc::clone(&bytes);
         src.static_pad("src")
             .ok_or("srtsrc has no src pad")?
             .add_probe(
                 gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
                 move |_, info| {
-                    match &info.data {
-                        Some(gst::PadProbeData::Buffer(b)) => received.add(b.size() as u64),
-                        Some(gst::PadProbeData::BufferList(l)) => received.add(l.calculate_size() as u64),
-                        _ => {}
-                    }
+                    let n = match &info.data {
+                        Some(gst::PadProbeData::Buffer(b)) => b.size() as u64,
+                        Some(gst::PadProbeData::BufferList(l)) => l.calculate_size() as u64,
+                        _ => 0,
+                    };
+                    received.add(n);
+                    build_bytes.fetch_add(n, Ordering::Relaxed);
                     gst::PadProbeReturn::Ok
                 },
             )
             .ok_or("the source's received-bytes probe was refused")?;
         let demux = make("tsdemux", "demux")?;
 
-        let vqueue = leaky_queue("vqueue", VIDEO_QUEUE_NS)?;
+        let vqueue = blocking_queue("vqueue", VIDEO_QUEUE_NS)?;
+        // C3 (S5 item 1): a full queue blocks the source; each time is counted.
+        let loss = Arc::clone(&self.loss);
+        vqueue.connect("overrun", false, move |_| {
+            loss.add_queue_overrun();
+            None
+        });
         let vparse = make("h264parse", "vparse")?;
         let vdec = make("avdec_h264", "vdec")?;
+        // C3 (S5 item 1): each access unit into the decoder opens a withheld span if none is open; the
+        // video appsink's next picture closes it (`wire_video`).
+        let withheld = Arc::new(Mutex::new(WithheldSpans::new(self.withheld_min)));
+        let units = Arc::clone(&withheld);
+        vdec.static_pad("sink")
+            .ok_or("avdec_h264 has no sink pad")?
+            .add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_, _| {
+                    locked(&units).on_unit(Instant::now());
+                    gst::PadProbeReturn::Ok
+                },
+            )
+            .ok_or("the decoder's unit probe was refused")?;
         // The owner's ruling, 2026-10-19 (Owed 48): a frame with damaged macroblocks is dropped, so
         // after a loss the slot holds the last good picture for a moment instead of airing smears.
         vdec.set_property("output-corrupt", false);
@@ -738,7 +802,7 @@ impl GstInput {
 
         self.link_demux(&demux, &vqueue, &aqueue, gen);
         let abandoned_at = Arc::new(Mutex::new(None));
-        self.wire_video(&vsink, build, gen, Arc::clone(&abandoned_at));
+        self.wire_video(&vsink, build, gen, Arc::clone(&abandoned_at), withheld);
         self.wire_audio(&asink, build);
         let errored = Arc::new(Mutex::new(None));
         self.sync_handler(&pipeline, build, &errored)?;
@@ -746,6 +810,7 @@ impl GstInput {
             gen,
             build,
             abandoned_at,
+            bytes,
             pipeline,
             stop: Arc::new(AtomicBool::new(false)),
             errored,
@@ -792,21 +857,32 @@ impl GstInput {
     /// logs `gen=<g>: video again <ms> ms after the abandon`, once a build. A stalled connection that
     /// starts delivering again inside the back-off is what the line records (does CF wake a silent
     /// reader?); video only, so a camera whose audio carries on never writes it, and a build retired
-    /// without an abandon never does.
+    /// without an abandon never does. C3 (S2) makes it a fact: the same sample sends
+    /// `InputAgain { gen }`, once an abandon, and the domain decides whether to take the build back
+    /// (`take_back`). Tried, never waited for: a full channel loses it, and the build is rebuilt as
+    /// before.
+    ///
+    /// C3 (S5 item 1): every picture out of the decoder, gated or not, closes the build's withheld
+    /// span (`WithheldSpans`), counted into `InputLoss` when it was one.
     fn wire_video(
         &self,
         sink: &gst_app::AppSink,
         build: u64,
         gen: u64,
         abandoned_at: Arc<Mutex<Option<Instant>>>,
+        withheld: Arc<Mutex<WithheldSpans>>,
     ) {
         let shared = Arc::clone(&self.shared);
         let eos = Arc::clone(&self.shared);
+        let loss = Arc::clone(&self.loss);
         let mut connected = false;
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |s| {
                     let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    if locked(&withheld).on_picture(Instant::now()) {
+                        loss.add_withheld_span();
+                    }
                     let open = locked(&shared.gate);
                     if *open != Some(build) {
                         drop(open);
@@ -816,6 +892,15 @@ impl GstInput {
                                 "gen={gen}: video again {} ms after the abandon, gated (Owed 49)",
                                 at.elapsed().as_millis()
                             ));
+                            if shared
+                                .tx
+                                .try_send(Inbound::Event(Event::InputAgain { gen }))
+                                .is_err()
+                            {
+                                shared.log(&format!(
+                                    "gen={gen}: InputAgain not delivered: the inbound channel was full"
+                                ));
+                            }
                         }
                         return Ok(gst::FlowSuccess::Ok);
                     }
@@ -1088,6 +1173,36 @@ impl InputSource for GstInput {
         }
     }
 
+    /// The domain took `gen` back (C3, S2): its build's gate re-opens, so its frames and audio reach
+    /// the programme again, with no rebuild. A `gen` that is not the current build's, and a build
+    /// whose mark is gone (an error after the abandon, a retire) or whose gate is open, change
+    /// nothing: the domain's stall rule or the reported loss then rebuilds as before.
+    fn take_back(&mut self, gen: u64) {
+        let Some(live) = self.current.as_ref().filter(|l| l.gen == gen) else {
+            self.shared
+                .log(&format!("gen={gen}: take back ignored: not the current build"));
+            return;
+        };
+        if self.shared.reopen(live.build) {
+            self.shared.taken_back.fetch_add(1, Ordering::SeqCst);
+            self.shared.log(&format!(
+                "gen={gen}: taken back by the domain; its gate is open again (C3)"
+            ));
+        } else {
+            self.shared.log(&format!(
+                "gen={gen}: take back: not the build given up, so its gate stays as it is"
+            ));
+        }
+    }
+
+    /// The current build's bytes out of `srtsrc` (C3, S2 item 2); `None` with no build.
+    fn bytes(&self) -> Option<InputBytes> {
+        self.current.as_ref().map(|l| InputBytes {
+            gen: l.gen,
+            total: l.bytes.load(Ordering::Relaxed),
+        })
+    }
+
     fn stop(&mut self) {
         if self.stopped {
             return;
@@ -1272,6 +1387,19 @@ fn capsfilter(name: &str, caps: gst::Caps) -> Result<gst::Element, String> {
     let f = make("capsfilter", name)?;
     f.set_property("caps", caps);
     Ok(f)
+}
+
+/// A queue that holds at most `max_ns` and then blocks its upstream (`leaky=no`, C3 S5 item 2): it
+/// drops nothing. Time is its bound: the buffer cap is off (its default 200 would cut 4 s to 3.3 s at
+/// 60 fps) and the byte cap is `CAMERA_VIDEO_QUEUE_BYTES`, the backstop for buffers with no
+/// timestamp (the C3 review). Blocking, it blocks tsdemux, so the audio waits with the video.
+fn blocking_queue(name: &str, max_ns: u64) -> Result<gst::Element, String> {
+    let q = make("queue", name)?;
+    q.set_property_from_str("leaky", "no");
+    q.set_property("max-size-time", max_ns);
+    q.set_property("max-size-buffers", 0u32);
+    q.set_property("max-size-bytes", CAMERA_VIDEO_QUEUE_BYTES);
+    Ok(q)
 }
 
 /// A queue that holds at most `max_ns` and then drops its OLDEST buffer (`leaky=downstream`). Its

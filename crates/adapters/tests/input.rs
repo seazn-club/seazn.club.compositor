@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use adapters::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
 use adapters::gst_input::{GstInput, InputThreads, StartHold};
 use adapters::gst_programme::GstProgramme;
-use adapters::stats::ReceivedBytes;
-use app::ports::{Inbound, InputSource, InputSpec, ProgrammeOutput, TargetSpec};
+use adapters::stats::{InputLoss, ReceivedBytes};
+use app::ports::{Inbound, InputBytes, InputSource, InputSpec, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::{Receiver, Sender};
 use domain::config::{OutputProfile, Thresholds};
 use domain::input_link::{BuildFacts, LossReason};
@@ -1300,8 +1300,9 @@ fn a_stream_without_audio_still_delivers_video() {
 }
 
 /// The video decoder hangs for 3 s: the audio keeps reaching the ring throughout, because the video
-/// queue before the decoder is leaky and drops its oldest buffer rather than holding up the demuxer
-/// (a blocking queue full of 1 s of video stops `tsdemux`, and the audio with it, about 1 s in).
+/// queue before the decoder holds more than the hang (`CAMERA_VIDEO_QUEUE_MS`, 4 s; C3, S5 item 2),
+/// so it never fills and never holds up the demuxer. It was leaky (1 s, dropping the oldest) before
+/// C3; a queue of under 3 s would block `tsdemux`, and the audio with it, before the hang ended.
 #[test]
 fn a_hung_video_decoder_never_stalls_the_audio() {
     let _s = serial();
@@ -1326,7 +1327,9 @@ fn a_hung_video_decoder_never_stalls_the_audio() {
 }
 
 /// The pipeline is built with the bounds the plan and the brief state (written out here from their
-/// text): leaky queues of 1 s (video) and 400 ms (audio) that drop the oldest; appsinks of two buffers
+/// text): a BLOCKING queue before the video decoder of `CAMERA_VIDEO_QUEUE_MS` (C3, S5 item 2: one
+/// phone GOP and one SRT latency, the domain's declaration; it was a leaky 1 s), a leaky 400 ms one
+/// before the audio decoder that drops the oldest; appsinks of two buffers
 /// that drop and never sync; the SRT latency `Thresholds::input_srt_latency_ms`; and no reconnecting
 /// inside `srtsrc` (the domain owns it).
 #[test]
@@ -1343,11 +1346,24 @@ fn the_pipeline_is_built_with_the_plans_bounds() {
         value
     };
     let mut checked = 0;
-    for (queue, ns) in [("vqueue", 1_000_000_000u64), ("aqueue", 400_000_000)] {
-        assert_eq!(leaky(queue), "downstream", "{queue}");
+    let video_ns = domain::config::CAMERA_VIDEO_QUEUE_MS * 1_000_000;
+    assert_eq!(
+        video_ns, 4_000_000_000,
+        "the C1 brief's 3 s GOP and F-002's 1 s latency"
+    );
+    for (queue, ns, policy) in [("vqueue", video_ns, "no"), ("aqueue", 400_000_000, "downstream")] {
+        assert_eq!(leaky(queue), policy, "{queue}");
         assert_eq!(el(queue).property::<u64>("max-size-time"), ns, "{queue}");
         checked += 1;
     }
+    // The blocking queue's other caps (the C3 review): no buffer cap (time is the bound), GStreamer's
+    // default byte cap set explicitly as the backstop.
+    let vq = el("vqueue");
+    assert_eq!(vq.property::<u32>("max-size-buffers"), 0);
+    assert_eq!(
+        vq.property::<u32>("max-size-bytes"),
+        domain::config::CAMERA_VIDEO_QUEUE_BYTES
+    );
     for sink in ["vsink", "asink"] {
         let s = el(sink);
         assert_eq!(s.property::<u32>("max-buffers"), 2, "{sink}");
@@ -1617,7 +1633,9 @@ fn frames_after_the_domain_gives_up_never_reach_the_programme() {
         input.abandoned()
     );
     assert_eq!(pauses, 3);
-    assert!(after.is_empty(), "{after:?}");
+    // C3 (S2): the one event a given-up build still sends, its first video at the shut gate, which
+    // the domain reads as `InputAgain` (and may take the build back).
+    assert_eq!(after, vec![Event::InputAgain { gen: 1 }], "{after:?}");
     assert!(
         ring_before > 0,
         "the generation's audio was in the ring at the abandon"
@@ -1711,7 +1729,9 @@ fn a_late_connect_is_dropped_and_a_fresh_generation_connects() {
         "gen 2 (late, given up): events {late:?}; samples dropped at the gate {dropped}; abandoned {}",
         input.abandoned()
     );
-    assert!(late.is_empty(), "{late:?}");
+    // C3 (S2): the one event a given-up build still sends, its first video at the shut gate, which
+    // the domain reads as `InputAgain` (and may take the build back).
+    assert_eq!(late, vec![Event::InputAgain { gen: 2 }], "{late:?}");
     assert_eq!(
         camera_pts(&frames),
         pts,
@@ -1831,7 +1851,9 @@ fn audio_stops_with_the_video_when_the_domain_gives_up() {
         "the window after the abandon was read: {after:?}"
     );
     assert_eq!(past, 0, "no audio after the abandon: {after:?}");
-    assert!(back.is_empty(), "{back:?}");
+    // C3 (S2): the one event a given-up build still sends, its first video at the shut gate, which
+    // the domain reads as `InputAgain` (and may take the build back).
+    assert_eq!(back, vec![Event::InputAgain { gen: 1 }], "{back:?}");
     assert_eq!(audio_back, 0);
     assert_eq!(input.abandoned(), 1);
     assert_eq!(
@@ -1909,7 +1931,9 @@ fn abandon_shuts_the_current_build_out_at_once() {
         input.abandoned(),
         ms_after_the_abandon(&lines, 1)
     );
-    assert!(after.is_empty(), "{after:?}");
+    // C3 (S2): the one event a given-up build still sends, its first video at the shut gate, which
+    // the domain reads as `InputAgain` (and may take the build back).
+    assert_eq!(after, vec![Event::InputAgain { gen: 1 }], "{after:?}");
     assert!(ring_before > 0, "the build's audio was in the ring at the call");
     assert_eq!(
         audio, 0,
@@ -1928,6 +1952,155 @@ fn abandon_shuts_the_current_build_out_at_once() {
         1,
         "the connection kept delivering, and its first gated video sample is logged once"
     );
+    finish(input);
+}
+
+/// C3 (S2): the domain takes an abandoned build back. Its first gated video sample is reported once
+/// (`InputAgain`), `take_back(gen)` re-opens its gate, and its frames reach the slot and the loop
+/// again with no rebuild, the generation unchanged. A second `take_back`, one of a generation that
+/// is not the current build's, and one of a build whose gate is open each change nothing.
+#[test]
+fn a_taken_back_build_delivers_again_without_a_rebuild() {
+    let _s = serial();
+    let l = Listener::new(&cfg(640, 360));
+    let (mut input, rx, frames, lines) = input(&P720);
+    connect(&mut input, &rx, 1, &spec(l.port));
+    input.take_back(1);
+    assert_eq!(input.taken_back(), 0, "an open gate is not taken back");
+    input.abandon(1);
+    // Every `InputFrame` is sent under the gate lock, which `abandon` takes to shut the gate, so all
+    // the build sent before the call is in the channel when it returns (CI run 45484166097 read one
+    // such frame here): drained at once, it may hold frames, then at most the `InputAgain`. After
+    // the drain, nothing of the build passes the shut gate.
+    let queued: Vec<Event> = rx
+        .try_iter()
+        .filter_map(|m| match m {
+            Inbound::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    let again_at = queued.iter().position(|e| *e == Event::InputAgain { gen: 1 });
+    if let Some(i) = again_at {
+        assert_eq!(
+            frames_in(&queued[i..]),
+            0,
+            "no frame after the report: {queued:?}"
+        );
+    }
+    let seen = if again_at.is_some() {
+        Vec::new()
+    } else {
+        events_until(&rx, Duration::from_secs(3), |e| {
+            *e == Event::InputAgain { gen: 1 }
+        })
+    };
+    assert_eq!(frames_in(&seen), 0, "nothing passed the shut gate: {seen:?}");
+    assert_eq!(
+        queued
+            .iter()
+            .chain(&seen)
+            .filter(|e| **e == Event::InputAgain { gen: 1 })
+            .count(),
+        1,
+        "reported once: {queued:?} then {seen:?}"
+    );
+    let pts = camera_pts(&frames);
+    input.take_back(2);
+    assert_eq!(input.taken_back(), 0, "not the current build");
+    input.take_back(1);
+    input.take_back(1);
+    let back = events_for(&rx, Duration::from_secs(1));
+    eprintln!(
+        "after take_back(1): {} frames, gens {:?}; taken back {}; builds {}",
+        frames_in(&back),
+        frame_gens(&back),
+        input.taken_back(),
+        input.builds()
+    );
+    assert!(frames_in(&back) >= FRAMES_IN_THE_FIRST_SECOND, "{back:?}");
+    assert!(frame_gens(&back).iter().all(|&g| g == 1), "{back:?}");
+    assert!(
+        !back.contains(&Event::InputAgain { gen: 1 }),
+        "once an abandon: {back:?}"
+    );
+    assert_ne!(camera_pts(&frames), pts, "the slot moves again");
+    assert_eq!(input.taken_back(), 1, "the second call changed nothing");
+    assert_eq!(input.builds(), 1, "no rebuild");
+    assert_eq!(lines_with(&lines, "gen=1: taken back by the domain"), 1);
+    // Abandoned again, it is reported again.
+    input.abandon(1);
+    let again = events_until(&rx, Duration::from_secs(3), |e| {
+        *e == Event::InputAgain { gen: 1 }
+    });
+    assert_eq!(again.last(), Some(&Event::InputAgain { gen: 1 }));
+    finish(input);
+}
+
+/// C3 (S2 item 2): `bytes()` is the current build's count out of `srtsrc`: none before a build, rising
+/// while it delivers, and from zero again for the next build (the process total, `ReceivedBytes`,
+/// carries on).
+#[test]
+fn the_current_builds_bytes_rise_and_start_again_at_each_rebuild() {
+    let _s = serial();
+    let port = free_port();
+    let (mut input, rx, _frames, _lines) = input(&P720);
+    assert_eq!(input.bytes(), None, "no build");
+    let mut checked = 0;
+    let mut last_total = 0;
+    for gen in 1..=2u64 {
+        let l = Listener::start(port, &cfg(640, 360));
+        let deadline = rebuild_past_the_handshake(&mut input, gen, &spec(port));
+        events_until(&rx, left(deadline), |e| *e == Event::InputConnected { gen });
+        let a = input.bytes().expect("a build");
+        thread::sleep(Duration::from_millis(500));
+        let b = input.bytes().expect("a build");
+        eprintln!("gen {gen}: {a:?} then {b:?}");
+        assert_eq!((a.gen, b.gen), (gen, gen));
+        assert!(b.total > a.total, "gen {gen}: rising");
+        if gen == 2 {
+            assert!(
+                a.total < last_total,
+                "gen 2 counts from zero ({} vs {last_total})",
+                a.total
+            );
+        }
+        last_total = b.total;
+        l.stop();
+        events_until(&rx, LOSS_BUDGET, is_loss);
+        checked += 1;
+    }
+    assert!(matches!(input.bytes(), Some(InputBytes { gen: 2, .. })));
+    eprintln!("builds checked: {checked}");
+    assert_eq!(checked, 2);
+}
+
+/// C3 (S5): a decoder hung past the video queue's bound fills the queue, which now blocks rather
+/// than drops: its `overrun` is counted (`InputLoss::queue_overruns`), and the slot's frame stays
+/// put through the hang. A hang shorter than the bound (`a_hung_video_decoder_never_stalls_the_audio`)
+/// counts none there.
+#[test]
+fn a_decoder_hung_past_the_queue_bound_counts_an_overrun() {
+    let _s = serial();
+    let l = Listener::new(&cfg(640, 360));
+    let loss = Arc::new(InputLoss::default());
+    let (fresh, rx, frames, _lines) = input(&P720);
+    let mut input = fresh.with_loss_counts(Arc::clone(&loss));
+    connect(&mut input, &rx, 1, &spec(l.port));
+    assert_eq!(loss.queue_overruns(), 0, "a healthy decoder");
+    let bound = domain::config::CAMERA_VIDEO_QUEUE_MS;
+    assert!(
+        input.hang_decoder(Duration::from_millis(bound + 2_000)),
+        "the hook"
+    );
+    thread::sleep(Duration::from_millis(bound + 1_000));
+    eprintln!(
+        "a {} ms hang: overruns {}, withheld spans {}; camera {:?}",
+        bound + 2_000,
+        loss.queue_overruns(),
+        loss.withheld_spans(),
+        camera_pts(&frames)
+    );
+    assert!(loss.queue_overruns() >= 1, "the queue filled and blocked");
     finish(input);
 }
 
