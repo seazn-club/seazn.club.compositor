@@ -998,9 +998,10 @@ fn a_list_of_owed_rows_names_the_first_whose_signature_holds() {
         )),
         "{s}"
     );
-    // Every leg chaos.json expands to (38 since case 19), counted from the manifest itself.
+    // Every leg chaos.json expands to (38 since case 19, 39 since case 20), counted from the manifest
+    // itself.
     let n = expected_legs().len();
-    assert_eq!(n, 38, "chaos.json's legs with their repeats");
+    assert_eq!(n, 39, "chaos.json's legs with their repeats");
     assert!(
         s.contains(&format!(
             "WAVE GATE 3: a run over another manifest (CHAOS_MANIFEST) never counts ({n} of {n} legs PASS)\n"
