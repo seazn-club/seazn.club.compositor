@@ -3371,7 +3371,7 @@ ruling relayed by the coordinator; no stg run yet).
   (1 000 ms, one SRT latency, F-002), the bound is `input_decode_wait_ms` = 5 000 + `CAMERA_GOP_MS`
   3 000 = 8 000 ms; once they stop, the plain 5 s. The slate never waits for bytes (it is the
   viewer's rule, not the connection's), and the hold-end gate still holds (20 000 > 8 000 + 9 000).
-- **The queue before the decoder.** It was leaky downstream at 400 ms: under a stall it dropped
+- **The queue before the decoder.** It was leaky downstream at 1 s (400 ms is the audio queue; corrected in the C3 fix round, the review's minor): under a stall it dropped
   compressed access units, and every drop mid-GOP lost a reference and froze the picture to the next
   keyframe, up to 3 s on the phone's GOP. It is now non-leaky and holds `CAMERA_VIDEO_QUEUE_MS`
   (4 000 = one GOP + one SRT latency), so libsrt's too-late drop is the one loss on the input leg; a
