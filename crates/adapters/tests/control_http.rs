@@ -1018,11 +1018,13 @@ fn the_sessions_credentials_are_scrubbed_by_value_from_the_final_beat_and_errors
 #[test]
 fn the_camera_keys_are_posted_only_by_a_plane_with_them_on() {
     use domain::input_link::{GiveUp, GiveUpReason};
-    const KEYS: [&str; 4] = [
+    const KEYS: [&str; 6] = [
         "inputGiveUpReason",
         "inputGiveUpGen",
         "inputReceivedFps",
         "inputReceivedKbps",
+        "inputWithheldSpans",
+        "inputQueueOverruns",
     ];
     let h = HealthReport {
         input_give_up: Some(GiveUp {
@@ -1034,6 +1036,8 @@ fn the_camera_keys_are_posted_only_by_a_plane_with_them_on() {
     let m = Measured {
         input_received_fps: Some(29.97),
         input_received_kbps: Some(2_500),
+        input_withheld_spans: Some(7),
+        input_queue_overruns: Some(3),
         ..Measured::default()
     };
     let mut checked = 0;
@@ -1060,6 +1064,8 @@ fn the_camera_keys_are_posted_only_by_a_plane_with_them_on() {
                 assert_eq!(posted["inputGiveUpGen"], 3);
                 assert_eq!(posted["inputReceivedFps"].as_f64(), Some(30.0));
                 assert_eq!(posted["inputReceivedKbps"], 2_500);
+                assert_eq!(posted["inputWithheldSpans"], 7);
+                assert_eq!(posted["inputQueueOverruns"], 3);
             } else {
                 assert_eq!(posted, heartbeat_wire(beat, &m), "{keys:?}");
                 for k in KEYS {

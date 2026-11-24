@@ -43,6 +43,23 @@ pub struct Thresholds {
     /// confirmed it is needed: CF holds a silent, encrypted playback socket open indefinitely after the
     /// phone stops publishing.
     pub input_stall_after_ms: Ms,
+    /// C3 (S2 item 2): while bytes still leave the camera's SRT source (`input_bytes_fresh_ms`) and no
+    /// frame decodes, a Running input is waiting on its decoder, not on a dead socket, so the stall
+    /// rule waits this long instead of `input_stall_after_ms`. Derived (`input_decode_wait_ms`): the
+    /// stall and one phone GOP (`CAMERA_GOP_MS`). With `output-corrupt=false` (Owed 48) a lost
+    /// reference withholds every frame to the next keyframe, and a lost keyframe to the one after
+    /// it: up to two GOPs (6 s) from the last good frame, which this clears; a decoder wedged with
+    /// bytes still arriving is rebuilt here, 3 s later than a silent one. A silent socket is never
+    /// extended: Cloudflare's held broadcast carries no byte (F-032) and a dead pull none (F-002).
+    pub input_decode_wait_ms: Ms,
+    /// C3 (S2 item 2): bytes "still arrive" while the build's source byte count rose within this
+    /// long. One SRT latency (`input_srt_latency_ms`, F-002's 1 000 ms): libsrt's live mode hands
+    /// each packet on a latency after it was sent, so a sender that still publishes moves the count
+    /// many times inside it (a 1 316 B payload per SRT packet; the phone's audio alone fills several
+    /// a second), and a whole latency with no byte is a sender gone quiet. The driver reads the
+    /// count once per tick (C08), well inside it (`TICK_WIDEST_MS`). C3's choice: the stg counters
+    /// read it (Owed 111).
+    pub input_bytes_fresh_ms: Ms,
     /// C10: the SRT receive latency the input pipeline asks of CF Input A's playback (`srtsrc`
     /// `latency`, in its URI). The POC's `INPUT_LATENCY_MS` (1 000). F-002 measured every CF reader
     /// at 1 000 ms: 0 packets lost or retransmitted in 120 s, the first AU at 2.22–3.89 s, and an
@@ -251,6 +268,28 @@ pub const FORCED_KEYFRAME_MARGIN_MS: Ms = 200;
 /// time, the stream's own clock: a wall-clock rule cannot see when the last keyframe was encoded.
 pub const FORCED_KEYFRAME_MIN_INTERVAL_MS: Ms = CF_KEYFRAME_INTERVAL_MIN_MS + FORCED_KEYFRAME_MARGIN_MS;
 
+/// The phone's GOP: the capture app publishes a keyframe every 3 s (the C1 brief; F-036, the same
+/// 2 s edge `PROGRAMME_GOP_MS` moved off). The camera side's, not ours: the decode wait reads it
+/// (`input_decode_wait_ms`), and the owner's 4.5 s slate is one of it and a margin.
+pub const CAMERA_GOP_MS: Ms = 3_000;
+
+/// C3 (S5 item 2): the most compressed camera video the queue before the decoder holds, as running
+/// time. The queue no longer leaks: a dropped access unit loses a reference mid-GOP, and with
+/// `output-corrupt=false` (Owed 48) the picture then freezes to the next keyframe, up to a whole phone
+/// GOP; a full queue blocks the source instead, and libsrt's too-late drop is the one loss left on the
+/// leg. The bound: one phone GOP (`CAMERA_GOP_MS`), so a decoder that waits a GOP for its keyframe
+/// still has room, and one SRT latency (`input_srt_latency_ms`, F-002's 1 000 ms), the burst
+/// libsrt releases after a network pause. A decoder wedged past it blocks the pull, and the stall
+/// rule rebuilds it (the bytes stop with it, so no decode wait extends it).
+pub const CAMERA_VIDEO_QUEUE_MS: Ms = CAMERA_GOP_MS + 1_000;
+
+/// C3 (S2 item 2), derived in one place: the stall rule's bound while bytes still arrive, the stall
+/// and one phone GOP (`Thresholds::input_decode_wait_ms`'s doc). A const fn, so the default and the
+/// config test read the same terms.
+pub const fn input_decode_wait_ms(input_stall_after_ms: Ms) -> Ms {
+    input_stall_after_ms + CAMERA_GOP_MS
+}
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -368,6 +407,7 @@ impl Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         let (output_backoff_base_ms, output_connect_timeout_ms) = (500, 5_000);
+        let (input_stall_after_ms, input_srt_latency_ms) = (5_000, 1_000);
         Self {
             frozen_after_ms: 500,
             slate_after_ms: 4_500,
@@ -375,8 +415,10 @@ impl Default for Thresholds {
             input_backoff_base_ms: 1_000,
             input_backoff_cap_ms: 4_000,
             input_connect_timeout_ms: 9_000,
-            input_stall_after_ms: 5_000,
-            input_srt_latency_ms: 1_000,
+            input_stall_after_ms,
+            input_decode_wait_ms: input_decode_wait_ms(input_stall_after_ms),
+            input_bytes_fresh_ms: input_srt_latency_ms,
+            input_srt_latency_ms,
             input_hold_end_after_ms: 20_000,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
@@ -662,6 +704,47 @@ mod tests {
         assert!(t.input_connect_timeout_ms > brief_estimate);
         assert!(t.input_connect_timeout_ms > f032_slowest + (gop_now - gop_then));
         assert!(t.input_hold_end_after_ms > t.input_stall_after_ms + t.input_connect_timeout_ms);
+    }
+
+    // C3 (S2 item 2), each term from its source, written here: the stall rule's 5 s (spec §6), the
+    // phone's 3 s GOP (the C1 brief), and the worst decoder wait with `output-corrupt=false`, a lost
+    // keyframe, so two GOPs from the last good frame. The extension clears that wait, stays short of
+    // the hold-end gate with a whole connect after it (F-032: a hold-end close must still read as one),
+    // and is the stall's own bound when no byte arrives (the fresh window is under the stall).
+    #[test]
+    fn the_decode_wait_clears_a_lost_keyframe_and_keeps_the_hold_end_gate() {
+        let t = Thresholds::default();
+        let (stall, phone_gop) = (5_000, 3_000);
+        assert_eq!(CAMERA_GOP_MS, phone_gop, "the C1 brief's 3 s");
+        assert_eq!(t.input_decode_wait_ms, stall + phone_gop, "the stall and one GOP");
+        assert!(t.input_decode_wait_ms > t.input_stall_after_ms);
+        assert!(t.input_decode_wait_ms >= 2 * phone_gop, "a lost keyframe's wait");
+        assert!(t.input_hold_end_after_ms > t.input_decode_wait_ms + t.input_connect_timeout_ms);
+    }
+
+    // C3 (S5 item 2): the camera's pre-decoder queue holds one phone GOP and one SRT latency, each
+    // from its source (the C1 brief's 3 s, F-002's 1 000 ms), and so more than a whole lost
+    // keyframe's GOP; it is under the stall, so a queue that fills (a wedged decoder) is rebuilt by
+    // the stall rule well after it, and the hung-decoder probe's 3 s (adapters input.rs) fits in it.
+    #[test]
+    fn the_camera_video_queue_holds_a_phone_gop_and_one_srt_latency() {
+        let t = Thresholds::default();
+        assert_eq!(CAMERA_VIDEO_QUEUE_MS, 3_000 + 1_000);
+        assert_eq!(CAMERA_VIDEO_QUEUE_MS, CAMERA_GOP_MS + t.input_srt_latency_ms);
+        assert!(t.input_srt_latency_ms > 0, "so the queue holds more than a GOP");
+        assert!(CAMERA_VIDEO_QUEUE_MS < t.input_stall_after_ms);
+    }
+
+    // C3 (S2 item 2): bytes count as still arriving for one SRT latency (F-002's 1 000 ms). The window
+    // is read once per tick, so it holds several ticks, and it is under the stall, so a sender gone
+    // quiet before the stall bound is stalled at the plain bound.
+    #[test]
+    fn the_bytes_window_is_one_srt_latency_and_under_the_stall() {
+        let t = Thresholds::default();
+        assert_eq!(t.input_bytes_fresh_ms, 1_000, "F-002's SRT latency");
+        assert_eq!(t.input_bytes_fresh_ms, t.input_srt_latency_ms);
+        assert!(t.input_bytes_fresh_ms > 2 * TICK_WIDEST_MS);
+        assert!(t.input_bytes_fresh_ms < t.input_stall_after_ms);
     }
 
     // C10: the SRT latency is the one every F-002 reader used (1 000 ms), so the measured first-frame

@@ -125,6 +125,8 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         input_backoff_cap_ms,
         input_connect_timeout_ms,
         input_stall_after_ms,
+        input_decode_wait_ms,
+        input_bytes_fresh_ms,
         input_srt_latency_ms,
         input_hold_end_after_ms,
         kick_alert_count,
@@ -175,6 +177,8 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("input_backoff_cap_ms", json!(input_backoff_cap_ms));
     put("input_connect_timeout_ms", json!(input_connect_timeout_ms));
     put("input_stall_after_ms", json!(input_stall_after_ms));
+    put("input_decode_wait_ms", json!(input_decode_wait_ms));
+    put("input_bytes_fresh_ms", json!(input_bytes_fresh_ms));
     put("input_srt_latency_ms", json!(input_srt_latency_ms));
     put("input_hold_end_after_ms", json!(input_hold_end_after_ms));
     put("kick_alert_count", json!(kick_alert_count));

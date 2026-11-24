@@ -241,6 +241,7 @@ fn the_camera_rates_are_the_totals_rise_over_the_beat_window() {
         Some(CameraTotals {
             frames_written,
             bytes_received,
+            ..CameraTotals::default()
         })
     };
     let mut checked = 0;
@@ -274,6 +275,7 @@ fn the_camera_rates_are_the_totals_rise_over_the_beat_window() {
     // No camera reader (fake mode): the sample carries neither rate.
     let s = ProcMetrics::new(Arc::new(Stats::default())).sample();
     assert_eq!((s.input_received_fps, s.input_received_kbps), (None, None));
+    assert_eq!((s.input_withheld_spans, s.input_queue_overruns), (None, None));
     checked += 1;
     eprintln!("camera rate samples checked: {checked}");
     assert_eq!(checked, 5);
@@ -296,6 +298,9 @@ fn the_sampler_reads_the_camera_reader_once_a_sample() {
         CameraTotals {
             frames_written: n,
             bytes_received: n * 1_000,
+            // C3 (S5): totals passed on as read.
+            withheld_spans: n / 10,
+            queue_overruns: n / 25,
         }
     });
     let after = Instant::now();
@@ -325,6 +330,16 @@ fn the_sampler_reads_the_camera_reader_once_a_sample() {
         "{kbps} outside {lo}..{hi}"
     );
     assert_eq!(reads.load(Ordering::Relaxed), 2, "one read a sample");
+    assert_eq!(
+        (first.input_withheld_spans, first.input_queue_overruns),
+        (Some(0), Some(0)),
+        "C3: the loss totals as read, a measured 0 first"
+    );
+    assert_eq!(
+        (s.input_withheld_spans, s.input_queue_overruns),
+        (Some(5), Some(2)),
+        "C3: the loss totals as read, not rates"
+    );
     eprintln!("camera reader samples checked: 2");
 }
 

@@ -121,6 +121,11 @@ enum Kind {
     InputError,
     /// The first byte of the current input build (Owed 108 fix (b)).
     InputMedia,
+    /// C3: a frame at a shut gate. The on-air setups' camera is Connecting, never given up, so it
+    /// takes nothing back (the take-back's own cases are `tests/take_back.rs`).
+    InputAgain,
+    /// C3: the build's source byte count; a rise is routed to the input link.
+    InputBytes,
     /// Web's phone-live edge counter from a reply (Owed 108 fix (b)): the first value, a baseline.
     PhoneLiveEdge,
     OutputProgress,
@@ -147,7 +152,7 @@ enum Kind {
     CefRestart,
 }
 
-const KINDS: [Kind; 31] = [
+const KINDS: [Kind; 33] = [
     Kind::Tick,
     Kind::BootstrapOk,
     Kind::BootstrapFailed,
@@ -159,6 +164,8 @@ const KINDS: [Kind; 31] = [
     Kind::InputLost,
     Kind::InputError,
     Kind::InputMedia,
+    Kind::InputAgain,
+    Kind::InputBytes,
     Kind::PhoneLiveEdge,
     Kind::OutputProgress,
     Kind::OutputError,
@@ -198,6 +205,8 @@ fn kind_of(e: &Event) -> Kind {
         Event::InputLost { .. } => Kind::InputLost,
         Event::InputError { .. } => Kind::InputError,
         Event::InputMedia { .. } => Kind::InputMedia,
+        Event::InputAgain { .. } => Kind::InputAgain,
+        Event::InputBytes { .. } => Kind::InputBytes,
         Event::PhoneLiveEdge { .. } => Kind::PhoneLiveEdge,
         Event::OutputProgress { .. } => Kind::OutputProgress,
         Event::OutputError { .. } => Kind::OutputError,
@@ -257,6 +266,13 @@ fn sample(kind: Kind, s: &Supervisor) -> Event {
         },
         Kind::InputMedia => Event::InputMedia {
             gen: s.input_generation(),
+        },
+        Kind::InputAgain => Event::InputAgain {
+            gen: s.input_generation(),
+        },
+        Kind::InputBytes => Event::InputBytes {
+            gen: s.input_generation(),
+            total: 1_316,
         },
         Kind::PhoneLiveEdge => Event::PhoneLiveEdge { count: 2 },
         Kind::OutputProgress => Event::OutputProgress {
@@ -413,6 +429,8 @@ fn brief(st: Setup, k: Kind) -> Want {
         (S::Holding, K::Ending | K::Int | K::EncoderOverrun) => W::Ignored,
         // C10b: a frame of a generation not the current one counts for nothing.
         (S::Running | S::Holding, K::InputFrameStale) => W::Ignored,
+        // C3: nothing was given up, so nothing is taken back (and the hold takes nothing back).
+        (S::Running | S::Holding, K::InputAgain) => W::Ignored,
         (
             S::Running | S::Holding,
             K::BootstrapOk | K::BootstrapFailed | K::RefusedGone | K::RefusedOther | K::OutputDrained,

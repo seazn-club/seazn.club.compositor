@@ -59,6 +59,22 @@
 //!     timeout or its loss.
 //!
 //!   The nudge is cleared when it acts, or when a generation reaches Running.
+//! - **A generation taken back (C3, S2; Owed 49).** A generation the link gave up by its own rule
+//!   (`Abandon`: the stall rule, the connect timeout, the nudge's discard) keeps its pipeline up,
+//!   gated, until the rebuild a back-off later. If that build delivers a decoded frame before the
+//!   rebuild is due (`on_again`, the adapter's report of a frame at its shut gate), the link takes it
+//!   back: Running again from that instant, no rebuild, and `InputAction::TakeBack` asks the adapter
+//!   to re-open its gate. The window is the back-off itself, `until`: a pull that stays silent is
+//!   rebuilt exactly when it was before (F-002: Cloudflare holds a silent socket open indefinitely,
+//!   so waiting longer on one costs the camera). A loss the adapter reported (EOS, an error) is never
+//!   taken back: that build is gone. A taken-back generation can be given up again, and taken back
+//!   again; each give-up is counted (`give_ups`), since the generation alone no longer rises.
+//! - **Bytes still arriving (C3, S2 item 2).** The driver reads the current build's source byte
+//!   count each tick (`on_bytes`); a rise within `input_bytes_fresh_ms` means the sender still
+//!   publishes. While it does, a Running input with no decoded frame is waiting on its decoder (a
+//!   lost reference, `output-corrupt=false`), not on a dead socket, so the stall rule waits
+//!   `input_decode_wait_ms` instead of `input_stall_after_ms`. When the bytes stop, the plain bound
+//!   applies again from the last frame, so a sender gone quiet is given up at the normal instant.
 use crate::backoff::delay;
 use crate::config::Thresholds;
 use crate::time::{elapsed, Ms};
@@ -140,6 +156,9 @@ pub enum InputAction {
     /// The link gave generation `gen` up by its own rule, the connect timeout or the stall rule
     /// (`Effect::AbandonInput`).
     Abandon { gen: u64 },
+    /// The link took generation `gen` back (C3, S2): it delivered a frame at its shut gate inside
+    /// its back-off, so its gate re-opens and no rebuild follows (`Effect::TakeBackInput`).
+    TakeBack { gen: u64 },
 }
 
 /// What the driver's log reads of the phone-live nudge (Owed 108 fix (b), the PR #99 review's m1): a
@@ -185,6 +204,17 @@ pub struct InputLink {
     /// The last generation given up and why (C2, S4): set by every move from Connecting or Running
     /// into Backoff (`give_up`), never by a Backoff that is only rescheduled.
     last_give_up: Option<GiveUp>,
+    /// Every give-up so far (C3): a taken-back generation can be given up twice, so the driver's log
+    /// line reads this, not the generation, to see a new one.
+    give_ups: u64,
+    /// The current generation was given up by the link's own rule (`Abandon`) and its build has not
+    /// been reported lost since: a frame from it inside the back-off takes it back (C3, S2). Cleared by
+    /// the take-back, the rebuild, and any loss or error the adapter reports for it.
+    abandoned: bool,
+    /// The current build's source byte count as last read (C3, S2 item 2); 0 at each build.
+    bytes_total: u64,
+    /// When that count last rose for the current build; `None` until it has.
+    bytes_at: Option<Ms>,
 }
 
 impl Default for InputLink {
@@ -206,6 +236,10 @@ impl InputLink {
             discard_armed: true,
             media: false,
             last_give_up: None,
+            give_ups: 0,
+            abandoned: false,
+            bytes_total: 0,
+            bytes_at: None,
         }
     }
 
@@ -221,6 +255,11 @@ impl InputLink {
     /// The last generation given up and why (C2, S4); `None` until one is.
     pub fn last_give_up(&self) -> Option<GiveUp> {
         self.last_give_up
+    }
+
+    /// How many give-ups so far (C3): it rises with each, a taken-back generation's second included.
+    pub fn give_ups(&self) -> u64 {
+        self.give_ups
     }
 
     /// The phone-live nudge's fields as they stand, for the log (`NudgeView`).
@@ -249,13 +288,53 @@ impl InputLink {
     /// only while Connecting: a second one while Running must not restart the stall clock.
     pub fn on_connected(&mut self, now: Ms, gen: u64) {
         if gen == self.generation && matches!(self.state, InputState::Connecting { .. }) {
-            self.state = InputState::Running { since: now };
-            self.hold_end_armed = true;
-            // Owed 108 fix (b): the camera is back, so a nudge not yet acted on has nothing left to
-            // do, and the next outage gets its own discard.
-            self.nudged = false;
-            self.discard_armed = true;
+            self.reach_running(now);
         }
+    }
+
+    /// The current generation runs from `now`: its first decoded frame, or a take-back.
+    fn reach_running(&mut self, now: Ms) {
+        self.state = InputState::Running { since: now };
+        self.hold_end_armed = true;
+        // Owed 108 fix (b): the camera is back, so a nudge not yet acted on has nothing left to do,
+        // and the next outage gets its own discard.
+        self.nudged = false;
+        self.discard_armed = true;
+    }
+
+    /// A decoded frame of generation `gen` reached the adapter's shut gate (C3, S2; Owed 49's
+    /// measurement made a fact): the build the link gave up delivers again. Taken back, as Running
+    /// from `now` with no rebuild, when `gen` is the current generation, the link gave it up by its
+    /// own rule and nothing reported it lost since, and its rebuild is not due yet (`now < until`, the
+    /// back-off is the whole window). Anything else changes nothing: a stale generation, a build
+    /// the adapter reported lost, a second report after the take-back, or one at or past the
+    /// rebuild's instant (the tick builds it as it would have).
+    pub fn on_again(&mut self, now: Ms, gen: u64) -> Option<InputAction> {
+        let InputState::Backoff { until, .. } = self.state else {
+            return None;
+        };
+        if gen != self.generation || !self.abandoned || now >= until {
+            return None;
+        }
+        self.abandoned = false;
+        self.reach_running(now);
+        Some(InputAction::TakeBack { gen })
+    }
+
+    /// The current build's source byte count, as the driver read it (C3, S2 item 2): a rise stamps
+    /// `now` as the latest instant bytes arrived. Another generation's count, or one that did not
+    /// rise, changes nothing.
+    pub fn on_bytes(&mut self, now: Ms, gen: u64, total: u64) {
+        if gen == self.generation && total > self.bytes_total {
+            self.bytes_total = total;
+            self.bytes_at = Some(now);
+        }
+    }
+
+    /// Bytes still arrive at `now`: the count rose within `input_bytes_fresh_ms`.
+    fn bytes_flowing(&self, now: Ms, t: &Thresholds) -> bool {
+        self.bytes_at
+            .is_some_and(|at| elapsed(now, at) < t.input_bytes_fresh_ms)
     }
 
     /// The current generation's first byte out of its source (Owed 108 fix (b)), decoded or not: a
@@ -299,6 +378,7 @@ impl InputLink {
                 self.discard_armed = false;
                 let gen = self.generation;
                 self.give_up(now, 0, GiveUpReason::PhoneLiveDiscard, t);
+                self.abandoned = true;
                 Some(InputAction::Abandon { gen })
             }
             InputState::Connecting { .. } | InputState::Running { .. } => None,
@@ -320,6 +400,8 @@ impl InputLink {
         if gen != self.generation {
             return;
         }
+        // The build errored: whatever it was, it is not taken back (C3).
+        self.abandoned = false;
         if !self.is_hold_end(now, facts, last_frame_at, t) {
             self.on_lost(now, gen, LossReason::Error, t);
             return;
@@ -361,6 +443,9 @@ impl InputLink {
         if gen != self.generation {
             return;
         }
+        // A reported loss ends the build (C3: never taken back). The stall rule sets the flag again
+        // after this call, its own give-up being an abandon.
+        self.abandoned = false;
         let failed_before = match self.state {
             InputState::Running { .. } => {
                 if reason == LossReason::Eos {
@@ -376,17 +461,24 @@ impl InputLink {
     }
 
     /// Running but no frame since max(running since, last frame) for `input_stall_after_ms`: lost as
-    /// `Stalled`, and given up (`Abandon`). A frame from before this connection does not count.
+    /// `Stalled`, and given up (`Abandon`). A frame from before this connection does not count. While
+    /// bytes still arrive (`bytes_flowing`, C3 S2 item 2) the bound is `input_decode_wait_ms`.
     pub fn check_stall(&mut self, now: Ms, last_frame_at: Option<Ms>, t: &Thresholds) -> Option<InputAction> {
         let InputState::Running { since } = self.state else {
             return None;
         };
         let fresh = last_frame_at.map_or(since, |f| f.max(since));
-        if elapsed(now, fresh) < t.input_stall_after_ms {
+        let bound = if self.bytes_flowing(now, t) {
+            t.input_decode_wait_ms
+        } else {
+            t.input_stall_after_ms
+        };
+        if elapsed(now, fresh) < bound {
             return None;
         }
         let gen = self.generation;
         self.on_lost(now, gen, LossReason::Stalled, t);
+        self.abandoned = true;
         Some(InputAction::Abandon { gen })
     }
 
@@ -398,12 +490,16 @@ impl InputLink {
                 self.generation += 1;
                 self.state = InputState::Connecting { attempt, since: now };
                 self.media = false;
+                self.abandoned = false;
+                self.bytes_total = 0;
+                self.bytes_at = None;
                 Some(InputAction::Rebuild { gen: self.generation })
             }
             InputState::Connecting { attempt, since }
                 if elapsed(now, since) >= t.input_connect_timeout_ms =>
             {
                 self.give_up(now, attempt, GiveUpReason::ConnectTimeout, t);
+                self.abandoned = true;
                 Some(InputAction::Abandon { gen: self.generation })
             }
             _ => None,
@@ -426,6 +522,7 @@ impl InputLink {
             gen: self.generation,
             reason,
         });
+        self.give_ups = self.give_ups.saturating_add(1);
         self.back_off(now, failed_before, t);
     }
 

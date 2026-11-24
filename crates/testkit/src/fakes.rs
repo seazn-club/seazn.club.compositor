@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use app::ports::{
     redacted_origin, ControlPlane, ControlQueue, ControlRequest, FetchError, FrameTap, FrameUpload,
-    FrameUploadError, GraphicsRenderer, HeartbeatError, Inbound, InputSource, InputSpec, LogSink, Measured,
-    Metrics, PhasePublisher, Ports, ProgrammeOutput, Reply, SessionConfig, TargetSpec,
+    FrameUploadError, GraphicsRenderer, HeartbeatError, Inbound, InputBytes, InputSource, InputSpec, LogSink,
+    Measured, Metrics, PhasePublisher, Ports, ProgrammeOutput, Reply, SessionConfig, TargetSpec,
 };
 use domain::airings::AiringBatch;
 use domain::cef_health::CefHealth;
@@ -30,6 +30,8 @@ pub enum Call {
     InputRebuild(u64, InputSpec),
     /// `InputSource::abandon(gen)` (C10b).
     InputAbandon(u64),
+    /// `InputSource::take_back(gen)` (C3, S2).
+    InputTakeBack(u64),
     InputStop,
     Start(OutputProfile),
     Push(u64, FrameChoice),
@@ -52,6 +54,7 @@ impl fmt::Debug for Call {
         match self {
             Call::InputRebuild(g, s) => f.debug_tuple("InputRebuild").field(g).field(s).finish(),
             Call::InputAbandon(g) => f.debug_tuple("InputAbandon").field(g).finish(),
+            Call::InputTakeBack(g) => f.debug_tuple("InputTakeBack").field(g).finish(),
             Call::InputStop => f.write_str("InputStop"),
             Call::Start(p) => f.debug_tuple("Start").field(p).finish(),
             Call::Push(i, c) => f.debug_tuple("Push").field(i).field(c).finish(),
@@ -133,8 +136,56 @@ impl InputSource for FakeInput {
         self.0.push(Call::InputAbandon(gen));
     }
 
+    fn take_back(&mut self, gen: u64) {
+        self.0.push(Call::InputTakeBack(gen));
+    }
+
+    /// The fake mode counts no bytes (as C2's camera rates): `FakeInputBytes` does.
+    fn bytes(&self) -> Option<InputBytes> {
+        None
+    }
+
     fn stop(&mut self) {
         self.0.push(Call::InputStop);
+    }
+}
+
+/// A shared cell a test writes the camera's byte count into (C3, S2 item 2).
+#[derive(Debug, Clone, Default)]
+pub struct BytesCell(pub Arc<Mutex<Option<InputBytes>>>);
+
+impl BytesCell {
+    pub fn set(&self, b: Option<InputBytes>) {
+        *locked(&self.0) = b;
+    }
+}
+
+/// `FakeInput`, whose `bytes()` reads a `BytesCell` the test drives (C3).
+#[derive(Debug)]
+pub struct FakeInputBytes {
+    pub log: Log,
+    pub bytes: BytesCell,
+}
+
+impl InputSource for FakeInputBytes {
+    fn rebuild(&mut self, gen: u64, spec: &InputSpec) {
+        self.log.push(Call::InputRebuild(gen, spec.clone()));
+    }
+
+    fn abandon(&mut self, gen: u64) {
+        self.log.push(Call::InputAbandon(gen));
+    }
+
+    fn take_back(&mut self, gen: u64) {
+        self.log.push(Call::InputTakeBack(gen));
+    }
+
+    fn bytes(&self) -> Option<InputBytes> {
+        *locked(&self.bytes.0)
+    }
+
+    fn stop(&mut self) {
+        self.log.push(Call::InputStop);
     }
 }
 

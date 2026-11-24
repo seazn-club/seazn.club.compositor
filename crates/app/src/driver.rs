@@ -68,12 +68,18 @@
 //!   reaches Running before it acts. Each line is once a change or once a latch, so none repeats on a
 //!   beat. Integers and words only.
 //! - **The camera as the relay received it** (C2, S4): each beat's metrics sample that carries
-//!   either camera rate writes `input received fps=<x.y> kbps=<n>` (`-` for the one not measured); a
-//!   sample with neither writes nothing.
+//!   either camera rate (or, C3, either loss total) writes `input received fps=<x.y> kbps=<n>`
+//!   (`-` for the one not measured), then ` withheld_spans=<n> queue_overruns=<n>` when a loss total
+//!   is measured; a sample with none of them writes nothing.
 //! - **Each camera generation given up** (C2, S4), read off the input link before and after each
 //!   decision (`Supervisor::input_give_up`), never decided here: `input give up gen=<g>
 //!   reason=<connect_timeout|stalled|phone_live_discard|hold_end|eos|error>`, once a generation,
 //!   before the decision's port calls (its `abandon` included). The beat carries the same.
+//! - **A camera generation taken back** (C3, S2): `input take back gen=<g>` before the port's
+//!   `take_back`. The give-up line above is written on each rise of the link's give-up count, so a
+//!   taken-back generation given up again writes it again.
+//! - **The camera's source bytes** (C3, S2 item 2) are read from the input port once per `tick_due`
+//!   that ran a tick, after CEF's health, and handed to `decide` as `InputBytes` (never decided here).
 //! - **After `Exit`** nothing reaches a port from `step` or `tick_due`. `run()`'s flush follows, and
 //!   logs `final beat not confirmed within 2000 ms` when it times out.
 use std::time::Duration;
@@ -267,9 +273,25 @@ impl Driver {
         }
         // An exit returned above, so a tick that ran means the driver is live.
         if ran > 0 {
-            return self.cef_health(now);
+            if let Some(code) = self.cef_health(now) {
+                return Some(code);
+            }
+            return self.input_bytes(now);
         }
         None
+    }
+
+    /// The camera build's source byte count, read once and handed to `decide` (C3, S2 item 2): the
+    /// domain decides whether bytes still arrive. Nothing is posted with no build or no counter.
+    fn input_bytes(&mut self, now: u64) -> Option<i32> {
+        let b = self.ports.input.bytes()?;
+        self.decide(
+            Event::InputBytes {
+                gen: b.gen,
+                total: b.total,
+            },
+            now,
+        )
     }
 
     /// CEF's health, read once and handed to `decide` (C11b), with its line when it changed.
@@ -352,10 +374,13 @@ impl Driver {
 
     fn apply(&mut self, d: Decision, now: u64) -> Option<i32> {
         let before = self.supervisor.input_nudge();
-        let gave_up = self.supervisor.input_give_up();
+        let give_ups = self.supervisor.input_give_ups();
         self.supervisor = d.next;
         self.phone_live(before, self.supervisor.input_nudge());
-        if let Some(g) = self.supervisor.input_give_up().filter(|g| Some(*g) != gave_up) {
+        // A rise in the count, not a change of the record: a taken-back generation given up again
+        // has the same generation and reason (C3).
+        let gave_up = self.supervisor.input_give_ups() != give_ups;
+        if let Some(g) = self.supervisor.input_give_up().filter(|_| gave_up) {
             self.ports.log.info(&format!(
                 "input give up gen={} reason={}",
                 g.gen,
@@ -410,6 +435,12 @@ impl Driver {
             }
             // The domain gave the generation up (C10b): the adapter shuts it out. No session needed.
             Effect::AbandonInput { gen } => p.input.abandon(gen),
+            // The domain took the generation back (C3, S2): logged, then the adapter re-opens its
+            // gate. No session needed.
+            Effect::TakeBackInput { gen } => {
+                p.log.info(&format!("input take back gen={gen}"));
+                p.input.take_back(gen);
+            }
             Effect::SwapSink { gen, reason } => {
                 let Some(cfg) = &self.session else {
                     return self.no_session(now);
@@ -651,17 +682,29 @@ fn phase_word(p: ProgrammePhase) -> &'static str {
 }
 
 /// The camera as received (C2, S4), once a beat: `input received fps=<x.y> kbps=<n>`, each `-` when
-/// not measured (a non-finite rate is not a measurement), and no line when neither is.
+/// not measured (a non-finite rate is not a measurement), and no line when neither is. C3 (S5 item
+/// 1): the camera's loss totals follow, ` withheld_spans=<n> queue_overruns=<n>`, each `-` when not
+/// measured, and only when either is (so a beat without them writes C2's line as it was).
 fn received_line(m: &Measured) -> Option<String> {
     let fps = m.input_received_fps.filter(|f| f.is_finite() && *f >= 0.0);
-    if fps.is_none() && m.input_received_kbps.is_none() {
+    let loss = m.input_withheld_spans.is_some() || m.input_queue_overruns.is_some();
+    if fps.is_none() && m.input_received_kbps.is_none() && !loss {
         return None;
     }
-    Some(format!(
+    let count = |n: Option<u64>| n.map_or("-".to_owned(), |k| k.to_string());
+    let mut line = format!(
         "input received fps={} kbps={}",
         fps.map_or("-".to_owned(), |f| format!("{f:.1}")),
-        m.input_received_kbps.map_or("-".to_owned(), |k| k.to_string())
-    ))
+        count(m.input_received_kbps)
+    );
+    if loss {
+        line.push_str(&format!(
+            " withheld_spans={} queue_overruns={}",
+            count(m.input_withheld_spans),
+            count(m.input_queue_overruns)
+        ));
+    }
+    Some(line)
 }
 
 /// Why a camera generation was given up, as the log and the beat's `inputGiveUpReason` name it

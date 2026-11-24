@@ -129,9 +129,16 @@ enum InputEvent {
     /// current generation's counts (the no-op sweep below holds it to that).
     Media,
     Stall,
+    /// A frame at the adapter's shut gate (C3, S2). No state here takes it back: this matrix's
+    /// Backoff is a reported loss's, never an abandon's, and its instant is the rebuild's own, the
+    /// window's end. The take-back's own cases are in `tests/take_back.rs`.
+    Again,
+    /// The build's source byte count (C3, S2 item 2): it moves no state and asks for nothing; only the
+    /// current generation's counts.
+    Bytes,
 }
 
-const INPUT_EVENTS: [InputEvent; 8] = [
+const INPUT_EVENTS: [InputEvent; 10] = [
     InputEvent::Tick,
     InputEvent::Connected,
     InputEvent::Lost(LossReason::Eos),
@@ -140,6 +147,8 @@ const INPUT_EVENTS: [InputEvent; 8] = [
     InputEvent::Error,
     InputEvent::Media,
     InputEvent::Stall,
+    InputEvent::Again,
+    InputEvent::Bytes,
 ];
 
 /// Applies `e` at `now`, from generation `gen`. Returns what a tick or a stall check asked for.
@@ -168,6 +177,11 @@ fn apply_input(l: &mut InputLink, e: InputEvent, now: Ms, gen: u64, t: &Threshol
             None
         }
         InputEvent::Stall => l.check_stall(now, None, t),
+        InputEvent::Again => l.on_again(now, gen),
+        InputEvent::Bytes => {
+            l.on_bytes(now, gen, 1_316);
+            None
+        }
     }
 }
 
@@ -178,6 +192,7 @@ enum Asks {
     Nothing,
     Build,
     Abandon,
+    TakeBack,
 }
 
 /// The brief's transitions (Step 3), written from its prose: (kind after, what it asks, kicks added).
@@ -206,6 +221,7 @@ fn asks(a: Option<InputAction>) -> Asks {
         None => Asks::Nothing,
         Some(InputAction::Rebuild { .. }) => Asks::Build,
         Some(InputAction::Abandon { .. }) => Asks::Abandon,
+        Some(InputAction::TakeBack { .. }) => Asks::TakeBack,
     }
 }
 
@@ -229,6 +245,7 @@ fn every_input_pair_follows_the_brief() {
                     assert_eq!(gen, 2, "({kind:?}, {e:?})");
                     abandons += 1;
                 }
+                Some(InputAction::TakeBack { gen }) => panic!("({kind:?}, {e:?}): took {gen} back"),
                 None => {}
             }
             checked += 1;
@@ -271,7 +288,7 @@ fn input_early_ticks_and_other_generations_change_nothing() {
         }
     }
     eprintln!("input no-ops checked: {checked}");
-    assert_eq!(checked, INPUT_KINDS.len() * (1 + 2 * 6));
+    assert_eq!(checked, INPUT_KINDS.len() * (1 + 2 * 8));
 }
 
 /// An output link in `kind` at sink generation 2 (1 torn down, 3 never built), one failure behind it
