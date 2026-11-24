@@ -18,7 +18,8 @@ use domain::programme::ProgrammePhase;
 use domain::supervisor::{Effect, Event, Supervisor};
 use domain::time::Ms;
 
-/// F-036's stg window: the first decoded frame 6 to 8 s after the connect, in 0.5 s steps.
+/// The C1 brief's estimate of F-036's stg returns (not a measurement; the derived figure is F-032's
+/// 4.2 s plus the GOP's extra second, 5.2 s): the first decoded frame 6 to 8 s after the connect.
 const FIRST_FRAME_AFTER: [Ms; 5] = [6_000, 6_500, 7_000, 7_500, 8_000];
 
 /// F-002's connect timeout, the one the stg session ran with (F-036: each connect "abandoned by the

@@ -10,8 +10,9 @@
 //! `Thresholds::default()`, so a spike-driven threshold change that breaks a budget still reds at
 //! `cargo test`, not in a two-minute chaos run.
 use domain::config::{
-    OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN, OUTPUT_GAP_BUDGET_MS,
-    OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS, TICK_WIDEST_MS,
+    OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN,
+    FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
+    TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
 };
 use serde_json::{json, Map, Value};
 
@@ -19,15 +20,24 @@ use serde_json::{json, Map, Value};
 pub const BUDGET_SLATE_AFTER_LOSS_MS: u64 = 3_100;
 /// Spec §6 "Budgets": "return to live ≤1.2 s" (the failure table: "Live 1.2 s after frames return").
 pub const BUDGET_RETURN_TO_LIVE_MS: u64 = 1_200;
-/// Spec §6 "Budgets": "output reconnect ≤5 s".
-pub const BUDGET_OUTPUT_RECONNECT_MS: u64 = 5_000;
+/// Spec §6 "Budgets": "output reconnect ≤5 s", as the spec states it.
+pub const SPEC_OUTPUT_RECONNECT_MS: u64 = 5_000;
+/// The output reconnect budget every case reads: spec §6's ≤5 s and F-036's forced-keyframe floor
+/// (the C1 review's I2(a); the owner's apply-rec ruling 2026-11-24, docs/_INDEX.md: spec §6's "≤5 s"
+/// now reads "≤5 s + forced-key floor"). A reconnected sink starts at the keyframe its swap asks for,
+/// which the encoder holds to the floor after its last one. Its readers: run-case.sh's
+/// `output_reconnect`, lib.jq's error-to-swap bound, case 18 (`output-hung.sh`) and the soak's
+/// verdict 2 (`soak/verdict.jq`).
+pub const BUDGET_OUTPUT_RECONNECT_MS: u64 = SPEC_OUTPUT_RECONNECT_MS + FORCED_KEYFRAME_MIN_INTERVAL_MS;
 /// Spec §6, the failure table's output disconnect / stall row: "≤2 s of programme lost".
 pub const BUDGET_OUTPUT_LOST_MAX_MS: u64 = 2_000;
 /// Spec §6, the failure table's encoder overrun row: "Real time within 10 s".
 pub const BUDGET_LADDER_REALTIME_MS: u64 = 10_000;
 /// Spec §6, the failure table's process crash row: "Output back ≤15 s". The same number as the
-/// domain's `OUTPUT_GAP_BUDGET_MS` (F-004: YouTube's broadcast split; owner, 2026-10-20, Owed 69).
-pub const BUDGET_PROCESS_RESTART_OUTPUT_MS: u64 = OUTPUT_GAP_BUDGET_MS;
+/// domain's `YOUTUBE_KEPT_GAP_MS` (F-004: YouTube's broadcast split; owner, 2026-10-20, Owed 69).
+/// Not `OUTPUT_GAP_BUDGET_MS`, which F-036 raised by the forced-keyframe floor for the output's
+/// recovery paths only (the C1 review's I2(b), which names those readers and not this one).
+pub const BUDGET_PROCESS_RESTART_OUTPUT_MS: u64 = YOUTUBE_KEPT_GAP_MS;
 /// Spec §6 "Budgets": "input frame→encoder ≤150 ms".
 pub const BUDGET_FRAME_TO_ENCODER_MS: u64 = 150;
 /// The C14 brief's budget table: the PDF's A/V budget, which spec §6 adopts as written ("The PDF's
@@ -371,15 +381,23 @@ mod tests {
     #[test]
     fn the_output_budgets_hold_the_output_thresholds() {
         let t = Thresholds::default();
-        // One capped back-off then a connect attempt starts inside the reconnect budget.
-        assert!(t.output_backoff_cap_ms < BUDGET_OUTPUT_RECONNECT_MS);
+        // One capped back-off then a connect attempt starts inside the spec's reconnect budget, before
+        // F-036's floor is added to it.
+        assert!(t.output_backoff_cap_ms < SPEC_OUTPUT_RECONNECT_MS);
+        assert_eq!(
+            BUDGET_OUTPUT_RECONNECT_MS,
+            5_000 + 2_200,
+            "spec §6's 5 s and F-036's floor"
+        );
+        // The output's recovery paths add the same floor to F-004's 15 s.
+        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_200);
         // The restart budget is YouTube's split (F-004) and no looser.
         assert_eq!(BUDGET_PROCESS_RESTART_OUTPUT_MS, 15_000);
     }
 
     // Constant against constant: checked by the compiler (clippy refuses a runtime assert on
     // constants), so a change that breaks one fails the build. (The restart budget IS the domain's
-    // OUTPUT_GAP_BUDGET_MS, by definition above: no assert can add to that; the PR #52 review's m7.)
+    // YOUTUBE_KEPT_GAP_MS, by definition above: no assert can add to that; the PR #52 review's m7.)
     // The final beat's flush fits inside the restart budget with room for a boot.
     const _: () = assert!(app::ports::FINAL_BEAT_TIMEOUT_MS < BUDGET_PROCESS_RESTART_OUTPUT_MS);
     // The page polls more often than its stale rule fires.
@@ -490,7 +508,7 @@ mod tests {
     }
 
     // The PR #52 review's m7: a budget edited and then regenerated passed every drift test, because
-    // only the restart budget was pinned (to the domain's OUTPUT_GAP_BUDGET_MS). The domain declares
+    // only the restart budget was pinned (then to the domain's OUTPUT_GAP_BUDGET_MS). The domain declares
     // no const for the others (Owed 83), so each is pinned to the sentence it was taken from: the
     // spec §6 text, or the C14 brief's where the spec has none. A budget changed without its source
     // reds here, and so does a source changed without its budget.
@@ -528,7 +546,7 @@ mod tests {
                 "output reconnect ≤",
                 " s",
                 1000.0,
-                ms(BUDGET_OUTPUT_RECONNECT_MS),
+                ms(SPEC_OUTPUT_RECONNECT_MS),
             ),
             (
                 &spec,

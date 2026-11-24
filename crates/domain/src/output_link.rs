@@ -50,9 +50,10 @@
 //! - **Generations.** Every build is a new generation, and an event from any other generation is
 //!   ignored in both directions: a late error from a torn-down sink cannot knock down its replacement,
 //!   and late bytes from it can neither start nor prove the replacement.
-//! - **The 15 s budget** (`OUTPUT_GAP_BUDGET_MS`, F-004) holds from an error through one failed
-//!   connect, not two: `tests/links.rs` measures every recovery path, and docs/_INDEX.md records the
-//!   paths that exceed it. The gap ends when the new sink's bytes flow, not when it is Connected.
+//! - **The 17.2 s budget** (`OUTPUT_GAP_BUDGET_MS`: F-004's 15 s and F-036's forced-keyframe floor)
+//!   holds from an error through one failed connect, not two: `tests/links.rs` measures every
+//!   recovery path, and docs/_INDEX.md records the paths that exceed it. The gap ends when the new
+//!   sink's bytes flow and its keyframe comes (up to the floor after them), not when it is Connected.
 //! - **Every build carries its reason** (`SwapReason`, Owed 87): what ended the sink before it. An
 //!   error is the sink's own (rtmp2sink's socket timeout among them); the connect timeout and the
 //!   egress backstop are this module's rules. A build after a back-off carries the failure that

@@ -1428,9 +1428,10 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
         "trickle-err-early",
     );
     checked += 1;
-    // The spec's output budget from the error (§6 "≤5 s"): the swap placed a timeout later (x 2),
-    // so that the error clears the cut's floor and the trickle keeps the growth beat close, and only
-    // the budget is judged: the budget itself passes, 1 ms past it reds on it alone.
+    // The output reconnect budget from the error (§6 "≤5 s" and F-036's floor): the swap placed a
+    // timeout later (x 2), so that the error clears the cut's floor and the trickle keeps the growth
+    // beat close, and only the budget is judged: the budget itself passes, 1 ms past it reds on it
+    // alone.
     let w = dest_stall_err(5_000, 2, trickling(), ErrLine::At(1, budget));
     assert_pass(
         &judge(&w, "dest-trickle", "", "trickle-err-budget"),

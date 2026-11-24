@@ -163,7 +163,8 @@ def stall_swap($cut):
 #   lines' own `ts=`: the error line is written before the domain's `now` for it is read, and the
 #   swap line after the tick that builds, both on the process's ms clock, so a correct swap is never
 #   under the base; a swap that skipped the back-off lands within a tick of the error, far below it)
-#   and inside the spec's output budget (§6 "≤5 s", budget_output_reconnect_ms). Docker's stamps
+#   and inside the output reconnect budget (budget_output_reconnect_ms: §6 "≤5 s" and F-036's
+#   forced-keyframe floor; a swap waits for no keyframe, so the floor only loosens it). Docker's stamps
 #   cannot judge this: `docker logs --timestamps` stamps each line when its daemon reads it, so the
 #   pair can sit closer than the process wrote them (PR #71's CI run 40137725801: 499.38 ms at ns
 #   precision for a swap whose `ts=` were 500 apart, the error line read about 1.4 ms late);
