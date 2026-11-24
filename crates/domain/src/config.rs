@@ -189,6 +189,29 @@ pub const OUTPUT_GAP_BUDGET_MS: Ms = 15_000;
 /// not a `Thresholds` field: the domain decides nothing on it (the sink's error is its event).
 pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 5_000;
 
+/// F-036 (stg sessions d908c90c and 5e5403ce, 2026-11-24): Cloudflare Stream takes a live input's
+/// keyframe interval only from 2 to 10 s, and errors the input outside it (`live_input.errored`,
+/// `ERR_GOP_OUT_OF_RANGE`), which the programme input (our x264 output) did, twice in one morning.
+/// The range as the C1 brief states Cloudflare's rule. The floor.
+pub const CF_KEYFRAME_INTERVAL_MIN_MS: Ms = 2_000;
+/// F-036: Cloudflare's keyframe interval range, its ceiling (`CF_KEYFRAME_INTERVAL_MIN_MS`).
+pub const CF_KEYFRAME_INTERVAL_MAX_MS: Ms = 10_000;
+
+/// F-036: the programme's GOP, one keyframe every 3 s (the C1 brief): the capture app's own fix for
+/// the same 2 s edge (it measured ±14 ms of jitter at 2 s), a second inside Cloudflare's floor. C09
+/// sets x264enc's `key-int-max` to it in frames (`OutputProfile::gop_frames`) with x264's scene cut
+/// off (`scenecut=0`, which x264 honours and its `min-keyint` cannot replace: x264 clamps that to
+/// `key-int-max / 2 + 1`, F-036), so every GOP is this long, unless an output swap forces a keyframe
+/// (Owed 84; `FORCED_KEYFRAME_MIN_INTERVAL_MS` bounds that one).
+pub const PROGRAMME_GOP_MS: Ms = 3_000;
+
+/// F-036: the shortest GOP a forced keyframe may cut. Owed 84's output swap asks the encoder every
+/// output shares for a keyframe; asked within this of the last keyframe, it is deferred to this
+/// interval, never dropped. Cloudflare's floor exactly. C09 sets it as x264enc's
+/// `min-force-key-unit-interval` (GstVideoEncoder, since 1.18), which holds the request in running
+/// time, the stream's own clock: a wall-clock rule cannot see when the last keyframe was encoded.
+pub const FORCED_KEYFRAME_MIN_INTERVAL_MS: Ms = CF_KEYFRAME_INTERVAL_MIN_MS;
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -341,6 +364,16 @@ impl OutputProfile {
         1_000.0 / f64::from(self.fps)
     }
 
+    /// F-036: `PROGRAMME_GOP_MS` in this profile's frames (x264enc's `key-int-max`).
+    pub fn gop_frames(&self) -> u32 {
+        frames_in(self.fps, PROGRAMME_GOP_MS)
+    }
+
+    /// F-036: `FORCED_KEYFRAME_MIN_INTERVAL_MS` in this profile's frames.
+    pub fn forced_keyframe_min_frames(&self) -> u32 {
+        frames_in(self.fps, FORCED_KEYFRAME_MIN_INTERVAL_MS)
+    }
+
     /// Owed 86: the real output frame rate below which the output is starved
     /// (`OUTPUT_FPS_FLOOR_SHARE` of this profile's `fps`).
     pub fn fps_floor(&self) -> f64 {
@@ -352,6 +385,12 @@ impl OutputProfile {
     pub fn fps_recovered(&self) -> f64 {
         f64::from(self.fps) * OUTPUT_FPS_RECOVERED_SHARE
     }
+}
+
+/// `ms` at `fps`, in whole frames (rounded down; the config tests hold every interval to a whole
+/// number of frames in both profiles).
+fn frames_in(fps: u32, ms: Ms) -> u32 {
+    u32::try_from(u64::from(fps) * ms / 1_000).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -606,6 +645,41 @@ mod tests {
             flat > OUTPUT_SINK_TIMEOUT_MS + t.output_backoff_cap_ms + OUTPUT_PROGRESS_POLL_MS,
             "backstop {flat} ms"
         );
+    }
+
+    // F-036, each number against its source, written here: Cloudflare's 2 to 10 s (the C1 brief's
+    // statement of its rule), the 3 s GOP (the brief; the capture app's fix), and the forced keyframe's
+    // floor at Cloudflare's. In both modes each is a whole number of frames, so x264's frame counts
+    // land on the millisecond, and the GOP and the floor sit inside Cloudflare's range.
+    #[test]
+    fn the_gop_and_the_forced_keyframe_floor_sit_inside_cloudflares_range() {
+        assert_eq!(
+            (CF_KEYFRAME_INTERVAL_MIN_MS, CF_KEYFRAME_INTERVAL_MAX_MS),
+            (2_000, 10_000),
+            "Cloudflare's range"
+        );
+        assert_eq!(PROGRAMME_GOP_MS, 3_000, "the brief's 3 s");
+        assert_eq!(FORCED_KEYFRAME_MIN_INTERVAL_MS, 2_000, "Cloudflare's floor");
+        let mut checked = 0;
+        for p in BOTH_MODES {
+            for ms in [PROGRAMME_GOP_MS, FORCED_KEYFRAME_MIN_INTERVAL_MS] {
+                let fps = Ms::from(p.fps);
+                assert_eq!(fps * ms % 1_000, 0, "{p:?}: {ms} ms is not whole frames");
+                assert!(
+                    (CF_KEYFRAME_INTERVAL_MIN_MS..=CF_KEYFRAME_INTERVAL_MAX_MS).contains(&ms),
+                    "{ms} ms"
+                );
+                checked += 1;
+            }
+            // 30 fps (ADR 0005): 90 frames a GOP, the floor 60.
+            assert_eq!(
+                (p.gop_frames(), p.forced_keyframe_min_frames()),
+                (90, 60),
+                "{p:?}"
+            );
+            assert!(p.forced_keyframe_min_frames() < p.gop_frames(), "{p:?}");
+        }
+        assert_eq!(checked, 4, "intervals checked: {checked}");
     }
 
     // Owed 15 (the choice recorded in `_FINDINGS.md` F-011): C09 reads the sink's total every 250 ms.

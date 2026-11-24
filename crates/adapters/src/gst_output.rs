@@ -628,7 +628,7 @@ enum Next {
 
 /// The keyframe asked for at the reconnect point (Owed 84): asked again at each entry until the
 /// encoder takes it or the stream has started, so a refused request does not leave the stream
-/// waiting for the encoder's own keyframe, up to 2 s away (PR #57 review m-6).
+/// waiting for the encoder's own keyframe, up to a GOP away (3 s, F-036; PR #57 review m-6).
 #[derive(Default)]
 struct KeyAsk {
     tries: u32,

@@ -25,7 +25,8 @@ use adapters::stats::StatsSnapshot;
 use app::ports::{Inbound, Metrics, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
 use domain::config::{
-    OutputProfile, Thresholds, ENCODER_SPEED_REALTIME_MIN, OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS,
+    OutputProfile, Thresholds, CF_KEYFRAME_INTERVAL_MAX_MS, CF_KEYFRAME_INTERVAL_MIN_MS,
+    ENCODER_SPEED_REALTIME_MIN, OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS, PROGRAMME_GOP_MS,
 };
 use domain::ladder::Rung;
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -550,6 +551,209 @@ fn ninety_slate_ticks_give_ninety_frames_at_constant_spacing() {
         first_audio <= 1_024 * 1_000 / 48_000,
         "audio starts {first_audio} ms after the picture"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-036: a fixed GOP, every keyframe interval inside Cloudflare's 2 to 10 s
+
+/// Ticks between hard cuts. x264's default scene cut may start a GOP at a cut at least `keyint_min`
+/// frames after the last keyframe, which x264 sets to `keyint / 10` (9 of 90) when nothing else does,
+/// so a cut every 10 ticks is one it could take every time.
+const CUT_TICKS: u64 = 10;
+
+/// The GOP in ticks (`PROGRAMME_GOP_MS` in the 720p profile's frames).
+fn gop_ticks() -> u64 {
+    u64::from(P720.gop_frames())
+}
+
+/// Which of the three pictures tick `i` shows: the slate (0), then textured picture 1, then
+/// textured picture 2, each for `CUT_TICKS`, round and round.
+fn cut_picture(i: u64) -> usize {
+    ((i / CUT_TICKS) % 3) as usize
+}
+
+/// A `profile`-sized picture with detail in it, unlike the slate's flat backdrop: 32-pixel squares,
+/// each a colour hashed from its place and `seed`, so a cut to or from it is a hard one.
+fn textured(profile: &OutputProfile, seed: u32) -> gst::Sample {
+    picture(
+        gst_video::VideoFormat::I420,
+        profile.width,
+        profile.height,
+        |x, y| {
+            let mut h = (x / 32).wrapping_mul(0x9E37_79B9) ^ (y / 32).wrapping_mul(0x85EB_CA6B) ^ seed;
+            h ^= h >> 15;
+            h = h.wrapping_mul(0x2C1B_3C6D);
+            h ^= h >> 12;
+            let [r, g, b, _] = h.to_le_bytes();
+            [r, g, b, 255]
+        },
+    )
+}
+
+/// The frame indexes h264parse flagged as keyframes.
+fn key_indexes(d: &Decoded) -> Vec<u64> {
+    (0u64..)
+        .zip(&d.parsed)
+        .filter(|(_, f)| f.1)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The control: the keyframes x264 codes for `n` ticks of `pics` (in `cut_picture`'s order) with its
+/// scene cut at the default and the programme's other x264 settings, written here from C09's brief
+/// and F-036 (`zerolatency`, `medium`, no B-frames, the GOP). It is the premise that these cuts are
+/// hard enough for x264's scene cut to start a GOP at them, so a programme that codes none of them
+/// as keyframes has its scene cut off rather than cuts too soft to tell.
+fn default_scene_cut_keys(profile: &OutputProfile, pics: &[gst::Sample; 3], n: u64) -> Vec<u64> {
+    let launch = format!(
+        "appsrc name=src format=time block=true ! videoconvert ! x264enc tune=zerolatency \
+         speed-preset=medium bframes=0 key-int-max={} ! h264parse ! appsink name=sink sync=false",
+        profile.gop_frames()
+    );
+    let pipeline = gst::parse::launch(&launch)
+        .expect("control pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("pipeline");
+    let src = pipeline
+        .by_name("src")
+        .expect("src")
+        .downcast::<gst_app::AppSrc>()
+        .expect("appsrc");
+    // The programme's frame rate, so x264 paces its rate control as the programme's encoder does.
+    let mut caps = pics[0].caps().expect("caps").to_owned();
+    let fps = i32::try_from(profile.fps).expect("fps");
+    caps.make_mut().set("framerate", gst::Fraction::new(fps, 1));
+    src.set_caps(Some(&caps));
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&keys);
+    let count = Arc::new(AtomicU64::new(0));
+    pipeline
+        .by_name("sink")
+        .expect("sink")
+        .downcast::<gst_app::AppSink>()
+        .expect("appsink")
+        .set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |s| {
+                    let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let i = count.fetch_add(1, Ordering::SeqCst);
+                    if sample
+                        .buffer()
+                        .is_some_and(|b| !b.flags().contains(gst::BufferFlags::DELTA_UNIT))
+                    {
+                        seen.lock().unwrap().push(i);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    pipeline.set_state(gst::State::Playing).expect("control playing");
+    let step = 1_000_000_000 / u64::from(profile.fps);
+    for i in 0..n {
+        let mut b = pics[cut_picture(i)].buffer().expect("a buffer").copy();
+        b.get_mut()
+            .expect("writable")
+            .set_pts(gst::ClockTime::from_nseconds(i * step));
+        src.push_buffer(b).expect("control push");
+    }
+    src.end_of_stream().expect("control eos");
+    let msg = pipeline.bus().expect("bus").timed_pop_filtered(
+        gst::ClockTime::from_seconds(60),
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    );
+    let _ = pipeline.set_state(gst::State::Null);
+    assert!(
+        matches!(msg.as_ref().map(|m| m.view()), Some(gst::MessageView::Eos(_))),
+        "control: {msg:?}"
+    );
+    let k = keys.lock().unwrap().clone();
+    k
+}
+
+/// F-036: Cloudflare errored the programme input for GOPs under 2 s, and x264's scene cut started
+/// one at every hard cut. In both modes, with a hard cut every `CUT_TICKS` (the slate and two
+/// textured camera pictures, round and round), the programme's keyframes land on the GOP alone, and
+/// each interval in the file is the GOP, inside Cloudflare's range. The sink comes mid-GOP, so the
+/// file starts at the keyframe its swap forced (Owed 84), and the GOP restarts there: the encoder's
+/// own next keyframe is a whole GOP after a forced one, never sooner. The control codes the same
+/// pictures with x264's scene cut on and must find a keyframe off the GOP, or the cuts proved nothing.
+#[test]
+fn every_keyframe_lands_on_the_gop_and_a_hard_cut_never_starts_one() {
+    let _s = serial();
+    let mut intervals = 0;
+    for profile in [P720, OutputProfile::P1080] {
+        let dir = Tmp::new("gop");
+        let gop = u64::from(profile.gop_frames());
+        // Past the forced keyframe's floor, short of the GOP's second keyframe, and half a cut from
+        // the last cut: the keyframe the swap asks for is made at once, on no cut.
+        let lead = u64::from(profile.forced_keyframe_min_frames()) + CUT_TICKS / 2;
+        assert!(
+            lead < gop && !lead.is_multiple_of(CUT_TICKS),
+            "setup: the swap at {lead}"
+        );
+        // Two whole GOPs from the swap and three cuts into the third: keyframes at the file's first
+        // frame, the GOP and twice it.
+        let n = lead + 2 * gop + 3 * CUT_TICKS;
+        let [r, g, b] = HOUSE_NIGHT;
+        let pics = [
+            solid(
+                gst_video::VideoFormat::I420,
+                profile.width,
+                profile.height,
+                [r, g, b, 255],
+            ),
+            textured(&profile, 1),
+            textured(&profile, 2),
+        ];
+        let (mut p, rx, frames, _l) = programme_with(&profile);
+        let choose = |i| match cut_picture(i) {
+            0 => FrameChoice::Slate(SlateKind::Waiting),
+            _ => FrameChoice::Emit,
+        };
+        let cut = |i| {
+            if i % CUT_TICKS == 0 && cut_picture(i) != 0 {
+                frames.set_camera(pics[cut_picture(i)].clone());
+            }
+        };
+        pace_with(&mut p, 0..lead, &choose, &cut);
+        p.swap_sink(1, &file_target(&dir.file("a.flv")));
+        pace_with(&mut p, lead..n, &choose, &cut);
+        drain_and_wait(&mut p, &rx);
+        let d = decode(&dir.file("a.flv"));
+        let keys = key_indexes(&d);
+        let control = default_scene_cut_keys(&profile, &pics, n);
+        let cuts = (1..n).filter(|i| i % CUT_TICKS == 0).count();
+        eprintln!(
+            "{}p: {cuts} hard cuts over {} frames; keyframes at {keys:?}; x264's default scene cut: {control:?}",
+            profile.height,
+            d.parsed.len()
+        );
+        assert!(
+            control.iter().any(|k| k % gop != 0),
+            "setup: x264's own scene cut took none of these cuts: {control:?}"
+        );
+        // By frame count, so a frame the leaky queue dropped before x264 moves nothing.
+        let want: Vec<u64> = (0..d.parsed.len() as u64).step_by(gop as usize).collect();
+        assert!(
+            want.len() >= 3,
+            "setup: two whole GOPs reached the file: {}",
+            d.parsed.len()
+        );
+        assert_eq!(keys, want, "{}p: the keyframes", profile.height);
+        let key_ms: Vec<u64> = d.parsed.iter().filter(|f| f.1).map(|f| f.0).collect();
+        for w in key_ms.windows(2) {
+            let gap = w[1] - w[0];
+            assert!(
+                (CF_KEYFRAME_INTERVAL_MIN_MS..=CF_KEYFRAME_INTERVAL_MAX_MS).contains(&gap),
+                "{}p: a {gap} ms GOP",
+                profile.height
+            );
+            assert!(gap >= PROGRAMME_GOP_MS, "{}p: a {gap} ms GOP", profile.height);
+            intervals += 1;
+        }
+    }
+    eprintln!("GOP intervals checked: {intervals}");
+    assert!(intervals >= 4, "intervals checked: {intervals}");
 }
 
 #[test]
@@ -2680,8 +2884,8 @@ fn skipped_ticks_leave_no_hole_in_the_audio() {
 /// zerolatency x264 adds none), so the slate stops 10 ticks (333 ms) before the reconnect.
 const OWED84_MARGIN_TICKS: u64 = 10;
 /// The keyframe asked for at the reconnect point comes within this many ticks (6, 200 ms). The
-/// encoder's own next keyframe could be a whole 2 s interval away (`key-int-max` = 2 × fps), so a
-/// sink that waited for it would lose up to 60 ticks.
+/// encoder's own next keyframe could be a whole GOP away (F-036's 3 s, `OutputProfile::gop_frames`),
+/// so a sink that waited for it would lose up to 90 ticks.
 const OWED84_KEY_WAIT_TICKS: u64 = 6;
 /// The most a received message may run ahead of real time, measured from the first frame received.
 /// A stale backlog runs at least a whole 2 s ring ahead (F-023: about 4 s); this covers the AAC
@@ -3040,17 +3244,23 @@ fn a_drain_before_the_asked_keyframe_ends_without_waiting_for_it() {
 }
 
 /// I-1 (c) and m-6: an encoder that never takes the keyframe request. It is asked again at each
-/// frame; the 30 paced end before the encoder's own next keyframe (frame 120, `key-int-max` = 2 ×
-/// fps), so nothing is sent, and the drain ends with the encoders.
+/// frame; the swap comes just after the GOP's second keyframe and the 30 paced end before its
+/// third (`OutputProfile::gop_frames`, F-036), so nothing is sent, and the drain ends with the
+/// encoders.
 #[test]
 fn a_keyframe_request_never_taken_sends_nothing_and_the_drain_ends_with_the_encoders() {
     let _s = serial();
     let dir = Tmp::new("owed84-not-taken");
     let (mut p, rx, _f, lines) = programme();
-    pace(&mut p, 0..75, FrameChoice::Slate(SlateKind::Waiting));
+    let swap = gop_ticks() + OWED84_MARGIN_TICKS;
+    assert!(
+        swap + 30 + OWED84_KEY_WAIT_TICKS < 2 * gop_ticks(),
+        "setup: no keyframe of the encoder's own"
+    );
+    pace(&mut p, 0..swap, FrameChoice::Slate(SlateKind::Waiting));
     p.refuse_key_requests(u32::MAX);
     p.swap_sink(1, &file_target(&dir.file("a.flv")));
-    pace(&mut p, 75..105, FrameChoice::Slate(SlateKind::Waiting));
+    pace(&mut p, swap..swap + 30, FrameChoice::Slate(SlateKind::Waiting));
     assert_empty_output_drains_at_once("not taken", &mut p, &rx);
     let asked = u32::MAX - p.key_refusals_left();
     eprintln!("not taken: requests refused {asked}");
@@ -3066,17 +3276,24 @@ fn a_keyframe_request_never_taken_sends_nothing_and_the_drain_ends_with_the_enco
 }
 
 /// m-6: a request the encoder refuses once is asked again at the next frame, so the stream starts
-/// within `OWED84_KEY_WAIT_TICKS` of the swap, not at the encoder's own next keyframe (frame 120,
-/// 35 ticks after this swap).
+/// within `OWED84_KEY_WAIT_TICKS` of the swap, not at the encoder's own next keyframe (the GOP's
+/// third, 20 ticks after this swap: F-036's 3 s GOP). The swap comes more than
+/// `FORCED_KEYFRAME_MIN_INTERVAL_MS` after the GOP's second keyframe, so the retried request is due
+/// at once.
 #[test]
 fn a_keyframe_request_refused_once_is_asked_again_at_the_next_frame() {
     let _s = serial();
     let dir = Tmp::new("owed84-refused-once");
     let (mut p, rx, frames, lines) = programme();
     frames.set_camera(solid(gst_video::VideoFormat::I420, 1_280, 720, [255, 0, 0, 255]));
-    pace(&mut p, 0..75, FrameChoice::Slate(SlateKind::Waiting));
-    pace(&mut p, 75..75 + OWED84_MARGIN_TICKS, FrameChoice::Emit);
-    let swap = 75 + OWED84_MARGIN_TICKS;
+    let camera = gop_ticks() + u64::from(P720.forced_keyframe_min_frames());
+    let swap = camera + OWED84_MARGIN_TICKS;
+    assert!(
+        2 * gop_ticks() > swap + OWED84_KEY_WAIT_TICKS,
+        "setup: the encoder's own keyframe comes later than the retry's"
+    );
+    pace(&mut p, 0..camera, FrameChoice::Slate(SlateKind::Waiting));
+    pace(&mut p, camera..swap, FrameChoice::Emit);
     p.refuse_key_requests(1);
     p.swap_sink(1, &file_target(&dir.file("a.flv")));
     let paced = 45;
