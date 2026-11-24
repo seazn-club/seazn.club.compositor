@@ -18,10 +18,19 @@ const STEPS: [Ms; 4] = [1, 33, 250, 1_000];
 
 const FAR: Ms = 10_000_000;
 
-/// F-032's drop: the camera's last frame 1.9 s after the kill at 0, and Cloudflare's close 29 s
-/// after that (the drop + 30.9; the finding's closes came 27.9 to 29.2 s after the last frame).
+/// F-032's drop: the camera's last frame 1.9 s after the kill at 0.
 const LAST: Ms = 1_900;
-const CLOSE: Ms = LAST + 29_000;
+
+/// Cloudflare's close on a grid of `step`: the earliest the finding saw (its closes came 27.9 to
+/// 29.2 s after the last frame), after the last frame the grid sent. Not its typical 29 s: at F-036's
+/// 9 s connect timeout that one lands in the last base wait of a 4 s back-off (the build due at the
+/// last frame + 30 s), where the rule cannot rebuild any sooner
+/// (`the_rule_never_delays_a_build_already_due`), so it witnesses nothing. The earliest close lands
+/// 1.1 s before that build, at 9 s as at F-002's 5 s; anchored on the grid's own last frame, since a
+/// coarse grid sends it up to a step before `LAST` and the whole schedule moves with it.
+fn close_on(step: Ms) -> Ms {
+    LAST / step * step + 27_900
+}
 
 /// What Cloudflare's close finds on a relay build attached to its held broadcast.
 const HELD: BuildFacts = BuildFacts {
@@ -158,11 +167,12 @@ fn the_close_rebuilds_a_base_wait_later_on_every_tick_grid() {
     let th = t();
     let mut checked = 0;
     for step in STEPS {
-        let until = CLOSE + th.input_backoff_cap_ms + th.input_connect_timeout_ms;
+        let close = close_on(step);
+        let until = close + th.input_backoff_cap_ms + th.input_connect_timeout_ms;
         let mut with = Run::booted(step);
-        let sent = with.outage(CLOSE, HELD, After::TimesOut, until);
+        let sent = with.outage(close, HELD, After::TimesOut, until);
         let mut today = Run::booted(step);
-        assert_eq!(today.outage(CLOSE, REFUSED, After::TimesOut, until), sent);
+        assert_eq!(today.outage(close, REFUSED, After::TimesOut, until), sent);
         let gen_at_close = with.builds.iter().filter(|&&(at, _)| at < sent).count() as u64;
         let want = first_tick(sent + th.input_backoff_base_ms, step);
         assert_eq!(
@@ -191,19 +201,21 @@ fn the_close_rebuilds_a_base_wait_later_on_every_tick_grid() {
 /// times out or errors at once with the close's own facts, out to web's 15-minute phone-lost end.
 /// The extra connects against today's link are a constant (F-032: the reset re-runs the 2, 4 and 8 s
 /// steps once), never growing with the horizon. Unbounded, an erroring build would be rebuilt a base
-/// wait after each error, every 1.1 s.
+/// wait after each error, every 1.1 s. The witness that the rule acted: its first build comes before
+/// today's, and it costs at least one extra connect by some horizon. (At F-002's 5 s connect timeout
+/// it cost one at every horizon; at F-036's 9 s the capped tails sit 3.9 s apart, so 0 or 1.)
 #[test]
 fn a_phone_that_never_returns_costs_a_constant_number_of_connects() {
-    let end = CLOSE + 15 * 60_000;
-    let settled = CLOSE + 5 * 60_000;
     let mut horizons = 0;
     for after in [After::TimesOut, After::Errors] {
         for step in [10, 250] {
+            let close = close_on(step);
+            let (end, settled) = (close + 15 * 60_000, close + 5 * 60_000);
             let mut with = Run::booted(step);
-            let sent = with.outage(CLOSE, HELD, after, end);
+            let sent = with.outage(close, HELD, after, end);
             // Today's link: the same errors, refused-shaped, so the rule never reads one.
             let mut today = Run::booted(step);
-            assert_eq!(today.outage(CLOSE, REFUSED, after, end), sent);
+            assert_eq!(today.outage(close, REFUSED, after, end), sent);
             let (w, d) = (with.builds_from(sent), today.builds_from(sent));
             let extra = |h: Ms| {
                 let n = |b: &[Ms]| b.iter().filter(|&&at| at <= h).count() as i64;
@@ -228,7 +240,12 @@ fn a_phone_that_never_returns_costs_a_constant_number_of_connects() {
                 "{after:?}, step {step}: the extra grows: {e:?} then {l:?}"
             );
             assert!(e.1 <= 3, "{after:?}, step {step}: F-032 bounds it at 3: {e:?}");
-            assert!(l.0 >= 1, "{after:?}, step {step}: the rule rebuilt: {l:?}");
+            assert!(
+                w.first() < d.first() && e.1 >= 1,
+                "{after:?}, step {step}: the rule rebuilt: {:?} {:?}, {e:?}",
+                w.first(),
+                d.first()
+            );
             // The capped tail: both a capped step apart once the steps run out.
             let gap = |b: &[Ms]| b.windows(2).last().map(|x| x[1] - x[0]);
             assert_eq!(gap(&w), gap(&d), "{after:?}, step {step}: the same capped tail");
@@ -246,9 +263,10 @@ fn a_refused_connect_and_a_session_never_on_camera_keep_todays_back_off() {
     let th = t();
     let mut checked = 0;
     for step in STEPS {
-        let until = CLOSE + th.input_backoff_cap_ms + th.input_connect_timeout_ms;
+        let close = close_on(step);
+        let until = close + th.input_backoff_cap_ms + th.input_connect_timeout_ms;
         let mut refused = Run::booted(step);
-        let sent = refused.outage(CLOSE, REFUSED, After::TimesOut, until);
+        let sent = refused.outage(close, REFUSED, After::TimesOut, until);
         assert!(
             refused.builds_from(sent).first() > Some(&first_tick(sent + th.input_backoff_base_ms, step)),
             "step {step}: refused, {:?}",
@@ -375,10 +393,10 @@ fn the_hold_routes_the_error_and_the_second_close_waits_its_step() {
     let th = t();
     let mut r = Run::booted(1);
     let sent = r.outage(
-        CLOSE,
+        close_on(1),
         HELD,
         After::TimesOut,
-        CLOSE + th.input_backoff_base_ms + 100,
+        close_on(1) + th.input_backoff_base_ms + 100,
     );
     let rebuilt = first_tick(sent + th.input_backoff_base_ms, 1);
     assert_eq!(

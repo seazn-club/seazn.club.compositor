@@ -2171,10 +2171,11 @@ fn a_reported_loss_is_never_abandoned_through_the_driver() {
 }
 
 /// Owed 108 (F-032), through the real driver: Cloudflare's hold-end close, an error on the build
-/// the domain gave up (the handshake completed, no byte), 29 s after the last frame, rebuilds on the
-/// first tick at or after a base back-off from it, and the driver abandons nothing for it (the
-/// adapter decided it). Its pair, the same error with no handshake (a refused connect), keeps
-/// today's back-off: a later build.
+/// the domain gave up (the handshake completed, no byte), 27.9 s after the last frame (F-032's
+/// earliest close: at F-036's 9 s connect timeout its typical 29 s lands in the last base wait of a
+/// back-off, where no rule can build sooner), rebuilds on the first tick at or after a base back-off
+/// from it, and the driver abandons nothing for it (the adapter decided it). Its pair, the same error
+/// with no handshake (a refused connect), keeps today's back-off: a later build.
 #[test]
 fn cloudflares_close_rebuilds_a_base_wait_later_through_the_driver() {
     let t = th();
@@ -2186,7 +2187,7 @@ fn cloudflares_close_rebuilds_a_base_wait_later_through_the_driver() {
         let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
         events.extend(every(SESSION_AT + 1, stop, step, || frame(1)));
         let last = events.last().expect("frames").0;
-        let close = last + 29_000;
+        let close = last + 27_900;
         sim.drive(close, events);
         let gen = sim.log.count(|c| matches!(c, Call::InputRebuild(..))) as u64;
         let abandoned_before = abandons(&sim.log).len();

@@ -17,9 +17,12 @@ pub struct Thresholds {
     pub input_backoff_base_ms: Ms,
     /// PDF failure table: input back-off 1 s → 10 s. The cap.
     pub input_backoff_cap_ms: Ms,
-    /// Spec §4.2: a connect that neither succeeds nor fails within this is treated as lost. F-002 kept
-    /// 5 s with a thin margin: the slowest healthy first decoded frame was 4.19 s (F-002) and the
-    /// slowest first AU 4.4 s (F-004 rerun 1), so C10 times "connected" to the first decoded frame.
+    /// Spec §4.2: a connect that neither succeeds nor fails within this is treated as lost. C10 times
+    /// "connected" to the first decoded frame. F-002 kept 5 s with a thin margin (the slowest healthy
+    /// first decoded frame 4.19 s, F-002; the slowest first AU 4.4 s, F-004 rerun 1). F-036 (stg,
+    /// 2026-11-24; the C1 brief's rule): 9 s. A phone that republishes with its 3 s GOP behind the 1 s
+    /// SRT latency can take 6 to 8 s to a first decoded frame, and at 5 s the relay gave up six
+    /// connects in a row while the camera was back.
     pub input_connect_timeout_ms: Ms,
     /// Spec §6 "reconnect forever": a Running input that delivers no frame for this long is treated as
     /// a Stalled loss and rebuilt. Set after the 3 s slate so the viewer sees the slate first. F-002
@@ -276,7 +279,7 @@ impl Default for Thresholds {
             resume_after_ms: 1_000,
             input_backoff_base_ms: 1_000,
             input_backoff_cap_ms: 10_000,
-            input_connect_timeout_ms: 5_000,
+            input_connect_timeout_ms: 9_000,
             input_stall_after_ms: 5_000,
             input_srt_latency_ms: 1_000,
             input_hold_end_after_ms: 20_000,
@@ -480,6 +483,21 @@ mod tests {
             "{} ms",
             t.input_connect_timeout_ms
         );
+    }
+
+    // F-036 (the C1 brief's rule, 2026-11-24): 9 s. Each term from its source, written here: the stg
+    // session's slow returns decoded 6 to 8 s after the connect; F-032's first frames after the hold
+    // came up to 4.2 s after the connect behind a 2 s publisher GOP, and the phone's GOP is now 3 s,
+    // so up to a second more. The timeout clears both, and the hold-end gate (F-032) still sits after
+    // a stall and a whole connect.
+    #[test]
+    fn input_connect_timeout_is_f036s_9_s_and_clears_a_3_s_gop_return() {
+        let t = Thresholds::default();
+        assert_eq!(t.input_connect_timeout_ms, 9_000, "F-036's rule");
+        let (stg_slowest, f032_slowest, gop_now, gop_then) = (8_000, 4_200, 3_000, 2_000);
+        assert!(t.input_connect_timeout_ms > stg_slowest);
+        assert!(t.input_connect_timeout_ms > f032_slowest + (gop_now - gop_then));
+        assert!(t.input_hold_end_after_ms > t.input_stall_after_ms + t.input_connect_timeout_ms);
     }
 
     // C10: the SRT latency is the one every F-002 reader used (1 000 ms), so the measured first-frame

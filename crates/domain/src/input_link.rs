@@ -1015,12 +1015,53 @@ mod tests {
         twin.state()
     }
 
-    /// F-032's unlucky schedule: the close, 29 s after the last frame (the drop + 30.9), lands in the
-    /// Backoff after the build from +23.9 was given up at +28.9, its next build due at +36.9.
+    /// F-002's 5 s connect timeout, the one F-032's replay and schedule were computed with (F-036
+    /// raised it to 9 s): a setup that reads F-032's own instants runs on it.
+    fn at_f002() -> Thresholds {
+        Thresholds {
+            input_connect_timeout_ms: 5_000,
+            ..t()
+        }
+    }
+
+    /// Ticks `l` from `from` (the 10 ms grid, the stall rule read against `last`) to the first tick
+    /// after which it backs off a later attempt (a count above 1), and returns that tick; bounded by
+    /// two whole capped steps.
+    fn until_backing_off_a_later_attempt(
+        l: &mut InputLink,
+        from: Ms,
+        last: Option<Ms>,
+        th: &Thresholds,
+    ) -> Ms {
+        let bound = from + 2 * (th.input_connect_timeout_ms + th.input_backoff_cap_ms);
+        let mut now = from;
+        loop {
+            l.check_stall(now, last, th);
+            l.on_tick(now, th);
+            if matches!(l.state(), InputState::Backoff { attempt, .. } if attempt > 1) {
+                return now;
+            }
+            assert!(now <= bound, "setup: no later back-off by {now}: {:?}", l.state());
+            now += 10;
+        }
+    }
+
+    /// F-032's unlucky schedule: the close, inside F-032's window (27.9 to 29.2 s after the last
+    /// frame), lands in a Backoff after a given-up build, its next build more than a base wait away.
+    /// The first such instant in the window is read off today's schedule (F-036's 9 s connect
+    /// timeout: the build from +18.9 given up at +27.9, the next due at +31.9; at F-032's own 5 s it
+    /// was +23.9, +28.9 and +36.9).
     #[test]
     fn cloudflares_close_on_the_given_up_build_rebuilds_a_base_wait_later_with_the_count_reset() {
         let th = t();
-        let close = LAST + 29_000;
+        let long_wait = |at: Ms| {
+            matches!(dropped(at - 10, &th).state(),
+                InputState::Backoff { attempt, until } if attempt > 1 && until > at + th.input_backoff_base_ms)
+        };
+        let close = (LAST + 27_900..=LAST + 29_200)
+            .step_by(10)
+            .find(|&at| long_wait(at))
+            .expect("setup: a close in F-032's window lands in a long back-off");
         let mut l = dropped(close - 10, &th);
         let gen = l.generation();
         let InputState::Backoff { attempt, until } = l.state() else {
@@ -1122,32 +1163,45 @@ mod tests {
         assert_eq!(checked, 8, "cases checked: {checked}");
     }
 
-    /// The 20 s gate's edge: 1 ms before it the error is today's (nothing, in Backoff); at it, the
-    /// rule fires. Read in a Backoff long enough that the two outcomes differ at both instants.
+    /// The 20 s gate's edge: 1 ms before it the error is today's; at it, the rule fires. Read from
+    /// both between-build states: Connecting (F-036's 9 s connect timeout puts the gate inside the
+    /// build from +17.9) and Backoff (at F-002's 5 s it fell in the wait after +19.9's give-up; today's
+    /// error there changes nothing). Each a witness: the two outcomes differ at both instants.
     #[test]
     fn the_rule_fires_from_the_gate_and_not_1_ms_before() {
-        let th = t();
-        let at = LAST + th.input_hold_end_after_ms;
-        let base = dropped(at - 10, &th);
-        assert!(
-            matches!(base.state(), InputState::Backoff { .. }),
-            "setup: {:?}",
-            base.state()
-        );
-        let gen = base.generation();
+        let mut checked = 0;
+        for (th, connecting) in [(t(), true), (at_f002(), false)] {
+            let at = LAST + th.input_hold_end_after_ms;
+            let base = dropped(at - 10, &th);
+            assert_eq!(
+                matches!(base.state(), InputState::Connecting { .. }),
+                connecting,
+                "setup: {:?}",
+                base.state()
+            );
+            assert!(!matches!(base.state(), InputState::Running { .. }), "setup");
+            let gen = base.generation();
 
-        let mut early = base.clone();
-        assert_ne!(
-            today(&early, at - 1, &th),
-            fired_from(&early, at - 1, &th),
-            "setup: a witness"
-        );
-        early.on_error(at - 1, gen, HELD, Some(LAST), &th);
-        assert_eq!(early.state(), base.state(), "1 ms before the gate");
+            let mut early = base.clone();
+            let was = today(&base, at - 1, &th);
+            assert_ne!(was, fired_from(&base, at - 1, &th), "setup: a witness");
+            early.on_error(at - 1, gen, HELD, Some(LAST), &th);
+            assert_eq!(early.state(), was, "1 ms before the gate");
+            if !connecting {
+                assert_eq!(was, base.state(), "in Backoff, today's error changes nothing");
+            }
 
-        let mut on = base.clone();
-        on.on_error(at, gen, HELD, Some(LAST), &th);
-        assert_eq!(on.state(), fired_from(&base, at, &th), "at the gate");
+            let mut on = base.clone();
+            assert_ne!(
+                today(&base, at, &th),
+                fired_from(&base, at, &th),
+                "setup: a witness"
+            );
+            on.on_error(at, gen, HELD, Some(LAST), &th);
+            assert_eq!(on.state(), fired_from(&base, at, &th), "at the gate");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "states checked: {checked}");
     }
 
     /// Once an outage: the build the rule made errors the same way, and that is today's loss, both
@@ -1225,10 +1279,10 @@ mod tests {
         l.on_error(at, 1, HELD, Some(LAST), &th);
         assert_eq!(l.state(), want, "a Running build's error is a loss");
 
-        let close = at + 14_100;
-        tick_through(&mut l, at + 10, close - 10, Some(LAST), &th);
+        // The close lands in the first back-off of a later attempt (a timed-out connect's).
+        let close = until_backing_off_a_later_attempt(&mut l, at + 10, Some(LAST), &th) + 10;
         assert!(
-            matches!(l.state(), InputState::Backoff { attempt, .. } if attempt > 1),
+            matches!(l.state(), InputState::Backoff { attempt, until } if attempt > 1 && until > close),
             "setup: {:?}",
             l.state()
         );
@@ -1292,18 +1346,28 @@ mod tests {
 
     /// A phone that never returns: after the rule's one rebuild each build times out, and the builds
     /// re-run the back-off's steps from the base. Derived from `backoff::delay` and the connect
-    /// timeout, then held against F-032's own schedule (the drop + 31.9, 38.9, 47.9, 60.9, 75.9;
-    /// today's +37, +52, +67, +82). The bound over many horizons is swept in `tests/hold_end.rs`.
+    /// timeout, at today's (F-036's 9 s) and at F-002's 5 s, and at 5 s held against F-032's own
+    /// schedule, which it computed there (the drop + 31.9, 38.9, 47.9, 60.9, 75.9; today's +37, +52,
+    /// +67, +82). The bound over many horizons is swept in `tests/hold_end.rs`.
     #[test]
     fn a_phone_that_never_returns_gets_the_backoffs_steps_once_more() {
-        let th = t();
+        let mut checked = 0;
+        for (th, f032) in [(t(), false), (at_f002(), true)] {
+            checked += never_returns(&th, f032);
+        }
+        assert_eq!(checked, 2, "timeouts checked: {checked}");
+    }
+
+    fn never_returns(th: &Thresholds, f032: bool) -> usize {
+        let th = th.clone();
         let (base, cap, timeout) = (
             th.input_backoff_base_ms,
             th.input_backoff_cap_ms,
             th.input_connect_timeout_ms,
         );
         let close = LAST + 29_000;
-        let horizon = close + 60_000;
+        // Long enough for both to reach the capped step: the base doubles to the cap in four steps.
+        let horizon = close + 6 * (timeout + cap);
         let mut without = dropped(close - 10, &th);
         let mut with = without.clone();
         // Today's: the Backoff the close found runs out, then each step from its count.
@@ -1335,13 +1399,17 @@ mod tests {
             tick_through(&mut with, close, horizon, Some(LAST), &th),
             want_with
         );
-        // F-032's numbers, the finding's own.
-        assert_eq!(&want_with[..5], &[31_900, 38_900, 47_900, 60_900, 75_900]);
-        let rounded: Vec<Ms> = want_today.iter().take(4).map(|b| (b + 100) / 1_000).collect();
-        assert_eq!(rounded, vec![37, 52, 67, 82]);
+        assert_ne!(want_with, want_today, "setup: the rule moves the builds");
+        if f032 {
+            // F-032's numbers, the finding's own, at the 5 s it computed them with.
+            assert_eq!(&want_with[..5], &[31_900, 38_900, 47_900, 60_900, 75_900]);
+            let rounded: Vec<Ms> = want_today.iter().take(4).map(|b| (b + 100) / 1_000).collect();
+            assert_eq!(rounded, vec![37, 52, 67, 82]);
+        }
         // Both then run a capped step apart.
         let last_gap = |b: &[Ms]| b.windows(2).last().map(|w| w[1] - w[0]);
         assert_eq!(last_gap(&want_with), Some(timeout + cap));
         assert_eq!(last_gap(&want_today), Some(timeout + cap));
+        1
     }
 }
