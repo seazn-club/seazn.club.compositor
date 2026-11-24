@@ -66,7 +66,7 @@ use crate::graphics::{Graphics, GraphicsAction, GraphicsState, HideReason};
 use crate::health::{
     BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
 };
-use crate::input_link::{BuildFacts, InputAction, InputLink, InputState, LossReason, NudgeView};
+use crate::input_link::{BuildFacts, GiveUp, InputAction, InputLink, InputState, LossReason, NudgeView};
 use crate::ladder::{Ladder, Rung};
 use crate::lifecycle::{ExitReason, Lifecycle};
 use crate::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -268,6 +268,9 @@ pub struct Supervisor {
     phase_channel: Option<PhaseChannel>,
     heartbeat_interval_ms: Ms,
     next_beat_at: Ms,
+    /// The last beat `beat_if_due` sent, and the programme phase it carried (C2, S3): a phase that
+    /// has moved since beats once `phase_beat_gap_ms` has passed since it.
+    last_beat: Option<(Ms, ProgrammePhase)>,
     deadline_at: Ms,
     output_ever_connected: bool,
     heartbeat_failures: u32,
@@ -298,6 +301,7 @@ impl Supervisor {
             phase_channel: None,
             heartbeat_interval_ms: hb,
             next_beat_at: 0,
+            last_beat: None,
             deadline_at: Ms::MAX,
             output_ever_connected: false,
             heartbeat_failures: 0,
@@ -317,6 +321,12 @@ impl Supervisor {
 
     pub fn input_generation(&self) -> u64 {
         self.input.generation()
+    }
+
+    /// The last camera generation the input link gave up, and why (C2, S4): the driver's log line
+    /// reads it, and the beat carries it (`HealthReport::input_give_up`).
+    pub fn input_give_up(&self) -> Option<GiveUp> {
+        self.input.last_give_up()
     }
 
     /// The input link's phone-live nudge as it stands (Owed 108 fix (b)): read by the driver's log
@@ -441,10 +451,18 @@ impl Supervisor {
         self.next_beat_at = now;
     }
 
-    /// The beat, on the first tick at or after it is due.
+    /// The beat, on the first tick at or after it is due, or on a tick whose programme phase differs
+    /// from the last beat's once `phase_beat_gap_ms` has passed since it (C2, S3: the "edge beat", so
+    /// web reads a change on the next beat, not up to a cadence later). Either restarts the cadence.
+    /// The gap bounds a flapping phase to one beat a gap (`Thresholds::phase_beat_gap_ms`).
     fn beat_if_due(&mut self, now: Ms, fx: &mut Vec<Effect>) {
-        if now >= self.next_beat_at {
+        let phase = self.programme.phase();
+        let edge = self
+            .last_beat
+            .is_some_and(|(at, sent)| sent != phase && elapsed(now, at) >= self.t.phase_beat_gap_ms());
+        if now >= self.next_beat_at || edge {
             fx.push(Effect::SendHeartbeat(self.health(now)));
+            self.last_beat = Some((now, phase));
             self.next_beat_at = now.saturating_add(self.heartbeat_interval_ms);
         }
     }
@@ -753,6 +771,7 @@ impl Supervisor {
             heartbeat_failures: self.heartbeat_failures,
             phase_channel: self.phase_channel,
             exit,
+            input_give_up: self.input.last_give_up(),
         }
     }
 }

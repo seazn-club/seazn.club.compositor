@@ -16,7 +16,7 @@ use domain::config::{
     OUTPUT_SINK_TIMEOUT_MS,
 };
 use domain::health::{ExitDetail, GraphicsStatus, HealthReport, LinkStatus};
-use domain::input_link::{BuildFacts, LossReason};
+use domain::input_link::{BuildFacts, GiveUp, GiveUpReason, LossReason};
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
 use domain::output_link::Encoded;
@@ -319,7 +319,7 @@ fn the_final_beat_carries_the_metrics_sample_too() {
     );
     assert_eq!(code, Some(ExitReason::Fatal.code()));
     let fin = log.calls().into_iter().find_map(|c| match c {
-        Call::Control(ControlRequest::Heartbeat(h, m)) if h.exit.is_some() => Some(m),
+        Call::Control(ControlRequest::Heartbeat(h, m)) if h.exit.is_some() => Some(*m),
         _ => None,
     });
     assert_eq!(fin.expect("no final beat"), metrics());
@@ -504,6 +504,85 @@ fn phase_is_published_on_change_only_with_a_rising_seq() {
         phases.len()
     );
     assert!(ticks > 0 && checked > 0);
+}
+
+/// C2 (S3), through the real driver: each published phase change writes one line, `programme phase
+/// from=<a> to=<b> seq=<n>`, in the words the beat's `programmePhase` uses (the contract's enum), and
+/// the next beat the driver requests carries it within the edge-beat gap and a tick, not a cadence
+/// later. Both profiles (ADR 0005).
+#[test]
+fn a_phase_change_is_logged_once_and_rides_the_next_beat_through_the_driver() {
+    let t = th();
+    let gap = t.phase_beat_gap_ms();
+    let mut checked = 0;
+    for output in [OutputProfile::P720, OutputProfile::P1080] {
+        let period = output.frame_period_ms().ceil() as u64;
+        let mut sim = Sim::new(
+            t.clone(),
+            SessionConfig {
+                output,
+                ..session_720p()
+            },
+        );
+        // Frames until Live, a stop past the slate, frames back past a return.
+        let stop = SESSION_AT + t.resume_after_ms + 1_000;
+        let back = stop + t.slate_after_ms + 1_000;
+        let end = back + t.resume_after_ms + 2_000;
+        let mut events = vec![(SESSION_AT, ev(Event::InputConnected { gen: 1 }))];
+        events.extend(every(SESSION_AT, stop, period, || frame(1)));
+        events.extend(every(back, end, period, || frame(1)));
+        sim.drive(end, events);
+
+        let changes: Vec<(u64, ProgrammePhase)> = sim
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Phase(p, _) => Some(p),
+                _ => None,
+            })
+            .zip(sim.times_of(|c| matches!(c, Call::Phase(..))))
+            .map(|(p, at)| (at, p))
+            .collect();
+        use ProgrammePhase::{Frozen, Live, Reconnecting};
+        assert_eq!(
+            changes.iter().map(|c| c.1).collect::<Vec<_>>(),
+            vec![Live, Frozen, Reconnecting, Live],
+            "setup: the walk"
+        );
+        let lines: Vec<String> = sim
+            .log
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("programme phase "))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "programme phase from=waiting to=live seq=1",
+                "programme phase from=live to=frozen seq=2",
+                "programme phase from=frozen to=reconnecting seq=3",
+                "programme phase from=reconnecting to=live seq=4",
+            ],
+            "{output:?}"
+        );
+        let beat_times = sim.times_of(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))));
+        let beats = beats_in(&sim.calls());
+        for &(at, p) in &changes {
+            let i = beat_times
+                .iter()
+                .position(|&b| b >= at)
+                .unwrap_or_else(|| panic!("{output:?}: no beat after the change to {p:?} at {at}"));
+            assert!(
+                beat_times[i] - at <= gap + period,
+                "{output:?}: the change to {p:?} at {at} waited for the beat at {}",
+                beat_times[i]
+            );
+            assert_eq!(beats[i].programme_phase, p, "{output:?}: the beat carries it");
+            checked += 1;
+        }
+    }
+    eprintln!("phase changes checked through the driver: {checked}");
+    assert_eq!(checked, 8);
 }
 
 /// Drives a booted 720p session through an `Ending` reply at 20, one tick per call, until the drain.
@@ -1652,6 +1731,65 @@ fn camera_frames_replaced_is_logged_once_a_beat_with_the_beats_rise() {
     assert_eq!(want.len(), script.len() + 1);
 }
 
+/// The camera's two rates as a sample carries them: fps, kbit/s.
+type Rates = (Option<f64>, Option<u64>);
+
+/// A `Metrics` whose camera rates (C2, S4) the test sets between beats.
+struct ScriptedReceived(Arc<Mutex<Rates>>);
+
+impl Metrics for ScriptedReceived {
+    fn sample(&mut self) -> Measured {
+        let (fps, kbps) = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Measured {
+            input_received_fps: fps,
+            input_received_kbps: kbps,
+            ..metrics()
+        }
+    }
+}
+
+/// C2 (S4): every beat whose metrics sample carries a camera rate writes one line, `input received
+/// fps=<x.y> kbps=<n>`, `-` for the one not measured; a sample with neither (or only a non-finite
+/// rate, which is no measurement) writes none. The final beat's sample is logged too.
+#[test]
+fn the_camera_as_received_is_logged_once_a_beat_when_measured() {
+    let log = Log::default();
+    let rates = Arc::new(Mutex::new((None, None)));
+    let set = |r: Rates| *rates.lock().unwrap_or_else(PoisonError::into_inner) = r;
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedReceived(Arc::clone(&rates)));
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let lines = || lines_starting(&log, "input received");
+    let mut at = next_beat(&mut d, &log);
+    assert!(lines().is_empty(), "not measured: no line");
+    let script: [(Rates, Option<&str>); 6] = [
+        ((Some(29.97), Some(2_500)), Some("fps=30.0 kbps=2500")),
+        ((Some(0.0), Some(0)), Some("fps=0.0 kbps=0")),
+        ((Some(12.0), None), Some("fps=12.0 kbps=-")),
+        ((None, Some(800)), Some("fps=- kbps=800")),
+        ((Some(f64::NAN), None), None),
+        ((None, None), None),
+    ];
+    let mut want = Vec::new();
+    for (r, line) in script {
+        set(r);
+        at = next_beat(&mut d, &log);
+        if let Some(l) = line {
+            want.push(format!("input received {l}"));
+        }
+        assert_eq!(lines(), want, "the beat at {at}: {r:?}");
+    }
+    set((Some(1.0), Some(1)));
+    assert_eq!(d.step(ev(Event::Signal(SignalKind::Term)), at + 1), None);
+    assert_eq!(d.step(ev(Event::OutputDrained), at + 2), Some(0));
+    want.push("input received fps=1.0 kbps=1".to_owned());
+    assert_eq!(lines(), want, "the final beat's line");
+    eprintln!("input received beats checked: {}", script.len() + 1);
+    assert_eq!(want.len(), 5);
+}
+
 /// A `Metrics` whose `fps` (the real output rate, Owed 86) the test sets between beats.
 struct ScriptedFps(Arc<Mutex<Option<f64>>>);
 
@@ -2077,6 +2215,71 @@ fn position(log: &Log, pred: impl Fn(&Call) -> bool) -> usize {
     log.calls().iter().position(pred).expect("the call was made")
 }
 
+/// C2 (S4), through the real driver: each generation given up writes one line, `input give up
+/// gen=<g> reason=<r>`, before any port call its decision makes (the abandon included), and the next
+/// beat carries it (`HealthReport::input_give_up`). The rules (the connect timeout, the stall rule)
+/// and the adapter's reports (EOS, an error, a stall). The words are the beat's
+/// (`inputGiveUpReason`).
+#[test]
+fn each_give_up_is_logged_once_and_rides_the_next_beat_through_the_driver() {
+    let t = th();
+    let step = OutputProfile::P720.frame_period_ms().round() as u64;
+    let late = 2 * OutputProfile::P720.frame_period_ms().ceil() as u64;
+    let mut checked = 0;
+    let cases: [(&str, Option<LossReason>, GiveUpReason); 5] = [
+        ("connect_timeout", None, GiveUpReason::ConnectTimeout),
+        ("stalled", None, GiveUpReason::Stalled),
+        ("eos", Some(LossReason::Eos), GiveUpReason::Eos),
+        ("error", Some(LossReason::Error), GiveUpReason::Error),
+        ("stalled", Some(LossReason::Stalled), GiveUpReason::Stalled),
+    ];
+    for (i, (word, loss, reason)) in cases.into_iter().enumerate() {
+        let mut sim = Sim::new(t.clone(), session_720p());
+        let at = if i == 0 {
+            // Nothing connects: gen 1 times out.
+            sim.tick_until(SESSION_AT + t.input_connect_timeout_ms + late + 1, abandoned(1))
+        } else {
+            let stop = SESSION_AT + 1_000;
+            let mut events = vec![(SESSION_AT + 1, ev(Event::InputConnected { gen: 1 }))];
+            events.extend(every(SESSION_AT + 1, stop, step, || frame(1)));
+            if let Some(reason) = loss {
+                events.push((stop, ev(Event::InputLost { gen: 1, reason })));
+                sim.drive(stop + 1, events);
+                stop
+            } else {
+                // The stall rule: frames stop.
+                sim.drive(stop, events);
+                sim.tick_until(stop + t.input_stall_after_ms + late + 1, abandoned(1))
+            }
+        };
+        let want = format!("input give up gen=1 reason={word}");
+        assert_eq!(
+            lines_starting(&sim.log, "input give up"),
+            vec![want.clone()],
+            "{word}"
+        );
+        if sim.log.count(abandoned(1)) > 0 {
+            assert!(
+                position(&sim.log, line(want.clone())) < position(&sim.log, abandoned(1)),
+                "{word}: the line comes before the abandon"
+            );
+        }
+        // Within a cadence (the give-up names no phase change, so no edge beat is owed), and before
+        // gen 2's own connect could time out.
+        let now = sim.now;
+        sim.drive(now + t.heartbeat_interval_ms + late + 1, vec![]);
+        let beat = sim.beat_after(at);
+        assert_eq!(
+            beat.input_give_up,
+            Some(GiveUp { gen: 1, reason }),
+            "{word}: the next beat carries it"
+        );
+        checked += 1;
+    }
+    eprintln!("give-ups checked through the driver: {checked}");
+    assert_eq!(checked, 5);
+}
+
 /// The stall rule, through the real driver: gen 1 connects, frames stop, and the driver calls
 /// `abandon(1)` once, on the first tick at or after the last frame plus `input_stall_after_ms`, and
 /// before it rebuilds gen 2; nothing else is abandoned before gen 2's own connect timeout.
@@ -2116,9 +2319,12 @@ fn a_connect_timeout_abandons_each_generation_once_through_the_driver() {
     let mut sim = Sim::new(t.clone(), session_720p());
     let mut checked = 0;
     let mut built = SESSION_AT;
+    // Each wait ends on the tick grid, up to a period late, and there are two (the timeout, then the
+    // back-off): at the 4 s cap (F-036, C2) the third rebuild lands just past the bare sum.
+    let late = 2 * OutputProfile::P720.frame_period_ms().ceil() as u64;
     for gen in 1..=3u64 {
         let next = sim.tick_until(
-            built + t.input_connect_timeout_ms + t.input_backoff_cap_ms,
+            built + t.input_connect_timeout_ms + t.input_backoff_cap_ms + late + 1,
             rebuilt(gen + 1),
         );
         let at = sim.times_of(abandoned(gen));
@@ -2702,6 +2908,14 @@ fn a_nudge_on_a_connect_with_no_byte_logs_the_discard_once_an_outage() {
         .expect("the discard's line");
     assert_eq!(calls.get(i - 1), Some(&Call::InputAbandon(2)));
     assert!(matches!(calls.get(i + 1), Some(Call::InputRebuild(3, _))));
+    // C2 (S4): the discard is a give-up, and its line names it.
+    assert_eq!(
+        lines_starting(&sim.log, "input give up"),
+        vec![
+            "input give up gen=1 reason=error".to_owned(),
+            "input give up gen=2 reason=phone_live_discard".to_owned()
+        ]
+    );
     // Outage 1, edge 2: the discard is spent, so the nudge waits for gen 3's connect timeout.
     sim.drive(r3 + 101, replies(r3 + 100, r3 + 101, 2));
     let r4 = sim.tick_until(r3 + t.input_connect_timeout_ms + 1_000, rebuilt(4));

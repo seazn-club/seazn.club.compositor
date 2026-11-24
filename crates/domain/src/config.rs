@@ -15,7 +15,12 @@ pub struct Thresholds {
     pub resume_after_ms: Ms,
     /// PDF failure table: input back-off 1 s → 10 s, retried forever. The first wait.
     pub input_backoff_base_ms: Ms,
-    /// PDF failure table: input back-off 1 s → 10 s. The cap.
+    /// The cap. PDF failure table: input back-off 1 s → 10 s. F-036 (stg 2026-11-24, session
+    /// `5e5403ce`; the C2 brief's S7): 4 s. Cloudflare had the camera connected at 09:55:31.6Z, and the
+    /// relay built gens 4 to 9 with the back-off's 8 and 10 s steps between its connects, so the
+    /// reconnecting slate stayed on air about 50 s with the camera back. At 4 s a dead pull is retried
+    /// at most a connect timeout and 4 s apart (13 s), not 19 s; the first three waits (1, 2, 4 s) and
+    /// F-036's hold-end schedule are unchanged.
     pub input_backoff_cap_ms: Ms,
     /// Spec §4.2: a connect that neither succeeds nor fails within this is treated as lost. C10 times
     /// "connected" to the first decoded frame. F-002 kept 5 s with a thin margin (the slowest healthy
@@ -91,7 +96,9 @@ pub struct Thresholds {
     /// C02 brief default: spec §6 says "restart with backoff" and names no number, so CEF mirrors the
     /// input back-off, 1 s → 10 s. The first wait.
     pub cef_backoff_base_ms: Ms,
-    /// C02 brief default: the cap of the CEF back-off (1 s → 10 s, mirroring the input).
+    /// C02 brief default: the cap of the CEF back-off (1 s → 10 s, mirroring the input's PDF numbers;
+    /// F-036 moved the input's cap to 4 s for the camera's return, which says nothing of CEF's, so
+    /// this one stays).
     pub cef_backoff_cap_ms: Ms,
     /// R2005: the overlay page logs `seazn:alive` this often after ready, on F-001's console channel
     /// (`docs/_INDEX.md` Owed 18, owner 2026-10-18). The domain does not read it: it is the page's
@@ -321,6 +328,23 @@ pub const FRAME_GRAB_WAIT_MS: Ms = 1_000;
 /// encode takes milliseconds, so this only bounds a stuck encoder.
 pub const FRAME_ENCODE_WAIT_MS: Ms = 2_000;
 
+impl Thresholds {
+    /// C2 (S3), derived: the least time between two heartbeats once a programme phase change asks
+    /// for one before the cadence's (the "edge beat"). It is `resume_after_ms`, the shortest stay the
+    /// programme table guarantees the reconnecting slate: a return needs that long of frames, all
+    /// after the slate went up (the slate goes up `slate_after_ms` after the last frame, past
+    /// `frozen_after_ms`, so the next frame starts a new run). The slate's entry comes
+    /// `slate_after_ms − frozen_after_ms` after a freeze, which is longer. So a slate's entry and its
+    /// exit each beat on their own tick when the beat before them did, and a phase that flaps faster
+    /// costs at most one beat a gap (1 000 ms today: one beat a second at most, against the cadence's
+    /// one in five), each carrying the phase of its tick. A change the gap holds beats on the first
+    /// tick the gap allows. The pins: `the_phase_beat_gap_lets_a_slates_entry_and_exit_each_beat`, and the
+    /// slate's shortest stay as the supervisor makes it, `a_slates_shortest_stay_is_at_least_the_gap`.
+    pub fn phase_beat_gap_ms(&self) -> Ms {
+        self.resume_after_ms
+    }
+}
+
 impl Default for Thresholds {
     fn default() -> Self {
         let (output_backoff_base_ms, output_connect_timeout_ms) = (500, 5_000);
@@ -329,7 +353,7 @@ impl Default for Thresholds {
             slate_after_ms: 3_000,
             resume_after_ms: 1_000,
             input_backoff_base_ms: 1_000,
-            input_backoff_cap_ms: 10_000,
+            input_backoff_cap_ms: 4_000,
             input_connect_timeout_ms: 9_000,
             input_stall_after_ms: 5_000,
             input_srt_latency_ms: 1_000,
@@ -450,6 +474,26 @@ mod tests {
         }
     }
 
+    // C2 (S3): the edge beat's gap lets the slate's entry beat after a freeze; it is under the cadence
+    // (or no edge beat would ever come early) and above 0 (or a flapping phase would beat every
+    // tick). That it is no longer than the slate's shortest stay is read off the real supervisor, not
+    // here (the gap IS `resume_after_ms`): `a_slates_shortest_stay_is_at_least_the_gap` in
+    // `tests/phase_beat.rs` (C2 review, m3).
+    #[test]
+    fn the_phase_beat_gap_lets_a_slates_entry_and_exit_each_beat() {
+        let t = Thresholds::default();
+        let gap = t.phase_beat_gap_ms();
+        assert!(gap > 0, "a flap would beat every tick");
+        assert!(
+            gap <= t.slate_after_ms - t.frozen_after_ms,
+            "the slate's entry, after the freeze"
+        );
+        assert!(
+            gap < t.heartbeat_interval_ms,
+            "an edge beat comes before the cadence's"
+        );
+    }
+
     #[test]
     fn input_stall_rebuild_comes_after_the_slate() {
         let t = Thresholds::default();
@@ -487,8 +531,9 @@ mod tests {
         }
     }
 
-    // Each number against its own source. The plan's Global Constraints: input back-off 1 s → 10 s; a
-    // kick alert at MORE than 3 kicks in 5 min; a heartbeat every 5000 ms; CEF recycled every 2 h.
+    // Each number against its own source. The plan's Global Constraints: input back-off 1 s, capped
+    // at 4 s since F-036 (C2; the plan's 10 s, amended); a kick alert at MORE than 3 kicks in 5 min; a
+    // heartbeat every 5000 ms; CEF recycled every 2 h.
     // Spec §4.2: CEF Failed after 3 failures in 5 min. The C02 brief default: output back-off 0.5 s →
     // 2 s, sized to the PDF's 5 s reconnect budget. (The plan's output stall after 5 s is rtmp2sink's
     // own timeout since Owed 87: `the_sink_timeout_is_rtmp2s_own_default`.)
@@ -497,8 +542,8 @@ mod tests {
         let t = Thresholds::default();
         assert_eq!(
             (t.input_backoff_base_ms, t.input_backoff_cap_ms),
-            (1_000, 10_000),
-            "input back-off"
+            (1_000, 4_000),
+            "input back-off (F-036, C2: the cap is 4 s)"
         );
         assert_eq!((t.kick_alert_count, t.kick_window_ms), (3, 300_000), "kick alert");
         assert_eq!(

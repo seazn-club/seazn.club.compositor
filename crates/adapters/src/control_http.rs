@@ -29,6 +29,7 @@ use domain::airings::{AiringBatch, AiringLine};
 use domain::config::{OutputProfile, FRAME_UPLOAD_TIMEOUT_MS};
 use domain::frame_grab::is_path_segment;
 use domain::health::{BeatState, ExitDetail, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel};
+use domain::input_link::GiveUpReason;
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
 use domain::programme::ProgrammePhase;
@@ -121,6 +122,19 @@ fn exit_reason_wire(r: ExitReason) -> &'static str {
     }
 }
 
+/// The beat's `inputGiveUpReason` (C2, S4): why the camera generation `inputGiveUpGen` was given up,
+/// in the words the driver's `input give up` line uses.
+pub fn give_up_wire(r: GiveUpReason) -> &'static str {
+    match r {
+        GiveUpReason::ConnectTimeout => "connect_timeout",
+        GiveUpReason::Stalled => "stalled",
+        GiveUpReason::PhoneLiveDiscard => "phone_live_discard",
+        GiveUpReason::HoldEnd => "hold_end",
+        GiveUpReason::Eos => "eos",
+        GiveUpReason::Error => "error",
+    }
+}
+
 fn int(n: u64) -> Value {
     Value::from(n.min(JSON_MAX_SAFE_INTEGER))
 }
@@ -152,12 +166,40 @@ pub fn heartbeat_wire(report: &HealthReport, measured: &Measured) -> Value {
 
 /// `heartbeat_wire`, carrying `airings` (R4 task SC1).
 pub fn heartbeat_wire_with(report: &HealthReport, measured: &Measured, airings: &AiringBatch) -> Value {
-    wire(report, measured, airings, &Scrubber::default())
+    wire(report, measured, airings, &Scrubber::default(), InputKeys::Off)
+}
+
+/// `heartbeat_wire` with the camera's keys on (C2, S4; `RELAY_INPUT_BEAT`): `inputGiveUpReason`,
+/// `inputGiveUpGen`, `inputReceivedFps` and `inputReceivedKbps`, each when known.
+pub fn heartbeat_wire_input(report: &HealthReport, measured: &Measured) -> Value {
+    wire(
+        report,
+        measured,
+        &AiringBatch::default(),
+        &Scrubber::default(),
+        InputKeys::On,
+    )
+}
+
+/// Whether a beat carries the camera's keys (C2, S4). Off unless `RELAY_INPUT_BEAT` is `1`: web's
+/// heartbeat is strict, so a beat carrying them before web declares the keys (its task T44) is a 400
+/// and the whole beat is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputKeys {
+    #[default]
+    Off,
+    On,
 }
 
 /// `heartbeat_wire`, with `exitDetail` scrubbed of the values `scrubber` knows before it is
 /// redacted and capped (the cap comes last, so it never leaves a part of a value behind).
-fn wire(report: &HealthReport, measured: &Measured, airings: &AiringBatch, scrubber: &Scrubber) -> Value {
+fn wire(
+    report: &HealthReport,
+    measured: &Measured,
+    airings: &AiringBatch,
+    scrubber: &Scrubber,
+    input: InputKeys,
+) -> Value {
     let mut m = Map::new();
     let mut put = |k: &str, v: Value| {
         m.insert(k.to_owned(), v);
@@ -213,6 +255,20 @@ fn wire(report: &HealthReport, measured: &Measured, airings: &AiringBatch, scrub
     }
     if !airings.carries_nothing() {
         put("airingsDropped", airings.dropped().into());
+    }
+    // C2 (S4): the camera's keys, only when on. The give-up's two keys go together; each measurement
+    // is absent until measured, never 0.
+    if input == InputKeys::On {
+        if let Some(g) = report.input_give_up {
+            put("inputGiveUpReason", give_up_wire(g.reason).into());
+            put("inputGiveUpGen", int(g.gen));
+        }
+        if let Some(v) = fps_wire(measured.input_received_fps) {
+            put("inputReceivedFps", v);
+        }
+        if let Some(n) = measured.input_received_kbps {
+            put("inputReceivedKbps", int(n));
+        }
     }
     // The exit keys ride only a `stopped` beat (the contract's if/then; web answers 400 otherwise).
     if let (BeatState::Stopped, Some(exit)) = (report.state, &report.exit) {
@@ -462,6 +518,8 @@ pub struct HttpControlPlane {
     token: String,
     timeout_ms: u64,
     scrubber: Arc<Mutex<Scrubber>>,
+    /// Whether each beat carries the camera's keys (C2, S4; `with_input_keys`).
+    input: InputKeys,
 }
 
 /// The scrubber, its lock recovered if a scrub ever panicked: a poisoned lock must not stop a beat.
@@ -561,7 +619,15 @@ impl HttpControlPlane {
             token: job_token,
             timeout_ms,
             scrubber: Arc::new(Mutex::new(scrubber)),
+            input: InputKeys::Off,
         }
+    }
+
+    /// Whether each beat, the final lane's included, carries the camera's keys (C2, S4;
+    /// `RELAY_INPUT_BEAT`). Off by default.
+    pub fn with_input_keys(mut self, input: InputKeys) -> Self {
+        self.input = input;
+        self
     }
 
     /// Learns a fetched session's four credentials, so every later text is scrubbed of them: the
@@ -684,6 +750,7 @@ impl ControlPlane for HttpControlPlane {
             token: self.token.clone(),
             timeout_ms: self.timeout_ms,
             scrubber: Arc::clone(&self.scrubber),
+            input: self.input,
         })
     }
 
@@ -729,7 +796,7 @@ impl ControlPlane for HttpControlPlane {
             // The final beat: one attempt, never delaying `Exit` past its bound (Owed 28).
             req = req.timeout(Duration::from_millis(self.timeout_ms.min(FINAL_BEAT_TIMEOUT_MS)));
         }
-        let body = wire(report, measured, airings, &locked(&self.scrubber));
+        let body = wire(report, measured, airings, &locked(&self.scrubber), self.input);
         let sent = req.send_json(body);
         let (code, body) =
             exchange(sent).map_err(|e| self.transport(&format!("heartbeat transport: {e}")))?;

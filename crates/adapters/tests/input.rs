@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use adapters::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
 use adapters::gst_input::{GstInput, InputThreads, StartHold};
 use adapters::gst_programme::GstProgramme;
+use adapters::stats::ReceivedBytes;
 use app::ports::{Inbound, InputSource, InputSpec, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::{Receiver, Sender};
 use domain::config::{OutputProfile, Thresholds};
@@ -763,6 +764,44 @@ fn connects_and_delivers_frames_with_its_generation() {
         );
         checked += 1;
     }
+    assert_eq!(checked, 2);
+}
+
+/// C2 (S4), the camera as the relay receives it: every byte out of `srtsrc` counts into the shared
+/// `ReceivedBytes` (`with_received_bytes`), nothing before a build, and every build's, a rebuild's
+/// included; the camera slot's written count (`FrameStore::camera_written`, the fps half) rises with
+/// each build's delivered frames.
+#[test]
+fn the_received_bytes_count_every_builds_source_bytes() {
+    let _s = serial();
+    let port = free_port();
+    let received = Arc::new(ReceivedBytes::default());
+    let (fresh, rx, frames, _lines) = input(&P720);
+    let mut input = fresh.with_received_bytes(Arc::clone(&received));
+    assert_eq!(received.total(), 0, "nothing before a build");
+    let (mut last, mut checked) = (0, 0);
+    for gen in 1..=2u64 {
+        let l = Listener::start(port, &cfg(640, 360));
+        let deadline = rebuild_past_the_handshake(&mut input, gen, &spec(port));
+        events_until(&rx, left(deadline), |e| *e == Event::InputConnected { gen });
+        let written = frames.camera_written();
+        let second = events_for(&rx, Duration::from_secs(1));
+        let now = received.total();
+        eprintln!(
+            "gen {gen}: {now} bytes received in all, {} frames in the second",
+            frames_in(&second)
+        );
+        assert!(now > last, "gen {gen}: its bytes count ({last} then {now})");
+        assert!(
+            frames.camera_written() > written,
+            "gen {gen}: its frames are written"
+        );
+        last = now;
+        l.stop();
+        events_until(&rx, LOSS_BUDGET, is_loss);
+        checked += 1;
+    }
+    eprintln!("builds checked: {checked}");
     assert_eq!(checked, 2);
 }
 

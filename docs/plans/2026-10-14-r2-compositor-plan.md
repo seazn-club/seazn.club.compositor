@@ -56,7 +56,7 @@ These apply to every task. Values are copied from the spec and ADRs.
 - **Programme thresholds:** Frozen at 0.5 s with no frame; slate at 3 s; back to live after 1 s of
   continuous frames. The score layer is on in every state.
 - **Input backoff:** 1 s → 10 s cap, retried forever. A kick alert fires at **more than** 3 kicks in
-  5 min.
+  5 min. (Amended 2026-11-24, C2: the cap is 4 s, F-036 D4.)
 - **Output:** stall when no bytes are acked for 5 s. Reconnect within 5 s. Encoded ring buffer 2 s,
   dropping the oldest.
 - **Queues:** decoded video 1 s, audio 400 ms. All leaky, dropping the oldest. Nothing unbounded,
@@ -66,7 +66,7 @@ These apply to every task. Values are copied from the spec and ADRs.
 - **Machine:** Fly `performance-4x`, 8 GB, region `lhr`, restart `on-failure` with `max_retries: 2`,
   `auto_destroy: true`, no inbound port.
 - **Machine env (R1, unchanged):** `SESSION_ID`, `JOB_TOKEN`, `APP_URL`, `RELAY_DEADLINE_AT`.
-- **Heartbeat:** every 5000 ms. Optional fields are omitted when not measured, **never sent as 0**.
+- **Heartbeat:** every 5000 ms. Optional fields are omitted when not measured, **never sent as 0**. (Amended 2026-11-24, C2: a programme phase change also beats, at most one beat a `phase_beat_gap_ms`, 1 000 ms; either beat restarts the 5 000 ms cadence.)
 - **Exit codes:**
   - `0`: ended, deadline, signal, or session gone (410)
   - `78`: unauthorized or not found (401/404)

@@ -834,11 +834,31 @@ fn reader_kicked_returns_after_each_kick_and_reds_on_a_missed_kick_or_an_early_a
         "kick_alert_not_early",
         "kick-early",
     );
-    let w = reader_kicked(12_000, alert_from);
-    assert_fails(
-        &judge(&w, "reader-kicked", "", "kick-slow"),
-        "return_after_kicks",
-        "kick-slow",
+    // Every return 1 ms past the case's bound (the return budget plus the input back-off cap, from
+    // thresholds.json), from the bound itself: the literal 12 s it was stayed over it only by the
+    // cap's margin, and C2's 4 s cap moved the bound to 5.2 s. The measured return is at least the
+    // fixture's gap.
+    let probe = World::new(1);
+    let bound = probe.ms("budget_return_to_live_ms") + probe.ms("input_backoff_cap_ms");
+    let w = reader_kicked(bound + 1, alert_from);
+    let v = judge(&w, "reader-kicked", "", "kick-slow");
+    assert_fails(&v, "return_after_kicks", "kick-slow");
+    let m = &v.json["measures"]["return_after_kicks"];
+    assert_eq!(
+        m["bound"].as_i64(),
+        Some(bound),
+        "kick-slow: the case's own bound"
+    );
+    let returns: Vec<Option<i64>> = m["return_ms"]
+        .as_array()
+        .expect("kick-slow: the returns")
+        .iter()
+        .map(Value::as_i64)
+        .collect();
+    eprintln!("kick-slow: returns {returns:?} ms for the {bound} ms bound");
+    assert!(
+        !returns.is_empty() && returns.iter().all(|r| r.is_some_and(|r| r > bound)),
+        "kick-slow: every return over the bound: {returns:?}"
     );
 }
 

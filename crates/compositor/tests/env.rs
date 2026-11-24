@@ -192,6 +192,54 @@ fn relay_airings_is_off_unless_set_to_1() {
     assert_eq!(checked, 22);
 }
 
+/// C2 (S4): `RELAY_INPUT_BEAT` puts the camera's keys on the beat, in either mode, by the same rule
+/// as `RELAY_AIRINGS`: unset (every host that passes only R1's four keys), empty or `0` is off, `1`
+/// is on, anything else is refused (78). Each flag is read on its own: one on leaves the other off.
+#[test]
+fn relay_input_beat_is_off_unless_set_to_1_and_apart_from_the_airings() {
+    let mut checked = 0;
+    for drivers in ["live", "fake"] {
+        let mut m = base();
+        m.insert(env::COMPOSITOR_DRIVERS, drivers.to_owned());
+        assert!(!parse(&m, true).unwrap().input_beat, "{drivers}: unset is off");
+        checked += 1;
+        for (value, want) in [("", Some(false)), ("0", Some(false)), ("1", Some(true))] {
+            m.insert(env::RELAY_INPUT_BEAT, value.to_owned());
+            assert_eq!(
+                parse(&m, true).ok().map(|e| e.input_beat),
+                want,
+                "{drivers}: {value:?}"
+            );
+            checked += 1;
+        }
+        // On, the airings stay off; the airings on, the camera's keys stay off.
+        assert!(
+            !parse(&m, true).unwrap().airings,
+            "{drivers}: the airings are their own"
+        );
+        m.remove(env::RELAY_INPUT_BEAT);
+        m.insert(env::RELAY_AIRINGS, "1".to_owned());
+        assert!(
+            !parse(&m, true).unwrap().input_beat,
+            "{drivers}: the camera's keys are their own"
+        );
+        m.remove(env::RELAY_AIRINGS);
+        checked += 2;
+        for bad in ["true", "on", "yes", "2", " 1", "1 ", "01"] {
+            m.insert(env::RELAY_INPUT_BEAT, bad.to_owned());
+            assert_eq!(
+                parse(&m, true).err(),
+                Some(EnvError::Invalid(env::RELAY_INPUT_BEAT)),
+                "{drivers}: {bad:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(env::RELAY_INPUT_BEAT, "RELAY_INPUT_BEAT");
+    eprintln!("RELAY_INPUT_BEAT values checked: {checked}");
+    assert_eq!(checked, 26);
+}
+
 /// `Env`'s `Debug` never prints the token.
 #[test]
 fn env_debug_hides_the_token() {

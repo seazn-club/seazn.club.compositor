@@ -7,8 +7,8 @@
 //! connection closed with no reply and a server that never answers, and `tiny_http` answers a dropped
 //! request with a 500.
 use adapters::control_http::{
-    heartbeat_wire, heartbeat_wire_with, parse_reply, parse_session, path_segment, HttpControlPlane,
-    PlaneConfigError,
+    heartbeat_wire, heartbeat_wire_input, heartbeat_wire_with, parse_reply, parse_session, path_segment,
+    HttpControlPlane, InputKeys, PlaneConfigError,
 };
 use app::ports::{
     ControlPlane, FetchError, FrameUpload, FrameUploadError, HeartbeatError, Measured, Reply as BeatReply,
@@ -1012,6 +1012,70 @@ fn the_sessions_credentials_are_scrubbed_by_value_from_the_final_beat_and_errors
 }
 
 /// C08 review round 1 (the final-beat lane): the control worker posts final beats through
+/// C2 (S4): a plane `with_input_keys(On)` posts the camera's keys (`heartbeat_wire_input`), its final
+/// lane too; a plane left Off (the default, `RELAY_INPUT_BEAT` unset) posts none of them, whatever the
+/// report and the measurements carry, and its beat is exactly `heartbeat_wire`.
+#[test]
+fn the_camera_keys_are_posted_only_by_a_plane_with_them_on() {
+    use domain::input_link::{GiveUp, GiveUpReason};
+    const KEYS: [&str; 4] = [
+        "inputGiveUpReason",
+        "inputGiveUpGen",
+        "inputReceivedFps",
+        "inputReceivedKbps",
+    ];
+    let h = HealthReport {
+        input_give_up: Some(GiveUp {
+            gen: 3,
+            reason: GiveUpReason::Stalled,
+        }),
+        ..periodic()
+    };
+    let m = Measured {
+        input_received_fps: Some(29.97),
+        input_received_kbps: Some(2_500),
+        ..Measured::default()
+    };
+    let mut checked = 0;
+    for keys in [InputKeys::Off, InputKeys::On] {
+        let fake = serve(vec![
+            Reply::Status(200, ok(fixture("reply-live.json"))),
+            Reply::Status(200, ok(fixture("reply-live.json"))),
+        ]);
+        let mut p = plane(&fake.url).with_input_keys(keys);
+        let mut lane = p.final_lane();
+        let fin = final_beat(ExitReason::Ended);
+        let fin = HealthReport {
+            input_give_up: h.input_give_up,
+            ..fin
+        };
+        for (beat, posted) in [
+            (&h, p.heartbeat(&h, &m).map(|_| fake.next())),
+            (&fin, lane.heartbeat(&fin, &m).map(|_| fake.next())),
+        ] {
+            let posted: Value = serde_json::from_str(&posted.expect("200").body).unwrap();
+            if keys == InputKeys::On {
+                assert_eq!(posted, heartbeat_wire_input(beat, &m), "{keys:?}");
+                assert_eq!(posted["inputGiveUpReason"], "stalled");
+                assert_eq!(posted["inputGiveUpGen"], 3);
+                assert_eq!(posted["inputReceivedFps"].as_f64(), Some(30.0));
+                assert_eq!(posted["inputReceivedKbps"], 2_500);
+            } else {
+                assert_eq!(posted, heartbeat_wire(beat, &m), "{keys:?}");
+                for k in KEYS {
+                    assert!(posted.get(k).is_none(), "{k} on an Off beat: {posted}");
+                }
+                // Off, the vendored contract admits it.
+                let v = schema_heartbeat();
+                assert!(v.iter_errors(&posted).next().is_none(), "{posted}");
+            }
+            checked += 1;
+        }
+    }
+    eprintln!("camera-key beats checked: {checked}");
+    assert_eq!(checked, 4);
+}
+
 /// `final_lane()`, made when the worker starts, before any session is fetched. The fetch on the first
 /// instance still teaches the lane every credential, so the lane's final beat is scrubbed of each one;
 /// and the lane calls the same session's route with the same token.

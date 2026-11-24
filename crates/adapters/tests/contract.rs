@@ -1,7 +1,8 @@
 //! The vendored contract is the arbiter: our wire output must validate against it, and its fixtures
 //! must decode into our types. Expected values come from the vendored files, never from our code.
 use adapters::control_http::{
-    heartbeat_wire, heartbeat_wire_with, parse_reply, parse_session, programme_phase_wire,
+    give_up_wire, heartbeat_wire, heartbeat_wire_input, heartbeat_wire_with, parse_reply, parse_session,
+    programme_phase_wire,
 };
 use adapters::sponsor_line::{parse_sponsor_line, END_KEYS, SOURCE_WORDS, START_KEYS, STYLE_WORDS};
 use app::ports::{FetchError, Measured};
@@ -14,6 +15,7 @@ use domain::config::{OutputProfile, Thresholds};
 use domain::health::{
     BeatState, ExitDetail, ExitInfo, GraphicsStatus, HealthReport, LinkStatus, PhaseChannel,
 };
+use domain::input_link::{GiveUp, GiveUpReason};
 use domain::ladder::Rung;
 use domain::lifecycle::ExitReason;
 use domain::output_link::Encoded;
@@ -155,6 +157,7 @@ fn report() -> HealthReport {
         heartbeat_failures: 0,
         phase_channel: None,
         exit: None,
+        input_give_up: None,
     }
 }
 fn stopped(reason: ExitReason, detail: Option<&str>) -> HealthReport {
@@ -177,6 +180,8 @@ fn full_measured() -> Measured {
         cpu_pct: Some(41.5),
         mem_mb: Some(812),
         camera_frames_replaced: Some(57),
+        input_received_fps: Some(29.9),
+        input_received_kbps: Some(3_500),
     }
 }
 
@@ -453,6 +458,9 @@ fn a_measured_zero_is_sent_as_zero() {
         mem_mb: Some(0),
         // Measured, but not a contract key (Owed 90): `camera_frames_replaced_stays_off_the_wire…`.
         camera_frames_replaced: Some(0),
+        // Not on a default beat (C2, S4): `the_camera_keys_stay_off_a_default_beat…`.
+        input_received_fps: Some(0.0),
+        input_received_kbps: Some(0),
     };
     let wire = heartbeat_wire(&report(), &m);
     let mut checked = 0;
@@ -522,6 +530,174 @@ fn camera_frames_replaced_stays_off_the_wire_until_the_contract_declares_it() {
     }
     eprintln!("camera_frames_replaced counts kept off the wire: {checked}");
     assert_eq!(checked, 3);
+}
+
+// ---- C2 (S4): the camera's keys, proposed for web's T44 ----
+
+/// The four keys C2 proposes for the contract (`docs/specs/2026-11-24-heartbeat-input-keys.proposed.json`,
+/// outside `contracts/`, which is never hand-edited).
+fn proposed_input_keys() -> serde_json::Map<String, Value> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/specs/2026-11-24-heartbeat-input-keys.proposed.json");
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+    doc["properties"]
+        .as_object()
+        .expect("the proposal's properties")
+        .clone()
+}
+
+/// The vendored contract with the proposal's keys added to `heartbeat` (what web will enforce once
+/// T44 ships), as a validator.
+fn heartbeat_with_proposal() -> jsonschema::Validator {
+    let mut doc = contract();
+    let props = doc["$defs"]["heartbeat"]["properties"]
+        .as_object_mut()
+        .expect("the heartbeat's properties");
+    for (k, v) in proposed_input_keys() {
+        props.insert(k, v);
+    }
+    let s = json!({ "$schema": doc["$schema"], "$defs": doc["$defs"], "$ref": "#/$defs/heartbeat" });
+    jsonschema::validator_for(&s).unwrap()
+}
+
+fn all_give_up_reasons() -> Vec<GiveUpReason> {
+    use GiveUpReason::*;
+    let all = vec![ConnectTimeout, Stalled, PhoneLiveDiscard, HoldEnd, Eos, Error];
+    // A new reason is a compile error here, so it cannot be left out of the sweep.
+    for r in &all {
+        match r {
+            ConnectTimeout | Stalled | PhoneLiveDiscard | HoldEnd | Eos | Error => {}
+        }
+    }
+    all
+}
+
+/// C2 (S4), web's heartbeat is strict: a default beat (`RELAY_INPUT_BEAT` unset) carries none of the
+/// camera's keys, whatever the report and the measurements hold, and is the same beat as without them,
+/// so it validates against the vendored contract. Until a re-vendor brings the keys, the contract
+/// refuses each of them: the flag must stay off on any host whose web predates T44.
+#[test]
+fn the_camera_keys_stay_off_a_default_beat_and_the_vendored_contract_refuses_them() {
+    let v = schema_def("heartbeat");
+    let without = heartbeat_wire(&report(), &Measured::default());
+    let declared = contract()["$defs"]["heartbeat"]["properties"]
+        .as_object()
+        .expect("the heartbeat's properties")
+        .clone();
+    let proposed = proposed_input_keys();
+    assert_eq!(proposed.len(), 4, "the proposal's keys: {:?}", proposed.keys());
+    let mut checked = 0;
+    for r in all_give_up_reasons() {
+        let h = HealthReport {
+            input_give_up: Some(GiveUp { gen: 7, reason: r }),
+            ..report()
+        };
+        let m = Measured {
+            input_received_fps: Some(30.0),
+            input_received_kbps: Some(2_500),
+            ..Measured::default()
+        };
+        let wire = heartbeat_wire(&h, &m);
+        assert_eq!(
+            wire, without,
+            "{r:?}: the camera's keys change nothing on a default beat"
+        );
+        assert!(violations(&v, &wire).is_empty(), "{wire}");
+        let on = heartbeat_wire_input(&h, &m);
+        for k in proposed.keys() {
+            assert!(on.get(k).is_some(), "{r:?}: {k} missing from an input beat: {on}");
+            if !declared.contains_key(k) {
+                assert!(
+                    !violations(&v, &on).is_empty(),
+                    "{r:?}: the vendored contract admits {k} now: re-check the flag (T44)"
+                );
+            }
+        }
+        checked += 1;
+    }
+    eprintln!("default beats checked against the camera's keys: {checked}");
+    assert_eq!(checked, 6);
+}
+
+/// C2 (S4): an input beat validates against the contract plus the proposal, every give-up reason's
+/// word is one the proposal declares and every declared word is written, the give-up's two keys go
+/// together, and each measurement is absent until measured and a present 0 is a measured zero. Once a
+/// re-vendor brings the keys, each vendored declaration must be the proposal's (the types, not the
+/// description), or the compositor writes a shape web refuses.
+#[test]
+fn an_input_beat_writes_the_proposed_keys_and_only_their_words() {
+    let v = heartbeat_with_proposal();
+    let proposed = proposed_input_keys();
+    let words: Vec<String> = proposed["inputGiveUpReason"]["anyOf"][0]["enum"]
+        .as_array()
+        .expect("the reason's enum")
+        .iter()
+        .map(|w| w.as_str().unwrap().to_owned())
+        .collect();
+    let mut written = std::collections::BTreeSet::new();
+    let mut checked = 0;
+    for r in all_give_up_reasons() {
+        for gen in [1, 2, u64::MAX] {
+            let h = HealthReport {
+                input_give_up: Some(GiveUp { gen, reason: r }),
+                ..report()
+            };
+            let wire = heartbeat_wire_input(&h, &full_measured());
+            assert!(violations(&v, &wire).is_empty(), "{r:?} {gen}: {wire}");
+            assert_eq!(wire["inputGiveUpReason"], give_up_wire(r));
+            assert!(words.contains(&give_up_wire(r).to_owned()), "{r:?}");
+            assert!(wire["inputGiveUpGen"].as_u64().is_some_and(|g| g >= 1));
+            written.insert(give_up_wire(r).to_owned());
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        written.into_iter().collect::<Vec<_>>(),
+        {
+            let mut w = words.clone();
+            w.sort();
+            w
+        },
+        "every declared word is written"
+    );
+    // Nothing given up, nothing measured: no camera key at all.
+    let none = heartbeat_wire_input(&report(), &Measured::default());
+    for k in proposed.keys() {
+        assert!(none.get(k).is_none(), "{k} before it is known: {none}");
+    }
+    assert!(violations(&v, &none).is_empty(), "{none}");
+    // A measured zero is sent as 0; a NaN or a negative rate is no measurement.
+    let zero = heartbeat_wire_input(
+        &report(),
+        &Measured {
+            input_received_fps: Some(0.0),
+            input_received_kbps: Some(0),
+            ..Measured::default()
+        },
+    );
+    assert_eq!(zero["inputReceivedFps"].as_f64(), Some(0.0));
+    assert_eq!(zero["inputReceivedKbps"], 0);
+    let bad = heartbeat_wire_input(
+        &report(),
+        &Measured {
+            input_received_fps: Some(f64::NAN),
+            ..Measured::default()
+        },
+    );
+    assert!(bad.get("inputReceivedFps").is_none(), "{bad}");
+    checked += 3;
+    // After a re-vendor: the contract's declarations are the proposal's.
+    let declared = contract()["$defs"]["heartbeat"]["properties"].clone();
+    for (k, want) in &proposed {
+        if let Some(got) = declared.get(k) {
+            assert_eq!(
+                got["anyOf"], want["anyOf"],
+                "{k}: the vendored shape is not the proposal's"
+            );
+        }
+    }
+    eprintln!("input beats checked: {checked}");
+    assert_eq!(checked, 6 * 3 + 3);
 }
 
 /// "Never inserts a key whose value is unknown": a NaN or an infinity is not a measurement (JSON has

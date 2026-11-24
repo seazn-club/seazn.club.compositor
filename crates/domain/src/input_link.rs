@@ -8,7 +8,8 @@
 //! ```
 //!
 //! - **Back-off.** `attempt` counts consecutive failures, and failure number f waits `delay(f - 1)`:
-//!   1, 2, 4, 8, 10, 10 s (PDF failure table), retried forever. A first decoded frame resets it.
+//!   1, 2, 4, 4, 4 s (the PDF failure table's 1 s base, capped at 4 s by F-036), retried forever. A
+//!   first decoded frame resets it.
 //! - **Generations.** Every build starts a new generation, and every adapter event carries the
 //!   generation of the pipeline that sent it. An event from any other generation is ignored, so a late
 //!   `InputLost` from a torn-down pipeline cannot knock down the healthy new one.
@@ -24,6 +25,12 @@
 //!   keeps no copy of the rules. Each generation is given up at most once, since the link then backs
 //!   off and only a rebuild moves it on. A loss the adapter reported (`on_lost`) owes no abandon: the
 //!   adapter decided it, and its gate is shut already.
+//! - **Why a generation was given up (C2, S4).** Every move from Connecting or Running into Backoff
+//!   records `GiveUp { gen, reason }` (`last_give_up`), the reason one of six (`GiveUpReason`): the
+//!   connect timeout, the stall rule or a reported stall, the phone-live nudge's discard,
+//!   Cloudflare's hold-end close on a connect, and a reported EOS or error. A Backoff that is only
+//!   rescheduled (a nudge, a hold-end close, a second loss) records nothing. The driver logs each
+//!   one and the beat carries the last.
 //! - **Cloudflare's hold-end close (Owed 108 fix (a), F-032).** When the phone drops, Cloudflare holds
 //!   its SRT broadcast about 30 s, then closes every attached reader with an error. The adapter reports
 //!   an error on the current build, and the first one on the last build the link gave up while that
@@ -62,6 +69,44 @@ pub enum LossReason {
     Stalled,
     Eos,
     Error,
+}
+
+/// Why the link gave a generation up (C2, S4): the rule or the report that moved it from Connecting
+/// or Running into Backoff. The log and the beat name it (`inputGiveUpReason`), so a session's
+/// camera returns can be read without the relay's own lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GiveUpReason {
+    /// Connecting `input_connect_timeout_ms` with no first decoded frame (`on_tick`).
+    ConnectTimeout,
+    /// Running with no frame for `input_stall_after_ms` (`check_stall`), or a stall the adapter
+    /// reported (`LossReason::Stalled`).
+    Stalled,
+    /// Web's phone-live counter rose while the connect had carried no byte: the nudge's one discard
+    /// an outage (`check_nudge`; Owed 108 fix (b)).
+    PhoneLiveDiscard,
+    /// Cloudflare's hold-end close on a connect (`on_error`; Owed 108 fix (a), F-032).
+    HoldEnd,
+    /// The adapter reported an end of stream (`LossReason::Eos`).
+    Eos,
+    /// The adapter reported a pipeline error that is not the hold-end close (`LossReason::Error`).
+    Error,
+}
+
+impl From<LossReason> for GiveUpReason {
+    fn from(r: LossReason) -> Self {
+        match r {
+            LossReason::Stalled => GiveUpReason::Stalled,
+            LossReason::Eos => GiveUpReason::Eos,
+            LossReason::Error => GiveUpReason::Error,
+        }
+    }
+}
+
+/// The last generation the link gave up, and why (C2, S4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GiveUp {
+    pub gen: u64,
+    pub reason: GiveUpReason,
 }
 
 /// What a build's SRT connection had shown when its pipeline posted an error (Owed 108, F-032). The
@@ -137,6 +182,9 @@ pub struct InputLink {
     discard_armed: bool,
     /// The current generation's first byte has left its source (`on_media`). False at each build.
     media: bool,
+    /// The last generation given up and why (C2, S4): set by every move from Connecting or Running
+    /// into Backoff (`give_up`), never by a Backoff that is only rescheduled.
+    last_give_up: Option<GiveUp>,
 }
 
 impl Default for InputLink {
@@ -157,6 +205,7 @@ impl InputLink {
             nudged: false,
             discard_armed: true,
             media: false,
+            last_give_up: None,
         }
     }
 
@@ -167,6 +216,11 @@ impl InputLink {
     /// The number of builds so far, and the generation an adapter event must carry to count.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The last generation given up and why (C2, S4); `None` until one is.
+    pub fn last_give_up(&self) -> Option<GiveUp> {
+        self.last_give_up
     }
 
     /// The phone-live nudge's fields as they stand, for the log (`NudgeView`).
@@ -244,7 +298,7 @@ impl InputLink {
             InputState::Connecting { .. } if !self.media && self.discard_armed => {
                 self.discard_armed = false;
                 let gen = self.generation;
-                self.back_off(now, 0, t);
+                self.give_up(now, 0, GiveUpReason::PhoneLiveDiscard, t);
                 Some(InputAction::Abandon { gen })
             }
             InputState::Connecting { .. } | InputState::Running { .. } => None,
@@ -277,7 +331,12 @@ impl InputLink {
             InputState::Backoff { until, .. } => Some(until),
             InputState::Connecting { .. } | InputState::Running { .. } => None,
         };
-        self.back_off(now, 0, t);
+        if due.is_none() {
+            // A connect the close ends is given up; a Backoff's is only rescheduled.
+            self.give_up(now, 0, GiveUpReason::HoldEnd, t);
+        } else {
+            self.back_off(now, 0, t);
+        }
         if let (Some(due), InputState::Backoff { until, .. }) = (due, &mut self.state) {
             *until = (*until).min(due);
         }
@@ -313,7 +372,7 @@ impl InputLink {
             // Already lost: a second EOS or an error from the same pipeline changes nothing.
             InputState::Backoff { .. } => return,
         };
-        self.back_off(now, failed_before, t);
+        self.give_up(now, failed_before, reason.into(), t);
     }
 
     /// Running but no frame since max(running since, last frame) for `input_stall_after_ms`: lost as
@@ -344,7 +403,7 @@ impl InputLink {
             InputState::Connecting { attempt, since }
                 if elapsed(now, since) >= t.input_connect_timeout_ms =>
             {
-                self.back_off(now, attempt, t);
+                self.give_up(now, attempt, GiveUpReason::ConnectTimeout, t);
                 Some(InputAction::Abandon { gen: self.generation })
             }
             _ => None,
@@ -358,6 +417,16 @@ impl InputLink {
     /// PDF failure table: "alert if it repeats > 3 times in 5 min".
     pub fn kick_alert(&self, now: Ms, t: &Thresholds) -> bool {
         self.kicks(now, t) > t.kick_alert_count
+    }
+
+    /// The current generation is given up for `reason` (C2, S4): recorded, then backed off. Every
+    /// move from Connecting or Running into Backoff comes through here, and nothing else does.
+    fn give_up(&mut self, now: Ms, failed_before: u32, reason: GiveUpReason, t: &Thresholds) {
+        self.last_give_up = Some(GiveUp {
+            gen: self.generation,
+            reason,
+        });
+        self.back_off(now, failed_before, t);
     }
 
     /// Failure number `failed_before + 1` waits `delay(failed_before)`. Both additions saturate: the
@@ -439,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_failures_follow_the_pdf_backoff_1_2_4_8_10_10() {
+    fn consecutive_failures_back_off_1_2_4_then_hold_at_the_f036_cap() {
         let th = t();
         let mut l = InputLink::new();
         let mut now = 0;
@@ -455,13 +524,13 @@ mod tests {
             let gen = l.generation();
             l.on_lost(now, gen, LossReason::Error, &th); // fails instantly
         }
-        // The PDF's sequence, from the config's numbers: base, doubling, capped.
+        // The sequence, from the config's numbers: base, doubling, capped.
         let (base, cap) = (th.input_backoff_base_ms, th.input_backoff_cap_ms);
         let want: Vec<Ms> = (0..6).map(|a| (base << a).min(cap)).collect();
         assert_eq!(
             want,
-            vec![1_000, 2_000, 4_000, 8_000, 10_000, 10_000],
-            "PDF: 1 s → 10 s"
+            vec![1_000, 2_000, 4_000, 4_000, 4_000, 4_000],
+            "the PDF's 1 s base, capped at 4 s (F-036, C2)"
         );
         let rounded: Vec<Ms> = gaps.iter().map(|g| g / 10 * 10).collect();
         assert_eq!(rounded, want);
@@ -1024,6 +1093,16 @@ mod tests {
         }
     }
 
+    /// The numbers F-032 computed its schedule with: F-002's 5 s connect timeout and the PDF's 10 s
+    /// back-off cap (F-036 then moved both: 9 s, and 4 s in C2). A check of F-032's own instants runs
+    /// on it, so they stay F-032's.
+    fn at_f032() -> Thresholds {
+        Thresholds {
+            input_backoff_cap_ms: 10_000,
+            ..at_f002()
+        }
+    }
+
     /// Ticks `l` from `from` (the 10 ms grid, the stall rule read against `last`) to the first tick
     /// after which it backs off a later attempt (a count above 1), and returns that tick; bounded by
     /// two whole capped steps.
@@ -1346,16 +1425,17 @@ mod tests {
 
     /// A phone that never returns: after the rule's one rebuild each build times out, and the builds
     /// re-run the back-off's steps from the base. Derived from `backoff::delay` and the connect
-    /// timeout, at today's (F-036's 9 s) and at F-002's 5 s, and at 5 s held against F-032's own
-    /// schedule, which it computed there (the drop + 31.9, 38.9, 47.9, 60.9, 75.9; today's +37, +52,
-    /// +67, +82). The bound over many horizons is swept in `tests/hold_end.rs`.
+    /// timeout, at today's (F-036's 9 s, the 4 s cap) and at F-002's 5 s, and on F-032's own numbers
+    /// (5 s and the 10 s cap) held against the schedule it computed there (the drop + 31.9, 38.9, 47.9,
+    /// 60.9, 75.9; today's +37, +52, +67, +82). The bound over many horizons is swept in
+    /// `tests/hold_end.rs`.
     #[test]
     fn a_phone_that_never_returns_gets_the_backoffs_steps_once_more() {
         let mut checked = 0;
-        for (th, f032) in [(t(), false), (at_f002(), true)] {
+        for (th, f032) in [(t(), false), (at_f002(), false), (at_f032(), true)] {
             checked += never_returns(&th, f032);
         }
-        assert_eq!(checked, 2, "timeouts checked: {checked}");
+        assert_eq!(checked, 3, "timeouts checked: {checked}");
     }
 
     fn never_returns(th: &Thresholds, f032: bool) -> usize {

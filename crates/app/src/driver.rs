@@ -14,7 +14,9 @@
 //!   refused (the driver owns the tick), and a wiring effect with no session (an inbound
 //!   `BootstrapOk`) exits as a fatal error.
 //! - **The phase** is published after every `decide` that changed it, with a rising `seq` from
-//!   `(Waiting, 0)` (amendment 2026-10-15).
+//!   `(Waiting, 0)` (amendment 2026-10-15), and logged first, once a change: `programme phase
+//!   from=<a> to=<b> seq=<n>`, in the beat's `programmePhase` words (C2, S3). The domain's edge beat
+//!   puts the change on the next beat (`Thresholds::phase_beat_gap_ms`).
 //! - **The log** gets one line per hide (`overlay hidden reason=<r> gen=<g>`), one per sink swap
 //!   before the port call (`sink swap reason=first|error|connect_timeout|egress_stalled gen=<g>`,
 //!   Owed 87 and Owed 94: what ended the sink before it; the port's own `sink swap gen=<g> target=…`
@@ -65,6 +67,13 @@
 //!   then the rebuild line when it acts; or `phone live nudge cleared gen=<g>` when generation `g`
 //!   reaches Running before it acts. Each line is once a change or once a latch, so none repeats on a
 //!   beat. Integers and words only.
+//! - **The camera as the relay received it** (C2, S4): each beat's metrics sample that carries
+//!   either camera rate writes `input received fps=<x.y> kbps=<n>` (`-` for the one not measured); a
+//!   sample with neither writes nothing.
+//! - **Each camera generation given up** (C2, S4), read off the input link before and after each
+//!   decision (`Supervisor::input_give_up`), never decided here: `input give up gen=<g>
+//!   reason=<connect_timeout|stalled|phone_live_discard|hold_end|eos|error>`, once a generation,
+//!   before the decision's port calls (its `abandon` included). The beat carries the same.
 //! - **After `Exit`** nothing reaches a port from `step` or `tick_due`. `run()`'s flush follows, and
 //!   logs `final beat not confirmed within 2000 ms` when it times out.
 use std::time::Duration;
@@ -73,14 +82,16 @@ use domain::cef_health::CefHealth;
 use domain::config::Thresholds;
 use domain::graphics::HideReason;
 use domain::health::ExitDetail;
-use domain::input_link::{InputState, NudgeView};
+use domain::input_link::{GiveUpReason, InputState, NudgeView};
 use domain::lifecycle::{ExitReason, Lifecycle};
 use domain::output_link::SwapReason;
 use domain::programme::ProgrammePhase;
 use domain::starvation::{Alarm, StarvationAlarm};
 use domain::supervisor::{Decision, Effect, Event, Refusal, Supervisor};
 
-use crate::ports::{ControlRequest, Inbound, MemorySplit, Ports, SessionConfig, FINAL_BEAT_TIMEOUT_MS};
+use crate::ports::{
+    ControlRequest, Inbound, Measured, MemorySplit, Ports, SessionConfig, FINAL_BEAT_TIMEOUT_MS,
+};
 
 /// Ticks per second before the session gives a profile.
 const BOOT_RATE: u64 = 10;
@@ -341,12 +352,26 @@ impl Driver {
 
     fn apply(&mut self, d: Decision, now: u64) -> Option<i32> {
         let before = self.supervisor.input_nudge();
+        let gave_up = self.supervisor.input_give_up();
         self.supervisor = d.next;
         self.phone_live(before, self.supervisor.input_nudge());
+        if let Some(g) = self.supervisor.input_give_up().filter(|g| Some(*g) != gave_up) {
+            self.ports.log.info(&format!(
+                "input give up gen={} reason={}",
+                g.gen,
+                give_up_word(g.reason)
+            ));
+        }
         let phase = self.supervisor.programme_phase();
         if phase != self.phase {
-            self.phase = phase;
+            let from = std::mem::replace(&mut self.phase, phase);
             self.phase_seq += 1;
+            self.ports.log.info(&format!(
+                "programme phase from={} to={} seq={}",
+                phase_word(from),
+                phase_word(phase),
+                self.phase_seq
+            ));
             self.ports.phase.publish(phase, self.phase_seq);
         }
         for e in d.effects {
@@ -448,6 +473,9 @@ impl Driver {
                     p.log
                         .info(&format!("camera frames replaced beat={beat} total={total}"));
                 }
+                if let Some(line) = received_line(&m) {
+                    p.log.info(&line);
+                }
                 if self
                     .memory_at
                     .is_none_or(|at| now.saturating_sub(at) >= MEMORY_LINE_EVERY_MS)
@@ -472,7 +500,7 @@ impl Driver {
                         None => {}
                     }
                 }
-                p.control.request(ControlRequest::Heartbeat(h, m));
+                p.control.request(ControlRequest::Heartbeat(h, Box::new(m)));
                 let dropped = p.control.dropped();
                 if self.drops.due(dropped, now) {
                     p.log.info(&format!("heartbeats dropped total={dropped}"));
@@ -607,6 +635,45 @@ fn swap_name(r: SwapReason) -> &'static str {
         SwapReason::Error => "error",
         SwapReason::ConnectTimeout => "connect_timeout",
         SwapReason::EgressStalled => "egress_stalled",
+    }
+}
+
+/// The programme phase as the log names it: the beat's `programmePhase` words (the contract's enum),
+/// so a line and a beat read alike (C2, S3).
+fn phase_word(p: ProgrammePhase) -> &'static str {
+    match p {
+        ProgrammePhase::Waiting => "waiting",
+        ProgrammePhase::Live => "live",
+        ProgrammePhase::Frozen => "frozen",
+        ProgrammePhase::Reconnecting => "reconnecting",
+        ProgrammePhase::Final => "final",
+    }
+}
+
+/// The camera as received (C2, S4), once a beat: `input received fps=<x.y> kbps=<n>`, each `-` when
+/// not measured (a non-finite rate is not a measurement), and no line when neither is.
+fn received_line(m: &Measured) -> Option<String> {
+    let fps = m.input_received_fps.filter(|f| f.is_finite() && *f >= 0.0);
+    if fps.is_none() && m.input_received_kbps.is_none() {
+        return None;
+    }
+    Some(format!(
+        "input received fps={} kbps={}",
+        fps.map_or("-".to_owned(), |f| format!("{f:.1}")),
+        m.input_received_kbps.map_or("-".to_owned(), |k| k.to_string())
+    ))
+}
+
+/// Why a camera generation was given up, as the log and the beat's `inputGiveUpReason` name it
+/// (C2, S4).
+fn give_up_word(r: GiveUpReason) -> &'static str {
+    match r {
+        GiveUpReason::ConnectTimeout => "connect_timeout",
+        GiveUpReason::Stalled => "stalled",
+        GiveUpReason::PhoneLiveDiscard => "phone_live_discard",
+        GiveUpReason::HoldEnd => "hold_end",
+        GiveUpReason::Eos => "eos",
+        GiveUpReason::Error => "error",
     }
 }
 

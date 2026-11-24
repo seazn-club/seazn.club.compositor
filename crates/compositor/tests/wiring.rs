@@ -23,8 +23,8 @@ use compositor::clock::Clock;
 use compositor::env::Drivers;
 use compositor::logged::{rfc3339_ms, LoggedPlane, LoggedProgramme, Logger};
 use compositor::wiring::{
-    assemble, cef_fps, programme_tap, sponsor_airings, sponsor_frames, LazyInput, PageOrigin, Parts,
-    ProfileSlot, ProfileTap,
+    assemble, cef_fps, input_keys, programme_tap, sponsor_airings, sponsor_frames, LazyInput, PageOrigin,
+    Parts, ProfileSlot, ProfileTap,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use domain::airings::{AiringBuffer, AiringLine};
@@ -799,6 +799,53 @@ fn the_sponsor_airings_follow_relay_airings_and_say_so() {
         checked += 1;
     }
     assert_eq!(checked, 3);
+}
+
+/// C2 (S4): the beats' camera keys follow `RELAY_INPUT_BEAT` (off unless `1`), and the start says
+/// which. `RELAY_AIRINGS` does not turn them on.
+#[test]
+fn the_camera_keys_follow_relay_input_beat_and_say_so() {
+    use adapters::control_http::InputKeys;
+    let mut checked = 0;
+    let cases = [
+        (None, None, InputKeys::Off),
+        (Some("0"), None, InputKeys::Off),
+        (None, Some("1"), InputKeys::Off),
+        (Some("1"), None, InputKeys::On),
+    ];
+    for (value, airings, want) in cases {
+        let mut m = std::collections::BTreeMap::from([
+            (
+                compositor::env::SESSION_ID,
+                "3f8a2c1e-7b4d-4e9a-9c2f-5d6e7f8a9b0c".to_owned(),
+            ),
+            (compositor::env::JOB_TOKEN, TOKEN.to_owned()),
+            (compositor::env::APP_URL, "https://stg.seazn.club".to_owned()),
+            (
+                compositor::env::RELAY_DEADLINE_AT,
+                "2026-10-14T18:30:00.000Z".to_owned(),
+            ),
+            (compositor::env::COMPOSITOR_DRIVERS, "live".to_owned()),
+        ]);
+        if let Some(v) = value {
+            m.insert(compositor::env::RELAY_INPUT_BEAT, v.to_owned());
+        }
+        if let Some(v) = airings {
+            m.insert(compositor::env::RELAY_AIRINGS, v.to_owned());
+        }
+        let env = compositor::env::parse(|k| m.get(k).cloned(), true).expect("a valid env");
+        let (log, buf) = logger();
+        assert_eq!(input_keys(&env, &log), want, "{value:?} {airings:?}");
+        let word = if want == InputKeys::On { "on" } else { "off" };
+        assert_eq!(
+            buf.messages(),
+            vec![format!("camera keys on the heartbeat: {word}")],
+            "{value:?} {airings:?}"
+        );
+        checked += 1;
+    }
+    eprintln!("camera key cases checked: {checked}");
+    assert_eq!(checked, 4);
 }
 
 /// R4 task SC2: the frame grabs ride the airings' gate (the controller's ruling: one `RELAY_AIRINGS` for

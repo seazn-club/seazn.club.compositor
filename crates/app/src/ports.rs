@@ -224,6 +224,15 @@ pub struct Measured {
     /// than the programme (60 fps on 30) and a late tick thread raise it too, judder or not (the
     /// stats module's `ReplacedFrames` says how).
     pub camera_frames_replaced: Option<u64>,
+    /// The camera as the relay received it (C2, S4): decoded camera frames written into the
+    /// programme's camera slot over the beat window, per second (the adapter's `CameraTotals`). The
+    /// driver logs it once a beat (`input received fps=<x> kbps=<n>`); the heartbeat carries it as
+    /// `inputReceivedFps` only when `RELAY_INPUT_BEAT` is on (web's heartbeat is strict until its
+    /// task T44 declares the key).
+    pub input_received_fps: Option<f64>,
+    /// The bytes out of the camera's SRT source over the beat window, every build's, decoded or not,
+    /// in kbit/s rounded (C2, S4): `inputReceivedKbps`, under the same flag.
+    pub input_received_kbps: Option<u64>,
 }
 
 /// This process's memory from `/proc/self/status` (the soak's memory split). Each field is absent
@@ -455,11 +464,13 @@ pub trait FrameUpload: Send {
 
 /// What the loop asks of the control worker. A `Heartbeat` whose report carries an `exit` is a final
 /// beat, and the worker's queue never drops it (Owed 28). Its `Debug` is derived: `HealthReport`'s
-/// fatal text is an `ExitDetail`, which prints its length alone (Owed 31).
+/// fatal text is an `ExitDetail`, which prints its length alone (Owed 31). The measurements are boxed
+/// (C2, S4): a beat outgrew clippy's bound on the size between this enum's variants, and a box keeps
+/// the request and every queue slot that holds one small.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlRequest {
     FetchSession,
-    Heartbeat(HealthReport, Measured),
+    Heartbeat(HealthReport, Box<Measured>),
 }
 
 /// The control worker's side of the queue (`control_worker::ControlHandle`). `request` never

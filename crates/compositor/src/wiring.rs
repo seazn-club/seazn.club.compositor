@@ -25,13 +25,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use adapters::cef_graphics::{CefGraphics, CefMemory};
-use adapters::control_http::{HttpControlPlane, DECLARED_PROFILES};
+use adapters::control_http::{HttpControlPlane, InputKeys, DECLARED_PROFILES};
 use adapters::frame_store::FrameStore;
 use adapters::gst_input::GstInput;
 use adapters::gst_programme::GstProgramme;
-use adapters::metrics_proc::ProcMetrics;
+use adapters::metrics_proc::{CameraTotals, ProcMetrics};
 use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp, RELAY_PHASE_PORT};
-use adapters::stats::Stats;
+use adapters::stats::{ReceivedBytes, Stats};
 use app::airings::Airings;
 use app::control_worker;
 use app::driver::Driver;
@@ -368,7 +368,7 @@ struct Planes {
 
 /// The mode's `Planes`, or the refusal's exit code (78, with its line: the token is never in it,
 /// `PlaneConfigError` carries no value).
-fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Planes, i32> {
+fn plane(env: &Env, t: &Thresholds, log: &Logger, keys: InputKeys) -> Result<Planes, i32> {
     let http = match env.drivers {
         Drivers::Live => true,
         Drivers::Fake => env.fake.control_http,
@@ -388,6 +388,7 @@ fn plane(env: &Env, t: &Thresholds, log: &Logger) -> Result<Planes, i32> {
         t.heartbeat_interval_ms,
     ) {
         Ok(p) => {
+            let p = p.with_input_keys(keys);
             let frames = Box::new(p.frame_upload());
             Ok(Planes {
                 control: Box::new(p),
@@ -461,6 +462,25 @@ struct Media {
     /// R4 task SC2: the programme's frame tap, when the frame grabs are on (none when off: the
     /// programme then has no probe at all).
     tap: Option<Box<dyn FrameTap>>,
+    /// C2 (S4): the camera's totals as the relay receives them, for the metrics (none in fake mode:
+    /// no camera is pulled, so nothing is measured).
+    camera: Option<Camera>,
+}
+
+/// The camera's counters (C2, S4): the frames the input wrote into the programme's camera slot and
+/// the bytes its `srtsrc` put out, every build's.
+struct Camera {
+    frames: FrameStore,
+    received: Arc<ReceivedBytes>,
+}
+
+impl Camera {
+    fn totals(&self) -> CameraTotals {
+        CameraTotals {
+            frames_written: self.frames.camera_written(),
+            bytes_received: self.received.total(),
+        }
+    }
 }
 
 fn live_media(
@@ -487,11 +507,17 @@ fn live_media(
     let tap = programme_tap(&mut programme, airings.frames());
     let stats = programme.stats();
     let slot = ProfileSlot::default();
+    let camera = Camera {
+        frames: frames.clone(),
+        received: Arc::new(ReceivedBytes::default()),
+    };
     let (input_tx, input_log, input_t) = (tx.clone(), log.clone(), t.clone());
+    let received = Arc::clone(&camera.received);
     let build: InputBuilder = Box::new(move |p: &OutputProfile| -> Box<dyn InputSource> {
         Box::new(
             GstInput::new(frames.clone(), input_tx.clone(), &input_t, p.width, p.height)
-                .with_log(input_log.adapter_sink()),
+                .with_log(input_log.adapter_sink())
+                .with_received_bytes(Arc::clone(&received)),
         )
     });
     Media {
@@ -501,6 +527,7 @@ fn live_media(
         stats,
         cef: Some(cef),
         tap,
+        camera: Some(camera),
     }
 }
 
@@ -598,7 +625,28 @@ fn fake_media(env: &Env, airings: &Airings) -> Media {
             .frames()
             .is_on()
             .then(|| Box::new(FakeTap::new().0) as Box<dyn FrameTap>),
+        camera: None,
     }
+}
+
+/// Whether the beats carry the camera's keys (C2, S4; `RELAY_INPUT_BEAT`), and the info line that says
+/// which, so a run's log shows whether its beats can carry them. The `input give up` and `input
+/// received` lines are written either way. Public for a test of this decision alone
+/// (`tests/wiring.rs`).
+pub fn input_keys(env: &Env, log: &Logger) -> InputKeys {
+    let keys = if env.input_beat {
+        InputKeys::On
+    } else {
+        InputKeys::Off
+    };
+    log.info(&format!(
+        "camera keys on the heartbeat: {}",
+        match keys {
+            InputKeys::On => "on",
+            InputKeys::Off => "off",
+        }
+    ));
+    keys
 }
 
 /// The sponsor airings' buffer `env` asks for (R4 task SC1; `RELAY_AIRINGS`), and the info line that
@@ -643,7 +691,7 @@ pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32
     let Planes {
         control: plane,
         frames: frame_upload,
-    } = match plane(env, &t, log) {
+    } = match plane(env, &t, log, input_keys(env, log)) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -678,6 +726,10 @@ pub fn run(env: &Env, clock: &Arc<Clock>, log: &Logger, signals: Signals) -> i32
     let metrics = match media.cef {
         Some(cef) => ProcMetrics::new(media.stats).with_cef(move || cef.read()),
         None => ProcMetrics::new(media.stats),
+    };
+    let metrics = match media.camera {
+        Some(camera) => metrics.with_camera(move || camera.totals()),
+        None => metrics,
     };
     let parts = Parts {
         input: media.input,

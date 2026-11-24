@@ -3236,6 +3236,13 @@ libx264 probe, core 165 r3222, through ffmpeg).
    own keyframe gives 42); the four tests' first swaps wait for that line
    (`swap_before_the_first_frame`), so a request made there reds at the swap. The red CI run on
    `214f674` is this mutant's kill.
+   *Note, 2026-11-24 (C2; the C1 review's m1): the sentence above claims more than the build at
+   `7bd54bc` showed. There the line came from its own `if` in `Feeder::run`, and the guard was
+   `ask_key`'s early return a few lines below it, so the line said what the `if` expected, not what
+   the guard did, and the swap's wait could not tell them apart. The kill on `214f674` was the later
+   file asserts (the second sink's 42 frames, the empty file, the 552 kbps), not the wait. C2 moved
+   the line into `ask_key`'s `None` branch, written at its first call only, so the line and the
+   refusal are one branch. Like every programme test, the wait runs on CI only.*
 
 **Changes** (C1, branch `fix/seazn-live-gop-pull`).
 
@@ -3318,3 +3325,24 @@ sessions with swaps and cuts, the shortest GOP Cloudflare saw (its GraphQL
 `liveInputEventsAdaptiveGroups` `min.gopDuration`, the C1 review's m2), YouTube, a phone's return,
 and the 1080p peak (D2). The programme tests that witness the GOP, the floor and the stamp need
 GStreamer and run on CI only.
+
+**D4: the input back-off cap, 4 000 ms** (C2, 2026-11-24; the C2 brief's S7).
+
+- The same `5e5403ce` return: Cloudflare had the camera connected at 09:55:31.6Z, and frames came
+  only at gen 9, about 50 s later. Between gens 4 and 9 the link waited the back-off's 1, 2, 4, 8
+  and 10 s steps, each after a connect that was given up: at 5 s a connect and its wait came round
+  every 13 to 15 s once the steps reached the cap. `input_backoff_cap_ms` is now 4 000, so the
+  waits are 1, 2, 4, 4, … s, and a dead pull is retried a connect timeout and at most 4 s apart
+  (13 s at F-036's 9 s timeout, not 19 s).
+- The first three waits are unchanged, so D3's schedule (the third build at +30 s after the last
+  frame) and the hold-end gate (20 000 > 5 000 + 9 000) do not move. Only a phone away for longer
+  gains: from the fourth consecutive failure, 4 s a step (8 → 4, then 10 → 4).
+- The cost: a camera that never returns costs Cloudflare one SRT connect attempt about every 13 s
+  instead of 19 s. Each is a read of the input, never a publish, and the relay holds one at a time.
+- Not measured: whether 4 s shortens a stg return (Owed 109's stg run reads it from the same lines).
+  C14's case 3 (`reader-kicked`) bounds each return by `budget_return_to_live_ms` +
+  `input_backoff_cap_ms`, so its bound moves from 11 200 to 5 200 ms with this value. A kick is an
+  `Error` from Running (Owed 46), whose wait is the 1 s base, never the cap; the case's fixture reads
+  1 400 ms. The case runs on CI only, and its next chaos run is owed this bound.
+- The CEF back-off, which mirrored the input's PDF numbers, stays 1 s → 10 s: the camera's evidence
+  says nothing of CEF's.

@@ -8,6 +8,8 @@
 //! | `fps` | the programme's REAL output rate (Owed 86): the video frames that left the encoder since the last sample, over the wall time since it (`BeatRate`, fed `Stats::snapshot()`'s `encoded_frames`), never the profile's nominal rate; absent until a window has both ends |
 //! | `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `Stats::snapshot()`, unchanged: a `None` there stays absent on the wire |
 //! | `camera_frames_replaced` | `Stats::snapshot()`, unchanged; logged by the driver, never on the wire (Owed 90) |
+//! | `input_received_fps` | the camera as the relay receives it (C2, S4): the decoded camera frames the input wrote into the programme's camera slot since the last sample (`FrameStore::camera_written`, which counts only an open gate's), over the wall time since it (`BeatRate`); absent until a window has both ends, and absent with no camera reader (`with_camera`) |
+//! | `input_received_kbps` | the bytes out of the camera pull's `srtsrc`, every build's, decoded or not (`ReceivedBytes`), since the last sample, over the wall time since it, × 8 / 1000, rounded (`BeatRate`); absent as above |
 //! | `memory()` (not a `Measured` field) | the last sample's `/proc/<pid>/status` read of this process (`VmRSS`, `RssAnon`, `RssFile`, `RssShmem`, `Threads`: the read `mem_mb` already makes) and the CEF child poll's last PSS by kind (`with_cef`); logged by the driver once a minute, never on the wire (the soak's memory split) |
 //! | `measured_latency_ms` | never: it needs SEI (F-003), so it is omitted, never 0 |
 //!
@@ -136,10 +138,27 @@ pub struct ProcMetrics {
     cef: Option<CefReader>,
     /// This process's own status fields, from the last sample's `status` read (the memory split).
     own: Option<ProcStatus>,
+    /// The camera's totals (C2, S4; `with_camera`; none with no camera input).
+    camera: Option<CameraReader>,
+    /// The camera's frame and byte rates over the beat window.
+    camera_fps: BeatRate,
+    camera_bytes: BeatRate,
 }
 
 /// Reads the CEF child poll's last PSS by kind (`CefGraphics::memory`).
 type CefReader = Box<dyn Fn() -> Option<CefPoll> + Send>;
+
+/// The camera's totals as the relay received them (C2, S4), both growing counts for the process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CameraTotals {
+    /// Decoded camera frames written into the programme's camera slot (`FrameStore::camera_written`).
+    pub frames_written: u64,
+    /// Bytes out of the camera pull's `srtsrc`, every build's (`ReceivedBytes`).
+    pub bytes_received: u64,
+}
+
+/// Reads the camera's totals (`with_camera`).
+type CameraReader = Box<dyn Fn() -> CameraTotals + Send>;
 
 impl fmt::Debug for ProcMetrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -150,6 +169,7 @@ impl fmt::Debug for ProcMetrics {
             .field("sampled", &self.last.is_some())
             .field("rate", &self.rate)
             .field("cef", &self.cef.is_some())
+            .field("camera", &self.camera.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -166,6 +186,9 @@ impl ProcMetrics {
             rate: BeatRate::default(),
             cef: None,
             own: None,
+            camera: None,
+            camera_fps: BeatRate::default(),
+            camera_bytes: BeatRate::default(),
         }
     }
 
@@ -173,6 +196,23 @@ impl ProcMetrics {
     pub fn with_cef(mut self, read: impl Fn() -> Option<CefPoll> + Send + 'static) -> Self {
         self.cef = Some(Box::new(read));
         self
+    }
+
+    /// The camera as received (C2, S4): `read` gives the camera's totals, once a beat.
+    pub fn with_camera(mut self, read: impl Fn() -> CameraTotals + Send + 'static) -> Self {
+        self.camera = Some(Box::new(read));
+        self
+    }
+
+    /// The beat's camera rates from `totals` at `now`: frames a second, and kbit/s rounded to a whole
+    /// number. `None` totals (no camera reader) read nothing and reset both windows.
+    pub fn camera_rates(&mut self, now: Instant, totals: Option<CameraTotals>) -> (Option<f64>, Option<u64>) {
+        let fps = self.camera_fps.sample(now, totals.map(|c| c.frames_written));
+        let bytes_per_s = self.camera_bytes.sample(now, totals.map(|c| c.bytes_received));
+        let kbps = bytes_per_s
+            .filter(|b| b.is_finite() && *b >= 0.0)
+            .map(|b| (b * 8.0 / 1_000.0).round() as u64);
+        (fps, kbps)
     }
 }
 
@@ -194,6 +234,8 @@ impl Metrics for ProcMetrics {
         // the tree) never lands inside the rate's window (the PR #69 review's m3).
         let s = self.stats.snapshot();
         let fps = self.rate.sample(now, s.encoded_frames);
+        let camera = self.camera.as_ref().map(|read| read());
+        let (input_received_fps, input_received_kbps) = self.camera_rates(now, camera);
         let tree = process_tree(self.root);
         let ticks: BTreeMap<ProcKey, u64> = tree
             .iter()
@@ -234,6 +276,8 @@ impl Metrics for ProcMetrics {
             cpu_pct,
             mem_mb: mem_kb.map(|kb| kb / 1024),
             camera_frames_replaced: s.camera_frames_replaced,
+            input_received_fps,
+            input_received_kbps,
         }
     }
 

@@ -21,10 +21,29 @@
 //! **The beat's `fps`** is not a 1 s window: it is `BeatRate`'s, the frames that left the encoder
 //! over the beat window, which `ProcMetrics` reads once a beat (Owed 86).
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use domain::config::OUTPUT_FPS_MIN_WINDOW_MS;
+
+/// The bytes the camera pull's `srtsrc` has put out since the process started, every build's,
+/// decoded or not (C2, S4: the camera as the relay receives it). Every `GstInput` the process builds
+/// adds to one (`GstInput::with_received_bytes`), and `ProcMetrics` reads it once a beat
+/// (`CameraTotals`). A build the domain gave up still counts while its teardown runs: the bytes
+/// reached the relay.
+#[derive(Debug, Default)]
+pub struct ReceivedBytes(AtomicU64);
+
+impl ReceivedBytes {
+    pub fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn total(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 /// A window's length (the field definitions above: "the last complete 1 s window").
 pub const STATS_WINDOW: Duration = Duration::from_secs(1);

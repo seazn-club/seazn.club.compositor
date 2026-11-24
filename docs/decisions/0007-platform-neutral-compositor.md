@@ -54,6 +54,13 @@ Web's runner driver passes the key only when web's own `RELAY_AIRINGS` is exactl
 (`apps/web/src/server/relay/runner-fly.ts`, R4 PR A). Otherwise the key is absent. A sibling driver for another host
 owes the same pass-through. The table above is left as accepted. See `docs/_INDEX.md`, Decision log, 2026-11-01.
 
+**Amended in part (2026-11-24, C2, S4).** A second optional key, `RELAY_INPUT_BEAT`, puts the camera as the relay
+receives it on the heartbeat (`inputGiveUpReason`, `inputGiveUpGen`, `inputReceivedFps`, `inputReceivedKbps`). Its
+values are `RELAY_AIRINGS`' (absent, empty or `0`: off, the run unchanged; `1`: on; anything else: exit 78), and it is
+read from env the same way. It is independent of `RELAY_AIRINGS`. Web's heartbeat is strict, so a host driver passes it
+only once web declares the four keys (web task T44); until then the key is absent. The compositor writes its
+`input give up` and `input received` log lines whatever the key says. See `docs/_INDEX.md`, Decision log, 2026-11-24.
+
 Equivalents for item 5: Fly `restart: on-failure, max_retries: 2`; Docker
 `--restart on-failure:2`; Kubernetes Job `backoffLimit: 2` + `restartPolicy: OnFailure`; Nomad
 `restart { attempts = 2 }`; Cloud Run jobs `maxRetries: 2`.

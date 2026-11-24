@@ -115,6 +115,7 @@ pub use crate::input_threads::WorkerCounts;
 use crate::input_threads::{role_counts, task_counts};
 use crate::input_threads::{task_pool, TaskRole, BUILDS};
 use crate::redact::{percent_encoded, Scrubber};
+use crate::stats::ReceivedBytes;
 
 /// The leaky queue before the video decoder holds at most 1 s (plan, Global Constraints: "decoded video
 /// 1 s … leaky, dropping the oldest"; the C10 brief puts it between the demuxer and the decoder).
@@ -331,6 +332,8 @@ pub struct GstInput {
     refused_rebuilds: u64,
     /// Events this (the driver's) thread could not deliver: the inbound channel was full.
     events_dropped: u64,
+    /// The bytes every build's `srtsrc` has put out (C2, S4; `with_received_bytes`).
+    received: Arc<ReceivedBytes>,
 }
 
 /// One generation's pipeline.
@@ -387,9 +390,17 @@ impl GstInput {
             stopped: false,
             refused_rebuilds: 0,
             events_dropped: 0,
+            received: Arc::new(ReceivedBytes::default()),
         };
         input.preload();
         input
+    }
+
+    /// Counts every build's bytes out of `srtsrc` into `received` (C2, S4), shared with the metrics
+    /// (`ProcMetrics::with_camera`). Call it before the first `rebuild`.
+    pub fn with_received_bytes(mut self, received: Arc<ReceivedBytes>) -> Self {
+        self.received = received;
+        self
     }
 
     /// Loads every factory's plugin now: a plugin's first use otherwise loads it inside `make`, on
@@ -635,6 +646,23 @@ impl GstInput {
                 },
             )
             .ok_or("the source's byte probe was refused")?;
+        // C2 (S4): every byte out of the source, counted for the beat's `inputReceivedKbps`. A probe
+        // of its own, for the build's life: the media probe above removes itself.
+        let received = Arc::clone(&self.received);
+        src.static_pad("src")
+            .ok_or("srtsrc has no src pad")?
+            .add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_, info| {
+                    match &info.data {
+                        Some(gst::PadProbeData::Buffer(b)) => received.add(b.size() as u64),
+                        Some(gst::PadProbeData::BufferList(l)) => received.add(l.calculate_size() as u64),
+                        _ => {}
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            )
+            .ok_or("the source's received-bytes probe was refused")?;
         let demux = make("tsdemux", "demux")?;
 
         let vqueue = leaky_queue("vqueue", VIDEO_QUEUE_NS)?;
