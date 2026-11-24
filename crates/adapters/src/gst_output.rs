@@ -20,8 +20,9 @@
 //! nothing, at the gate or after it, ends with the encoders (`release_unsent`).
 //!
 //! **One exception: the encoder's first frames** (Owed 112). A sink that can send only after the
-//! encoder's first frames, while the ring still holds all of them and at most
-//! `FIRST_GOP_CATCH_UP_MAX_MS` of them, starts at the encoder's first keyframe and asks nothing:
+//! encoder's first frames, while the ring still holds all of them, at most
+//! `FIRST_GOP_CATCH_UP_MAX_MS` of them and under `OUTPUT_QUEUE_BYTES` a track, starts at the
+//! encoder's first keyframe and asks nothing (a bounded exception to Owed 84, pending the owner):
 //! dropping them would hold the stream to F-036's floor after frame 0, a head outage of up to 2.2 s.
 //!
 //! **Progress** (Owed 13). A poll every `OUTPUT_PROGRESS_POLL_MS` reads the sink's bytes-SENT total,
@@ -777,8 +778,9 @@ impl Feeder {
     /// owed to it (whatever the ring holds predates any connect), so `release_unsent`.
     ///
     /// Owed 112: when the ring holds only the encoder's first frames, at most
-    /// `FIRST_GOP_CATCH_UP_MAX_MS` of them (`first_gop_backlog`), they are taken out of it under the
-    /// same lock, so the ring cannot drop the first keyframe before the feeder sends it.
+    /// `FIRST_GOP_CATCH_UP_MAX_MS` of them (`first_gop_backlog`) and under `OUTPUT_QUEUE_BYTES` a
+    /// track (`first_gop_over_queue`), they are taken out of it under the same lock, so the ring
+    /// cannot drop the first keyframe before the feeder sends it.
     fn reconnect_point(&self) -> Option<Reconnect> {
         let since = Instant::now();
         loop {
@@ -793,7 +795,16 @@ impl Feeder {
                 let serves_from = r.newest_video.map(|t| t + gst::ClockTime::from_nseconds(1));
                 let held = r.entries.iter().filter(|e| e.video).count();
                 let waited = since.elapsed().as_millis();
-                if let Some(backlog) = first_gop_backlog(&r.entries, r.encoded.video) {
+                let backlog = first_gop_backlog(&r.entries, r.encoded.video);
+                let over = backlog.and(first_gop_over_queue(&r.entries, sample_bytes));
+                if let (Some(_), Some(bytes)) = (backlog, over) {
+                    self.shared.log(&format!(
+                        "output gen={}: the encoder's first frames hold {bytes} B on one track, over \
+                         the output queue's {OUTPUT_QUEUE_BYTES} B (Owed 112), so they are dropped",
+                        self.gen
+                    ));
+                }
+                if let (Some(backlog), None) = (backlog, over) {
                     let first_gop = std::mem::take(&mut r.entries);
                     let seq = first_gop.front().map_or(r.next_seq, |e| e.seq);
                     drop(r);
@@ -974,6 +985,25 @@ pub(crate) fn first_gop_backlog<S>(
     let backlog = newest.saturating_sub(first.pts);
     let bound = gst::ClockTime::from_mseconds(FIRST_GOP_CATCH_UP_MAX_MS);
     (held == encoded_video && first.key && backlog <= bound).then_some(backlog)
+}
+
+/// Owed 112 (the C3b review's m2): the first-GOP entries go to the output at once, past
+/// `backed_up`'s check, so they are taken only when they fit what that check lets an output hold.
+/// Returns the larger track's bytes (`size` of each sample, summed per track) when it reaches
+/// `OUTPUT_QUEUE_BYTES`, as `backed_up` counts it; `None` when they fit.
+pub(crate) fn first_gop_over_queue<S>(entries: &VecDeque<Entry<S>>, size: impl Fn(&S) -> u64) -> Option<u64> {
+    let (mut video, mut audio) = (0u64, 0u64);
+    for e in entries {
+        let track = if e.video { &mut video } else { &mut audio };
+        *track += size(&e.sample);
+    }
+    let most = video.max(audio);
+    (most >= OUTPUT_QUEUE_BYTES).then_some(most)
+}
+
+/// A sample's bytes (`first_gop_over_queue`).
+fn sample_bytes(sample: &gst::Sample) -> u64 {
+    sample.buffer().map_or(0, |b| b.size() as u64)
 }
 
 /// `sample` with its PTS and DTS moved back by `base` (a shallow copy: the memory is shared).
@@ -1233,14 +1263,17 @@ mod tests {
     /// Owed 112: a sink that can send only after the encoder's first frames starts from the first
     /// keyframe when the ring still holds every video frame the encoder made and the newest is at
     /// most `FIRST_GOP_CATCH_UP_MAX_MS` after it; a frame more, and the backlog is dropped (Owed 84).
-    /// The bound in frames comes from `config` and the profile, not from the rule: 33 at 30 fps.
+    /// The bound in frames comes from `config` and the profile, not from the rule: 30 at 30 fps.
     /// Each start it takes is run through the `Picker` from the ring's oldest entry, as the feeder
     /// does, and must start at the encoder's first keyframe, its PTS the base.
     #[test]
     fn the_encoders_first_frames_within_the_bound_start_the_stream_from_its_first_keyframe() {
         let fps = u64::from(domain::config::OutputProfile::P720.fps);
         let bound = domain::config::FIRST_GOP_CATCH_UP_MAX_MS * fps / 1_000;
-        assert_eq!(bound, 33, "setup: the bound in frames at 30 fps");
+        assert_eq!(
+            bound, 30,
+            "setup: the bound in frames at 30 fps (one VBV, `config`)"
+        );
         let (mut taken, mut dropped) = (0, 0);
         for n in 1..=bound + 3 {
             let ring = first_frames(n);
@@ -1302,6 +1335,35 @@ mod tests {
         }
         eprintln!("refusals checked {checked}");
         assert_eq!(checked, 14);
+    }
+
+    /// Owed 112 (the C3b review's m2): first-GOP entries go out past `backed_up`, so they are taken
+    /// only under `OUTPUT_QUEUE_BYTES` a track, counted as `backed_up` counts it (each track on its
+    /// own, refused AT the cap). The samples here are seqs: odd ones video, even ones audio
+    /// (`first_frames`), so a size per kind.
+    #[test]
+    fn first_gop_entries_at_the_output_queue_are_not_taken() {
+        let cap = OUTPUT_QUEUE_BYTES;
+        let sized = |v: u64, a: u64| move |s: &u64| if s % 2 == 1 { v } else { a };
+        let mut checked = 0;
+        // (frames, video bytes each, audio bytes each, the larger track if refused)
+        for (n, v, a, want) in [
+            (1, cap - 1, 0, None),
+            (1, cap, 0, Some(cap)),
+            (1, 0, cap, Some(cap)),
+            // Each track under the cap, their sum over it: not backed up.
+            (1, cap / 2 + 1, cap / 2 + 1, None),
+            // Spread over the bound's frames: 30 at 30 fps.
+            (30, cap / 30, 1, None),
+            (30, cap / 30 + 1, 1, Some(30 * (cap / 30 + 1))),
+            (0, cap, cap, None),
+        ] {
+            let got = first_gop_over_queue(&first_frames(n), sized(v, a));
+            assert_eq!(got, want, "{n} frames of {v} B video, {a} B audio");
+            checked += 1;
+        }
+        eprintln!("queue sizes checked {checked}");
+        assert_eq!(checked, 7);
     }
 
     #[test]
