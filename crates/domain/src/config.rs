@@ -280,8 +280,17 @@ pub const CAMERA_GOP_MS: Ms = 3_000;
 /// leg. The bound: one phone GOP (`CAMERA_GOP_MS`), so a decoder that waits a GOP for its keyframe
 /// still has room, and one SRT latency (`input_srt_latency_ms`, F-002's 1 000 ms), the burst
 /// libsrt releases after a network pause. A decoder wedged past it blocks the pull, and the stall
-/// rule rebuilds it (the bytes stop with it, so no decode wait extends it).
+/// rule rebuilds it (the bytes stop with it, so no decode wait extends it). A full queue blocks
+/// tsdemux, so the camera's audio stops with its video until the decoder drains or the rebuild.
+// `+ 1_000` is `input_srt_latency_ms` (a `const` cannot read `Thresholds::default()`):
+// `the_camera_video_queue_holds_a_phone_gop_and_one_srt_latency` pins the two equal.
 pub const CAMERA_VIDEO_QUEUE_MS: Ms = CAMERA_GOP_MS + 1_000;
+
+/// C3 (the C3 review's minor): the same queue's byte cap, GStreamer's own `max-size-bytes` default
+/// (10 MiB) set explicitly. Time is the bound (`CAMERA_VIDEO_QUEUE_MS`; the queue's buffer cap is
+/// off, since its default 200 would cut the bound to 3.3 s at 60 fps); the bytes are the backstop
+/// for buffers with no timestamp, and hold the 4 s at up to 20 Mbit/s.
+pub const CAMERA_VIDEO_QUEUE_BYTES: u32 = 10 * 1024 * 1024;
 
 /// C3 (S2 item 2), derived in one place: the stall rule's bound while bytes still arrive, the stall
 /// and one phone GOP (`Thresholds::input_decode_wait_ms`'s doc). A const fn, so the default and the
@@ -733,6 +742,10 @@ mod tests {
         assert_eq!(CAMERA_VIDEO_QUEUE_MS, CAMERA_GOP_MS + t.input_srt_latency_ms);
         assert!(t.input_srt_latency_ms > 0, "so the queue holds more than a GOP");
         assert!(CAMERA_VIDEO_QUEUE_MS < t.input_stall_after_ms);
+        // The byte backstop holds the whole bound at 20 Mbit/s (a phone's 1080p ceiling), so the
+        // time bound is the one that acts.
+        assert_eq!(CAMERA_VIDEO_QUEUE_BYTES, 10_485_760, "GStreamer queue's default");
+        assert!(u64::from(CAMERA_VIDEO_QUEUE_BYTES) * 8 * 1_000 / CAMERA_VIDEO_QUEUE_MS >= 20_000_000);
     }
 
     // C3 (S2 item 2): bytes count as still arriving for one SRT latency (F-002's 1 000 ms). The window

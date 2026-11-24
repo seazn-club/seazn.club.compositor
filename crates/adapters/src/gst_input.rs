@@ -98,7 +98,7 @@ use std::time::{Duration, Instant};
 
 use app::ports::{redacted_origin, Inbound, InputBytes, InputSource, InputSpec};
 use crossbeam_channel::Sender;
-use domain::config::{Thresholds, CAMERA_VIDEO_QUEUE_MS};
+use domain::config::{Thresholds, CAMERA_VIDEO_QUEUE_BYTES, CAMERA_VIDEO_QUEUE_MS};
 use domain::input_link::{BuildFacts, LossReason};
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -1390,12 +1390,15 @@ fn capsfilter(name: &str, caps: gst::Caps) -> Result<gst::Element, String> {
 }
 
 /// A queue that holds at most `max_ns` and then blocks its upstream (`leaky=no`, C3 S5 item 2): it
-/// drops nothing. Its buffer and byte caps stay at their defaults, a bound for buffers that carry no
-/// timestamp.
+/// drops nothing. Time is its bound: the buffer cap is off (its default 200 would cut 4 s to 3.3 s at
+/// 60 fps) and the byte cap is `CAMERA_VIDEO_QUEUE_BYTES`, the backstop for buffers with no
+/// timestamp (the C3 review). Blocking, it blocks tsdemux, so the audio waits with the video.
 fn blocking_queue(name: &str, max_ns: u64) -> Result<gst::Element, String> {
     let q = make("queue", name)?;
     q.set_property_from_str("leaky", "no");
     q.set_property("max-size-time", max_ns);
+    q.set_property("max-size-buffers", 0u32);
+    q.set_property("max-size-bytes", CAMERA_VIDEO_QUEUE_BYTES);
     Ok(q)
 }
 

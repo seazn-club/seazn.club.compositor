@@ -60,8 +60,9 @@
 //!
 //!   The nudge is cleared when it acts, or when a generation reaches Running.
 //! - **A generation taken back (C3, S2; Owed 49).** A generation the link gave up by its own rule
-//!   (`Abandon`: the stall rule, the connect timeout, the nudge's discard) keeps its pipeline up,
-//!   gated, until the rebuild a back-off later. If that build delivers a decoded frame before the
+//!   (`Abandon`: the stall rule, the connect timeout) keeps its pipeline up, gated, until the rebuild
+//!   a back-off later. The nudge's discard is never taken back: its rebuild is due at once (a zero
+//!   back-off), so no frame can come before it (the C3 review). If that build delivers a decoded frame before the
 //!   rebuild is due (`on_again`, the adapter's report of a frame at its shut gate), the link takes it
 //!   back: Running again from that instant, no rebuild, and `InputAction::TakeBack` asks the adapter
 //!   to re-open its gate. The window is the back-off itself, `until`: a pull that stays silent is
@@ -377,8 +378,8 @@ impl InputLink {
             InputState::Connecting { .. } if !self.media && self.discard_armed => {
                 self.discard_armed = false;
                 let gen = self.generation;
+                // Not `abandoned`: the rebuild is due now, so there is no window to take it back in.
                 self.give_up(now, 0, GiveUpReason::PhoneLiveDiscard, t);
-                self.abandoned = true;
                 Some(InputAction::Abandon { gen })
             }
             InputState::Connecting { .. } | InputState::Running { .. } => None,

@@ -1356,6 +1356,14 @@ fn the_pipeline_is_built_with_the_plans_bounds() {
         assert_eq!(el(queue).property::<u64>("max-size-time"), ns, "{queue}");
         checked += 1;
     }
+    // The blocking queue's other caps (the C3 review): no buffer cap (time is the bound), GStreamer's
+    // default byte cap set explicitly as the backstop.
+    let vq = el("vqueue");
+    assert_eq!(vq.property::<u32>("max-size-buffers"), 0);
+    assert_eq!(
+        vq.property::<u32>("max-size-bytes"),
+        domain::config::CAMERA_VIDEO_QUEUE_BYTES
+    );
     for sink in ["vsink", "asink"] {
         let s = el(sink);
         assert_eq!(s.property::<u32>("max-buffers"), 2, "{sink}");

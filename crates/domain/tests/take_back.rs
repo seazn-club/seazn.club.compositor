@@ -338,8 +338,9 @@ fn only_an_abandoned_current_build_is_taken_back() {
     assert_eq!(checked, 7);
 }
 
-// The connect timeout and the phone-live discard are the link's own give-ups too: a build that
-// delivers inside their back-off is taken back. A latched nudge's back-off is zero, so it never is.
+// The connect timeout is the link's own give-up too: a build that delivers inside its back-off is
+// taken back. The phone-live discard's back-off is zero, so it never is, even a frame the same
+// instant (`a_phone_live_discard_is_never_taken_back`).
 #[test]
 fn every_own_rule_give_up_can_be_taken_back() {
     let th = t();
@@ -361,6 +362,35 @@ fn every_own_rule_give_up_can_be_taken_back() {
     l.on_tick(0, &th);
     l.on_lost(500, 1, LossReason::Eos, &th);
     assert_eq!(l.on_again(600, 1), None);
+}
+
+// The nudge's discard of a connect with no byte: its rebuild is due at once, so a frame of the
+// discarded build, the same instant or later, is never taken back, and the next tick builds.
+#[test]
+fn a_phone_live_discard_is_never_taken_back() {
+    let th = t();
+    let mut l = InputLink::new();
+    l.on_tick(0, &th);
+    l.on_phone_live_edge(1);
+    l.on_phone_live_edge(2);
+    let at = 500;
+    assert_eq!(l.check_nudge(at, &th), Some(InputAction::Abandon { gen: 1 }));
+    assert_eq!(
+        l.last_give_up().map(|g| g.reason),
+        Some(GiveUpReason::PhoneLiveDiscard)
+    );
+    let mut checked = 0;
+    for again in [at, at + 1, at + 300] {
+        let mut probe = l.clone();
+        assert_eq!(probe.on_again(again, 1), None, "a frame at {again}");
+        checked += 1;
+    }
+    assert!(matches!(
+        l.on_tick(at, &th),
+        Some(InputAction::Rebuild { gen: 2 })
+    ));
+    eprintln!("discard instants checked: {checked}");
+    assert_eq!(checked, 3);
 }
 
 // The brief's third: a take-back, then a second stall. The same generation is given up again (the
