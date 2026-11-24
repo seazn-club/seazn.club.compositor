@@ -39,8 +39,10 @@ fn feed_index(f: Feed) -> usize {
 /// §4.2, §6), not from `PROGRAMME_TABLE`. Rows follow `PHASES`, columns follow `FEEDS`.
 /// - Waiting: only 1 s of continuous frames takes it live; a never-live input never shows the
 ///   reconnecting slate.
-/// - Live: 0.5 s with no frame freezes it; 3 s with no frame slates it (a stalled tick skips Frozen).
-/// - Frozen: frames resuming take it live at once, however short the run; 3 s with no frame slates.
+/// - Live: 0.5 s with no frame freezes it; `slate_after_ms` with no frame slates it (a stalled tick
+///   skips Frozen).
+/// - Frozen: frames resuming take it live at once, however short the run; `slate_after_ms` with no
+///   frame slates.
 /// - Reconnecting: only 1 s of continuous frames takes it live.
 /// - Final: overlay templates spec 2026-10-15 §6, C06 row: Final is terminal and wins over every
 ///   camera state.
@@ -380,16 +382,18 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
         row_hits: vec![0; PROGRAMME_TABLE.len()],
         ..Seen::default()
     };
-    // Durations and intervals sit on and beside each threshold (500, 3 000, 1 000), so the ±1 ms
-    // boundaries are reached by the schedule rather than set up by hand.
+    // Durations and intervals sit on and beside each threshold (500, the slate's, 1 000), so the
+    // ±1 ms boundaries are reached by the schedule rather than set up by hand. The slate's is read
+    // from the default (4 500 since the owner's ruling of 2026-11-24), so its edges move with it.
+    let s = t.slate_after_ms;
     let on_durations = [100, 499, 500, 501, 600, 999, 1_000, 1_001, 1_500, 3_000];
     let frame_intervals = [1, 10, 33, 34, 100, 250, 499, 500, 501];
-    let off_durations = [100, 499, 500, 501, 999, 1_000, 1_001, 2_999, 3_000, 3_001, 4_000];
+    let off_durations = [100, 499, 500, 501, 999, 1_000, 1_001, s - 1, s, s + 1, s + 1_000];
     let tick_intervals = [1, 10, 33, 34, 100];
-    let stalls = [2_999, 3_000, 3_001, 4_000];
-    let late_by = [1, 50, 100, 200, 300, 400, 499, 600, 5_000];
+    let stalls = [s - 1, s, s + 1, s + 1_000];
+    let late_by = [1, 50, 100, 200, 300, 400, 499, 600, s + 2_000];
     let continue_by = [1, 100, 250, 400, 499, 500];
-    let early_by = [1, 100, 499, 500, 501, 2_999, 3_000, 3_001];
+    let early_by = [1, 100, 499, 500, 501, s - 1, s, s + 1];
     for _case in 0..CASES {
         let mut sim = Sim {
             p: Programme::default(),
@@ -516,8 +520,9 @@ fn programme_matches_the_reference_model_over_generated_schedules() {
 
 // ---- the PDF timing budgets, in both output modes, at every grid phase ----
 
-/// Spec §6 budgets: "slate after camera loss ≤ 3.1 s; return to live ≤ 1.2 s".
-const SLATE_BUDGET_MS: Ms = 3_100;
+/// Spec §6 budgets: "slate after camera loss ≤ 3.1 s; return to live ≤ 1.2 s". The slate's moved
+/// with the owner's 4.5 s slate (2026-11-24): `Thresholds::slate_budget_ms`, the threshold and the
+/// PDF's 100 ms.
 const LIVE_BUDGET_MS: Ms = 1_200;
 
 /// The documented cost of measuring "1 s of continuous frames" as the span of the frames received
@@ -582,7 +587,7 @@ fn check_outage(
         .iter()
         .find(|&&f| f >= back)
         .expect("frames after the return");
-    // From the schedule alone: does any tick fall where the latest frame is ≥ 3 s old?
+    // From the schedule alone: does any tick fall where the latest frame is `slate_after_ms` old?
     let expect_slate = ticks
         .iter()
         .any(|&n| n >= last_before + t.slate_after_ms && n < first_after);
@@ -624,11 +629,12 @@ fn check_outage(
     let slated = match first_at(loss, FrameChoice::Slate(SlateKind::Reconnecting)) {
         Some(slate) => {
             let slate = slate - last_before;
-            assert!(expect_slate, "{ctx}: slate at +{slate} with no 3 s gap");
+            assert!(expect_slate, "{ctx}: slate at +{slate} with no slate-long gap");
             assert!(slate >= t.slate_after_ms, "{ctx}: slate at +{slate}");
             assert!(
-                slate <= SLATE_BUDGET_MS,
-                "{ctx}: PDF budget slate ≤ 3.1 s, got +{slate}"
+                slate <= t.slate_budget_ms(),
+                "{ctx}: the slate's budget {} ms, got +{slate}",
+                t.slate_budget_ms()
             );
             assert!(
                 back_live - first_after >= t.resume_after_ms,
@@ -638,7 +644,7 @@ fn check_outage(
             true
         }
         None => {
-            assert!(!expect_slate, "{ctx}: a 3 s gap and no slate");
+            assert!(!expect_slate, "{ctx}: a slate-long gap and no slate");
             assert!(
                 back_live - first_after <= tick_step,
                 "{ctx}: resume took {}",
@@ -665,13 +671,26 @@ fn the_pdf_budgets_hold_in_both_modes_at_every_grid_phase() {
     // Per gap row: cases, slated cases, worst live latency from the first returned frame and from
     // the return, and the cases past the 1.2 s budget.
     let mut rows = [(0usize, 0usize, 0, 0, 0usize); GAP_ROWS.len()];
+    // Around the slate's threshold, read from the default (4.5 s since the owner's ruling of
+    // 2026-11-24), so the edge cases move with it.
+    let s = t.slate_after_ms;
     let outages = [
-        600, 1_000, 2_000, 2_900, 2_990, 3_000, 3_010, 3_100, 3_500, 5_000, 10_000,
+        600,
+        1_000,
+        2_000,
+        s - 100,
+        s - 10,
+        s,
+        s + 10,
+        s + 100,
+        s + 500,
+        s + 2_000,
+        10_000,
     ];
     let loss = 5_000;
     // The gap rows need less timeline: an earlier loss and 2 s after the return still cover the
     // first live, the freeze, the slate and the return.
-    let (gap_outages, gap_loss) = ([1_000, 3_500], 2_000);
+    let (gap_outages, gap_loss) = ([1_000, s + 500], 2_000);
     let step30 = OutputProfile::P720.frame_period_ms().ceil() as Ms;
     for profile in [OutputProfile::P720, OutputProfile::P1080] {
         let period = profile.frame_period_ms();

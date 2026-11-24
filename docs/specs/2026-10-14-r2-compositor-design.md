@@ -23,7 +23,7 @@ the other side with Seazn's live scoreboard on it.
 Success, in the PDF's ranked order (a higher rank wins a conflict):
 
 1. **The output never stops.** Constant-rate frames for the whole event. When the camera drops, a
-   slate appears within 3 s with the score still on screen. No single process failure ends the
+   slate appears within 3 s (4.5 s since the owner's ruling of 2026-11-24, below) with the score still on screen. No single process failure ends the
    broadcast.
 2. **Bounded resources.** Every buffer has a limit, and memory stays flat over a 3 h soak (~~±10 %~~
    ±40 %, and its growth projected to the 5 h session cap stays within half the production guest's memory:
@@ -101,7 +101,10 @@ On every programme tick (1/fps), the domain picks a `FrameChoice`:
 - `Repeat`: the last camera frame, for as long as the programme is `Frozen` (from 0.5 s with no
   frame until the 3 s slate threshold). The PDF's scheduler paragraph says "up to 1 s", but its
   state machine and timing budget put the slate at 3 s. The state machine wins (owner ruling: the
-  PDF tables are adopted as written).
+  PDF tables are adopted as written). **Amended 2026-11-24** (the owner's ruling, "keep the frozen
+  picture, 4.5 s slate"; C3, `docs/_INDEX.md`): the slate threshold is 4.5 s, one 3 s phone GOP and a
+  margin, so a decoder that holds the last good picture to the next keyframe (`output-corrupt=false`,
+  Owed 48) never slates; the budget below moves with it.
 - `Slate(kind)`: waiting or reconnecting
 
 The CEF layer is composited on top of whichever one is picked, so the score bug is on screen in every
@@ -158,7 +161,7 @@ can be enumerated in tests.
 
 | Sub-machine | States | Key transitions (defaults from `config.rs`) |
 |---|---|---|
-| `Programme` | `Waiting → Live → Frozen → Reconnecting` | Waiting→Live after 1 s of continuous frames. Live→Frozen after 0.5 s with no frame. Frozen→Reconnecting after 3 s. Back to Live after 1 s continuous (hysteresis). |
+| `Programme` | `Waiting → Live → Frozen → Reconnecting` | Waiting→Live after 1 s of continuous frames. Live→Frozen after 0.5 s with no frame. Frozen→Reconnecting after 3 s (4.5 s since 2026-11-24, the owner's ruling). Back to Live after 1 s continuous (hysteresis). |
 | `InputLink` | `Connecting → Running → Backoff(n)` | Backoff 1 s → 10 s cap, retried forever. A reader kick or EOS counts as one kick. More than 3 kicks in 5 min raises an alert flag. |
 | `OutputLink` | `Connected → Reconnecting → Stalled` | A sink error leads to `SwapSink`; a destination that stops taking bytes fails the sink's own socket wait after 5 s (rtmp2sink `timeout`, set explicitly). A reconnect is expected to complete within 5 s. **Amended 2026-10-24** (owner ruling "A", `docs/_INDEX.md` Owed 87): no progress or ack rule; a sink that sends nothing and never errors is not swapped (Owed 94). **Amended 2026-10-25** (owner ruling "B", `docs/_INDEX.md` Owed 94): one backstop, not a stall rule. A sink whose egress stays flat for `output_egress_flat_ms` while both encoded tracks keep growing is swapped (`SwapReason::EgressStalled`, the log word `egress_stalled`), and the beat reads `stalled` until the new sink earns Connected. The threshold is one derived constant (`config.rs` `output_egress_flat_ms`: the 15 s outage target less one connect's worst case, the back-off, one progress poll and two widest ticks, floored to the poll: 9 000 ms; owner, 2026-10-25, in chat, relayed by the coordinator, "Apply rec": 9 s, keeps the worst outage under 15 s). It sits above the sink timeout plus the back-off, so a socket wait that outlasts the timeout still reaches the sink's own error first; a multi-wake trickle, whose every wait is under the timeout, never errors, and there the backstop is the only detector (`docs/_INDEX.md` false premises, 2026-10-25, P-3). A starved encoder restarts its clock. |
 | `Graphics` | `Loading → Ready → Recycling \| Failed` | A CEF crash or hang leads to restart with backoff, holding the last frame. Three failures in 5 min lead to `Failed`: the overlay is reported as failed, and video continues **without waiting on the browser**. Scheduled recycle every 2 h. |
@@ -252,7 +255,7 @@ adjustments below.
 
 | Failure | R2 behaviour | Recovery target |
 |---|---|---|
-| Camera loss | Frozen after 0.5 s, slate after 3 s, reconnect forever. iOS backgrounding makes this **normal operation**: it gets soaked, not just edge-tested. | Live 1.2 s after frames return |
+| Camera loss | Frozen after 0.5 s, slate after 3 s (4.5 s since 2026-11-24, the owner's ruling), reconnect forever. iOS backgrounding makes this **normal operation**: it gets soaked, not just edge-tested. | Live 1.2 s after frames return |
 | CF closes SRT playback (second reader, maintenance) | Treated as camera loss. The peer's close reason is logged. More than 3 in 5 min raises an alert flag. | as above |
 | Output disconnect / stall | Sink swapped behind a 2 s leaky queue. Input and graphics untouched. | ≤5 s, ≤2 s of programme lost. **Amended 2026-11-24** (the owner's apply-rec ruling, the C1 review's I2(a), `docs/_INDEX.md`): the reconnect reads ≤5 s + forced-key floor (F-036), 7.2 s: the new sink starts at the keyframe its swap asks for, held 2.2 s after the encoder's last. |
 | Encoder overrun | Drop frames before the encoder (`droppedFrames`), then step down the `DegradeLadder` (one rung, overlay at half rate; amended 2026-10-18, Owed 20). The score is never removed. In production a step down is a sizing alarm: raise the Machine size. | Real time within 10 s |
@@ -266,7 +269,7 @@ adjustments below.
 **Bounds at 720p30:** decoded video queue 1 s, encoded output queue 2 s, audio 400 ms. All are leaky
 and drop the oldest. CEF is capped at about 600 MB. CPU ≤70 % sustained across 4 vCPU.
 
-**Budgets:** input frame→encoder ≤150 ms; slate after camera loss ≤3.1 s; return to live ≤1.2 s;
+**Budgets:** input frame→encoder ≤150 ms; slate after camera loss ≤4.6 s (amended 2026-11-24, the owner's ruling "keep the frozen picture, 4.5 s slate": the 4.5 s threshold and the PDF's 100 ms; ≤3.1 s before); return to live ≤1.2 s;
 output reconnect ≤5 s; score event on screen by the next frame after its scheduled time.
 **Amended 2026-11-24** (the owner's apply-rec ruling, the C1 review's I2(a), `docs/_INDEX.md`): the reconnect budget is ≤5 s + forced-key floor (F-036), 7.2 s
 (`BUDGET_OUTPUT_RECONNECT_MS`).

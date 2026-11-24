@@ -380,7 +380,8 @@ fn camera_drop_repeats_then_slates_through_the_real_driver() {
         now += 33;
     }
     let stop = now;
-    while now < stop + 4_000 {
+    // Past the slate's threshold (4.5 s since the owner's ruling of 2026-11-24), from the default.
+    while now < stop + th().slate_after_ms + 1_000 {
         d.tick_due(now);
         now += 33;
     }
@@ -430,8 +431,11 @@ fn phase_is_published_on_change_only_with_a_rising_seq() {
     let period = OutputProfile::P720.frame_period_ms().round() as u64;
     // Spec §5's walk: frames until Live, a stop past frozen_after_ms then slate_after_ms, frames past
     // resume_after_ms, an Ending reply, then the hold and the drain.
+    // The stop ends halfway between the slate and the stall rule (harness case 2's pause), so the
+    // slate goes up and generation 1 is never given up: since the owner's 4.5 s slate (2026-11-24)
+    // a second past the slate is past the 5 s stall.
     let stop = SESSION_AT + t.resume_after_ms + 1_000;
-    let back = stop + t.slate_after_ms + 1_000;
+    let back = stop + (t.slate_after_ms + t.input_stall_after_ms) / 2;
     let ending = back + t.resume_after_ms + 500;
     let back_until = ending + 500;
     // The camera connects first (C10b: frames of an input given up at its connect timeout count for
@@ -524,9 +528,10 @@ fn a_phase_change_is_logged_once_and_rides_the_next_beat_through_the_driver() {
                 ..session_720p()
             },
         );
-        // Frames until Live, a stop past the slate, frames back past a return.
+        // Frames until Live, a stop past the slate (and short of the stall rule, which a second past
+        // the 4.5 s slate would reach), frames back past a return.
         let stop = SESSION_AT + t.resume_after_ms + 1_000;
-        let back = stop + t.slate_after_ms + 1_000;
+        let back = stop + (t.slate_after_ms + t.input_stall_after_ms) / 2;
         let end = back + t.resume_after_ms + 2_000;
         let mut events = vec![(SESSION_AT, ev(Event::InputConnected { gen: 1 }))];
         events.extend(every(SESSION_AT, stop, period, || frame(1)));

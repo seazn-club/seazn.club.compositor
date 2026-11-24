@@ -54,7 +54,8 @@ These apply to every task. Values are copied from the spec and ADRs.
 - **Output:** 720p30 by default (`1280×720`, 30 fps, 4000 kbps), with a 1080p30 flag (`1920×1080`,
   30 fps, 6000 kbps). CEF always renders the page at `1920×1080`.
 - **Programme thresholds:** Frozen at 0.5 s with no frame; slate at 3 s; back to live after 1 s of
-  continuous frames. The score layer is on in every state.
+  continuous frames. The score layer is on in every state. (Amended 2026-11-24, C3: the owner's
+  ruling "keep the frozen picture, 4.5 s slate": the slate is at 4.5 s, its budget 4.6 s.)
 - **Input backoff:** 1 s → 10 s cap, retried forever. A kick alert fires at **more than** 3 kicks in
   5 min. (Amended 2026-11-24, C2: the cap is 4 s, F-036 D4.)
 - **Output:** stall when no bytes are acked for 5 s. Reconnect within 5 s. Encoded ring buffer 2 s,

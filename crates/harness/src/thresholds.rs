@@ -16,8 +16,13 @@ use domain::config::{
 };
 use serde_json::{json, Map, Value};
 
-/// Spec §6 "Budgets": "slate after camera loss ≤3.1 s".
-pub const BUDGET_SLATE_AFTER_LOSS_MS: u64 = 3_100;
+/// Spec §6 "Budgets": "slate after camera loss ≤3.1 s", amended 2026-11-24 with the owner's 4.5 s
+/// slate ("keep the frozen picture, 4.5 s slate"; C3): the threshold and the PDF's 100 ms, so 4.6 s.
+/// Read from the domain's own declaration (`Thresholds::slate_budget_ms`), so the slate and its
+/// budget cannot drift apart; the spec's text is pinned to it below.
+pub fn budget_slate_after_loss_ms() -> u64 {
+    Thresholds::default().slate_budget_ms()
+}
 /// Spec §6 "Budgets": "return to live ≤1.2 s" (the failure table: "Live 1.2 s after frames return").
 pub const BUDGET_RETURN_TO_LIVE_MS: u64 = 1_200;
 /// Spec §6 "Budgets": "output reconnect ≤5 s", as the spec states it. Read as is where no keyframe
@@ -222,7 +227,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("reaper_kill_after_ms", json!(reaper_kill_after_ms));
     put("teardown_leak_after_ms", json!(teardown_leak_after_ms));
     // The budgets.
-    put("budget_slate_after_loss_ms", json!(BUDGET_SLATE_AFTER_LOSS_MS));
+    put("budget_slate_after_loss_ms", json!(budget_slate_after_loss_ms()));
     put("budget_return_to_live_ms", json!(BUDGET_RETURN_TO_LIVE_MS));
     put("budget_output_reconnect_ms", json!(BUDGET_OUTPUT_RECONNECT_MS));
     put("spec_output_reconnect_ms", json!(SPEC_OUTPUT_RECONNECT_MS));
@@ -360,7 +365,7 @@ mod tests {
         for p in BOTH_MODES {
             let f = p.frame_period_ms();
             assert!(
-                t.slate_after_ms as f64 + f <= BUDGET_SLATE_AFTER_LOSS_MS as f64,
+                t.slate_after_ms as f64 + f <= budget_slate_after_loss_ms() as f64,
                 "{p:?} slate"
             );
             assert!(
@@ -535,7 +540,7 @@ mod tests {
                 "slate after camera loss ≤",
                 " s",
                 1000.0,
-                ms(BUDGET_SLATE_AFTER_LOSS_MS),
+                ms(budget_slate_after_loss_ms()),
             ),
             (
                 &spec,

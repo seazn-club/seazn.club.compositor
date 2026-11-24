@@ -9,7 +9,12 @@ use crate::time::Ms;
 pub struct Thresholds {
     /// PDF robustness state machine: "no frame 0.5 s" → Frozen.
     pub frozen_after_ms: Ms,
-    /// PDF state machine "no frame 3 s" → Reconnecting slate; timing budget "slate ≤ 3.1 s".
+    /// PDF state machine "no frame 3 s" → Reconnecting slate; timing budget "slate ≤ 3.1 s". The
+    /// owner's ruling, 2026-11-24 (C3, S5 item 3: "keep the frozen picture, 4.5 s slate"): 4.5 s. The
+    /// phone publishes a 3 s GOP (C1, F-036), and with `avdec_h264`'s `output-corrupt=false` (Owed 48)
+    /// a lost reference holds the last good picture until the next keyframe, up to one GOP; at 3 s the
+    /// slate went up on every such freeze. One phone GOP and a 1.5 s margin, so a freeze that ends at
+    /// the GOP's keyframe never slates. The budget moves with it (`slate_budget_ms`).
     pub slate_after_ms: Ms,
     /// PDF: "a return to live requires 1 s of continuous frames".
     pub resume_after_ms: Ms,
@@ -31,7 +36,10 @@ pub struct Thresholds {
     /// relay gave up six connects in a row while the camera was back.
     pub input_connect_timeout_ms: Ms,
     /// Spec §6 "reconnect forever": a Running input that delivers no frame for this long is treated as
-    /// a Stalled loss and rebuilt. Set after the 3 s slate so the viewer sees the slate first. F-002
+    /// a Stalled loss and rebuilt. Set after the slate so the viewer sees the slate first (the slate
+    /// moved to 4.5 s by the owner's ruling of 2026-11-24, and this stays: `stall_comes_after_the_slate`
+    /// pins the gap at a tick at least, and the take-back (C3, S2) makes a stall that ends inside the
+    /// back-off cost no rebuild). F-002
     /// confirmed it is needed: CF holds a silent, encrypted playback socket open indefinitely after the
     /// phone stops publishing.
     pub input_stall_after_ms: Ms,
@@ -328,7 +336,19 @@ pub const FRAME_GRAB_WAIT_MS: Ms = 1_000;
 /// encode takes milliseconds, so this only bounds a stuck encoder.
 pub const FRAME_ENCODE_WAIT_MS: Ms = 2_000;
 
+/// The PDF's timing budget "slate ≤ 3.1 s" against its own 3 s threshold: the 100 ms the tick that
+/// sees the threshold may take. The owner's ruling of 2026-11-24 moved the threshold to 4.5 s and
+/// kept this slack, so the budget is the threshold and this (`Thresholds::slate_budget_ms`).
+pub const SLATE_BUDGET_SLACK_MS: Ms = 3_100 - 3_000;
+
 impl Thresholds {
+    /// The slate's budget (spec §6 "slate after camera loss", amended 2026-11-24 with the owner's
+    /// ruling): the reconnecting slate is on air at most this long after the last camera frame. The
+    /// threshold and the PDF's slack (`SLATE_BUDGET_SLACK_MS`), so a move of the threshold moves it.
+    pub fn slate_budget_ms(&self) -> Ms {
+        self.slate_after_ms + SLATE_BUDGET_SLACK_MS
+    }
+
     /// C2 (S3), derived: the least time between two heartbeats once a programme phase change asks
     /// for one before the cadence's (the "edge beat"). It is `resume_after_ms`, the shortest stay the
     /// programme table guarantees the reconnecting slate: a return needs that long of frames, all
@@ -350,7 +370,7 @@ impl Default for Thresholds {
         let (output_backoff_base_ms, output_connect_timeout_ms) = (500, 5_000);
         Self {
             frozen_after_ms: 500,
-            slate_after_ms: 3_000,
+            slate_after_ms: 4_500,
             resume_after_ms: 1_000,
             input_backoff_base_ms: 1_000,
             input_backoff_cap_ms: 4_000,
@@ -455,23 +475,41 @@ mod tests {
 
     const BOTH_MODES: [OutputProfile; 2] = [OutputProfile::P720, OutputProfile::P1080];
 
+    // The PDF state machine's frozen and resume numbers; the slate is the owner's ruling of
+    // 2026-11-24 ("keep the frozen picture, 4.5 s slate"): one 3 s phone GOP (C1, F-036) and a margin.
     #[test]
     fn programme_thresholds_match_the_pdf_state_machine() {
         let t = Thresholds::default();
         assert_eq!(
             (t.frozen_after_ms, t.slate_after_ms, t.resume_after_ms),
-            (500, 3_000, 1_000)
+            (500, 4_500, 1_000)
+        );
+        let phone_gop = 3_000;
+        assert!(
+            t.slate_after_ms > phone_gop,
+            "a freeze to the next keyframe must not slate"
         );
     }
 
-    // In both modes (ADR 0005) a tick may land one frame late, and the slate is still on screen by 3.1 s.
+    // In both modes (ADR 0005) a tick may land one frame late, and the slate is still on screen inside
+    // its budget: the PDF's 3.1 s for a 3 s threshold, so the threshold and 100 ms (4.6 s since the
+    // owner's ruling of 2026-11-24).
     #[test]
-    fn slate_lands_inside_the_3_1_s_budget_with_one_frame_of_tick_jitter() {
+    fn slate_lands_inside_its_budget_with_one_frame_of_tick_jitter() {
         let t = Thresholds::default();
+        assert_eq!(SLATE_BUDGET_SLACK_MS, 100, "the PDF's 3.1 s against its 3 s");
+        assert_eq!(
+            t.slate_budget_ms(),
+            4_500 + 100,
+            "the ruling's 4.5 s and the PDF's slack"
+        );
+        let mut checked = 0;
         for p in BOTH_MODES {
             let worst = t.slate_after_ms as f64 + p.frame_period_ms();
-            assert!(worst <= 3_100.0, "{p:?}: slate at {worst} ms");
+            assert!(worst <= t.slate_budget_ms() as f64, "{p:?}: slate at {worst} ms");
+            checked += 1;
         }
+        assert_eq!(checked, BOTH_MODES.len());
     }
 
     // C2 (S3): the edge beat's gap lets the slate's entry beat after a freeze; it is under the cadence
@@ -494,12 +532,26 @@ mod tests {
         );
     }
 
+    // The stall rule fires after the slate is on air: the slate goes up on the first tick at or past
+    // `slate_after_ms`, at most `TICK_WIDEST_MS` late, and the stall is read on a tick too, so the
+    // slate is on screen at least one tick before the input is given up. With the 4.5 s slate (the
+    // owner's ruling, 2026-11-24) the gap is 500 ms, a tick and more; the stall default stays 5 s.
     #[test]
-    fn input_stall_rebuild_comes_after_the_slate() {
+    fn stall_comes_after_the_slate() {
         let t = Thresholds::default();
         assert!(
             t.input_stall_after_ms > t.slate_after_ms,
             "viewers see the slate before the input is torn down"
+        );
+        assert!(
+            t.input_stall_after_ms >= t.slate_after_ms + TICK_WIDEST_MS,
+            "the slate is on air a tick before the stall: {} − {}",
+            t.input_stall_after_ms,
+            t.slate_after_ms
+        );
+        assert_eq!(
+            t.input_stall_after_ms, 5_000,
+            "spec §6's stall, unmoved by the slate ruling"
         );
     }
 
