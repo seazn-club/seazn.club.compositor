@@ -14,6 +14,17 @@ use crate::strip::{self, PlaneMut};
 
 /// The camera's frame rate.
 pub const FPS: u64 = 30;
+
+/// The camera's default GOP: a keyframe a second (the C13 brief's encoder).
+pub const DEFAULT_GOP_MS: u64 = 1_000;
+/// The GOPs fake-camera's `--gop-ms` takes (C3): one frame's worth at least, 10 s at most.
+pub const GOP_MS_RANGE: std::ops::RangeInclusive<u64> = 34..=10_000;
+
+/// A GOP of `gop_ms` in camera frames (x264's `key-int-max`), at least 1 (C3: the capture app's 3 s
+/// GOP, the C1 brief, is 90 frames at `FPS`).
+pub fn gop_frames(gop_ms: u64) -> u32 {
+    (gop_ms * FPS / 1_000).max(1) as u32
+}
 /// The longest burst accepted (its backlog lives in memory: counters only, frames drawn at push).
 pub const MAX_BURST_MS: u64 = 10_000;
 /// The largest picture (1080p, the compositor's largest profile).
@@ -322,6 +333,23 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // C3: the default GOP is C13's keyframe a second (`key-int-max` = FPS, as before the knob), the
+    // capture app's 3 s GOP (the C1 brief) is 3 s of frames, and the range's ends stay at least one.
+    #[test]
+    fn a_gop_in_ms_is_that_many_frames_at_the_camera_rate() {
+        let cases = [
+            (DEFAULT_GOP_MS, FPS),
+            (3_000, 3 * FPS),
+            (*GOP_MS_RANGE.start(), 1),
+            (*GOP_MS_RANGE.end(), 10 * FPS),
+        ];
+        for (ms, frames) in cases {
+            assert_eq!(u64::from(gop_frames(ms)), frames, "{ms} ms");
+        }
+        assert_eq!(gop_frames(0), 1, "never a zero key-int-max");
+        eprintln!("gops checked: {}", cases.len() + 1);
+    }
 
     #[test]
     fn controls_parse_and_bad_ones_are_refused() {

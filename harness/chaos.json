@@ -28,6 +28,7 @@
     {"n": 17, "case": "dest-stall-rule", "runs": 1},
     {"n": 18, "case": "output-hung", "variant": "hold", "runs": 1},
     {"n": 18, "case": "output-hung", "variant": "hang", "runs": 1},
-    {"n": 19, "case": "cef-blank", "runs": 1}
+    {"n": 19, "case": "cef-blank", "runs": 1},
+    {"n": 20, "case": "camera-gop-loss", "runs": 1}
   ]
 }

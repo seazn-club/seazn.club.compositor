@@ -327,9 +327,16 @@ pub enum CameraSink {
 
 /// x264's settings: the brief's 4 Mbit/s, a keyframe a second, and nothing that adds latency.
 pub fn x264enc() -> Result<gst::Element, String> {
+    x264enc_gop(DEFAULT_GOP_MS)
+}
+
+pub use crate::camera::{gop_frames, DEFAULT_GOP_MS, GOP_MS_RANGE};
+
+/// `x264enc`, with a keyframe every `gop_ms` (C3: the capture app's 3 s GOP, the C1 brief).
+pub fn x264enc_gop(gop_ms: u64) -> Result<gst::Element, String> {
     let enc = make("x264enc")?;
     enc.set_property("bitrate", 4_000u32);
-    enc.set_property("key-int-max", camera::FPS as u32);
+    enc.set_property("key-int-max", gop_frames(gop_ms));
     enc.set_property_from_str("tune", "zerolatency");
     enc.set_property_from_str("speed-preset", "ultrafast");
     Ok(enc)
@@ -391,6 +398,8 @@ pub struct CameraOptions {
     /// `mpegtsmux alignment`: TS packets per pushed buffer (fake-camera's `--ts-alignment`), 1 to 7
     /// (more than 7 would pass an SRT payload's 1 316 bytes).
     pub ts_alignment: u32,
+    /// The encoder's GOP in ms (fake-camera's `--gop-ms`, C3), in `GOP_MS_RANGE`.
+    pub gop_ms: u64,
 }
 
 impl Default for CameraOptions {
@@ -398,6 +407,7 @@ impl Default for CameraOptions {
         Self {
             audio: true,
             ts_alignment: TS_ALIGNMENT,
+            gop_ms: DEFAULT_GOP_MS,
         }
     }
 }
@@ -421,6 +431,9 @@ impl CameraPipeline {
                 "ts alignment {}: 1 to {TS_ALIGNMENT} packets a buffer",
                 opts.ts_alignment
             ));
+        }
+        if !GOP_MS_RANGE.contains(&opts.gop_ms) {
+            return Err(format!("gop {} ms: {GOP_MS_RANGE:?} ms", opts.gop_ms));
         }
         let layout = Layout::i420(w, h);
         check_layout(&layout)?;
@@ -448,7 +461,7 @@ impl CameraPipeline {
                 s
             }
         };
-        let encoder = x264enc()?;
+        let encoder = x264enc_gop(opts.gop_ms)?;
         let v: [gst::Element; 4] = [video.clone().upcast(), encoder.clone(), h264parse, make("queue")?];
         pipeline
             .add_many(v.iter().chain([&mux, &out]))

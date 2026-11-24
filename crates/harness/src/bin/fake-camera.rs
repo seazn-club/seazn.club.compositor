@@ -7,7 +7,7 @@
 //! ```text
 //! fake-camera --emit /out/emit.jsonl --listen 0.0.0.0:7001 --srt-host mediamtx --srt-port 8890 \
 //!   --stream-id publish:cam [--size 1280x720] [--pattern ball|snow|noise] [--latency-ms 200] \
-//!   [--wire /out/wire.jsonl] [--audio on|off] [--ts-alignment 1..7]
+//!   [--wire /out/wire.jsonl] [--audio on|off] [--ts-alignment 1..7] [--gop-ms 1000]
 //! ```
 //!
 //! `--wire` (Owed 81's probe) writes a line for every PES packet that starts in a buffer the camera
@@ -16,6 +16,8 @@
 //! camera SENT each frame from when it pushed it (`--emit`). `--audio off` (Owed 81's control)
 //! sends the video alone: no tone bursts, so the checker's A/V facts are empty on such a run.
 //! `--ts-alignment` (default 7, `media::TS_ALIGNMENT`) is the mux's TS packets per SRT payload.
+//! `--gop-ms` (default 1 000, `media::DEFAULT_GOP_MS`; C3) is the encoder's keyframe interval: 3 000
+//! is the capture app's GOP (the C1 brief).
 //!
 //! The SRT passphrase is `HARNESS_SRT_PASSPHRASE` (environment, never argv). A failed build (MediaMTX
 //! not up yet, a kicked publisher) is logged and rebuilt a second later; the counter keeps its pace
@@ -34,7 +36,7 @@ use harness::media::{self, CameraOptions, CameraPipeline, CameraSink, SentFn, Sr
 use harness::wire::{self, Stream};
 use serde_json::json;
 
-const FLAGS: [&str; 11] = [
+const FLAGS: [&str; 12] = [
     "--emit",
     "--listen",
     "--srt-host",
@@ -46,6 +48,7 @@ const FLAGS: [&str; 11] = [
     "--wire",
     "--audio",
     "--ts-alignment",
+    "--gop-ms",
 ];
 const REQUIRED: [&str; 5] = ["--emit", "--listen", "--srt-host", "--srt-port", "--stream-id"];
 /// How long a failed build waits before the next.
@@ -162,7 +165,14 @@ fn run() -> Result<(), (u8, String)> {
             .get("--ts-alignment")
             .map_or(Ok(media::TS_ALIGNMENT), |v| v.parse())
             .map_err(|_| (64, "--ts-alignment: a number".to_owned()))?,
+        gop_ms: a
+            .get("--gop-ms")
+            .map_or(Ok(media::DEFAULT_GOP_MS), |v| v.parse())
+            .map_err(|_| (64, "--gop-ms: a number".to_owned()))?,
     };
+    if !media::GOP_MS_RANGE.contains(&opts.gop_ms) {
+        return Err((64, format!("--gop-ms: {:?}", media::GOP_MS_RANGE)));
+    }
     // Refused here, before the first build: a build would refuse it every second forever.
     if !(1..=media::TS_ALIGNMENT).contains(&opts.ts_alignment) {
         return Err((64, format!("--ts-alignment: 1 to {}", media::TS_ALIGNMENT)));
@@ -205,10 +215,11 @@ fn run() -> Result<(), (u8, String)> {
         std::thread::spawn(move || controls(server, s, p));
     }
     println!(
-        "fake-camera: {w}x{h} {pattern:?} at {} fps (audio {}, ts alignment {}) to {}:{}; controls on {}",
+        "fake-camera: {w}x{h} {pattern:?} at {} fps (audio {}, ts alignment {}, gop {} ms) to {}:{}; controls on {}",
         camera::FPS,
         if audio { "on" } else { "off" },
         opts.ts_alignment,
+        opts.gop_ms,
         target.host,
         target.port,
         a["--listen"]

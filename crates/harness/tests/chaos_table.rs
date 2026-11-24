@@ -140,8 +140,8 @@ fn the_plan_names_every_chaos_case_and_expands_the_repeats() {
     assert_eq!(sorted, files, "chaos.json and harness/cases/*.sh disagree");
     assert_eq!(
         files.len(),
-        19,
-        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24), case 18 (Owed 94) and case 19 (Owed 99)"
+        20,
+        "the brief's 16 cases (amended 2026-10-20), case 17 (2026-10-24), case 18 (Owed 94), case 19 (Owed 99) and case 20 (C3, camera-gop-loss)"
     );
 
     let out = run(&["--legs", "all"]);

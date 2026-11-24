@@ -7,7 +7,7 @@ mod common;
 use common::{explain, slate, x264_round_trip, Rng};
 use harness::camera::{self, Layout, Pattern};
 use harness::checker::CAMERA_AAC_DELAY_MS;
-use harness::media::{scan_segment, CameraOptions, CameraPipeline, CameraSink, TS_ALIGNMENT};
+use harness::media::{scan_segment, CameraOptions, CameraPipeline, CameraSink, GOP_MS_RANGE, TS_ALIGNMENT};
 
 /// The brief's 1 000 random counters, each drawn on the ball picture; then the snow subset; then
 /// slates, which must read as no strip.
@@ -227,7 +227,11 @@ fn the_wire_probe_sees_every_frame_the_camera_sends_with_and_without_audio() {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let ts = dir.join("camera.ts");
-        let opts = CameraOptions { audio, ts_alignment };
+        let opts = CameraOptions {
+            audio,
+            ts_alignment,
+            ..CameraOptions::default()
+        };
         let mut cam =
             CameraPipeline::start_with(&CameraSink::File(ts.clone()), 1280, 720, Pattern::Ball, opts)
                 .unwrap();
@@ -311,6 +315,26 @@ fn a_ts_alignment_outside_one_to_seven_is_refused() {
         let e = CameraPipeline::start_with(&CameraSink::File(ts.clone()), 1280, 720, Pattern::Ball, opts)
             .expect_err("refused");
         assert!(e.contains("ts alignment"), "{e}");
+        refused += 1;
+    }
+    assert_eq!(refused, 2);
+    assert!(!ts.exists(), "nothing was built");
+}
+
+/// C3: a GOP outside `GOP_MS_RANGE` (under one frame, over 10 s) is refused before anything is built.
+#[test]
+fn a_gop_outside_its_range_is_refused() {
+    common::init();
+    let ts = std::env::temp_dir().join(format!("harness-gop-refused-{}.ts", std::process::id()));
+    let mut refused = 0;
+    for gop_ms in [*GOP_MS_RANGE.start() - 1, *GOP_MS_RANGE.end() + 1] {
+        let opts = CameraOptions {
+            gop_ms,
+            ..CameraOptions::default()
+        };
+        let e = CameraPipeline::start_with(&CameraSink::File(ts.clone()), 1280, 720, Pattern::Ball, opts)
+            .expect_err("refused");
+        assert!(e.contains("gop"), "{e}");
         refused += 1;
     }
     assert_eq!(refused, 2);
