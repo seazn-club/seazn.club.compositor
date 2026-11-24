@@ -172,10 +172,14 @@ in `crates/adapters/src/frame_store.rs`, and every slot is bounded.
     `h264parse config-interval=-1`. **(Amended 2026-11-24, F-036, the C1 brief:** Cloudflare errored
     the programme input for GOPs under 2 s (`ERR_GOP_OUT_OF_RANGE`). `key-int-max` = a fixed 3 s GOP
     in frames (`OutputProfile::gop_frames`, from `PROGRAMME_GOP_MS`), `option-string` adds
-    `scenecut=0`, and `min-force-key-unit-interval` = `FORCED_KEYFRAME_MIN_INTERVAL_MS` (2 s) holds
-    Owed 84's forced keyframe to Cloudflare's floor. Witnessed by
-    `every_keyframe_lands_on_the_gop_and_a_hard_cut_never_starts_one` and
-    `a_late_first_sink_starts_at_the_keyframe_after_its_swap_not_inside_the_ring`.)**
+    `scenecut=0`, and `min-force-key-unit-interval` = `FORCED_KEYFRAME_MIN_INTERVAL_MS` (2.2 s:
+    Cloudflare's 2 s floor and a 200 ms margin, the C1 review's I1) holds Owed 84's forced keyframe
+    past Cloudflare's floor; the request carries the reconnect point's running time, so a keyframe
+    made after it serves the swap. Witnessed by
+    `every_keyframe_lands_on_the_gop_and_a_hard_cut_never_starts_one`,
+    `a_late_first_sink_starts_at_the_keyframe_after_its_swap_not_inside_the_ring`,
+    `a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor` and
+    `a_keyframe_made_after_the_reconnect_point_serves_the_swap_and_none_is_forced_a_floor_on`.)**
   - **venc/aenc appsinks:** `sync=false`, with `emit-signals` or `set_callbacks`.
     `new_sample` → push into the encoded ring (`VecDeque<(gst::Sample, is_video)>`, capped at 2 s by
     PTS span).
