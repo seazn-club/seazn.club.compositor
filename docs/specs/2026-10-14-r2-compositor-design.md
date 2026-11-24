@@ -254,7 +254,7 @@ adjustments below.
 |---|---|---|
 | Camera loss | Frozen after 0.5 s, slate after 3 s, reconnect forever. iOS backgrounding makes this **normal operation**: it gets soaked, not just edge-tested. | Live 1.2 s after frames return |
 | CF closes SRT playback (second reader, maintenance) | Treated as camera loss. The peer's close reason is logged. More than 3 in 5 min raises an alert flag. | as above |
-| Output disconnect / stall | Sink swapped behind a 2 s leaky queue. Input and graphics untouched. | ≤5 s, ≤2 s of programme lost |
+| Output disconnect / stall | Sink swapped behind a 2 s leaky queue. Input and graphics untouched. | ≤5 s, ≤2 s of programme lost. **Amended 2026-11-24** (the owner's apply-rec ruling, the C1 review's I2(a), `docs/_INDEX.md`): the reconnect reads ≤5 s + forced-key floor (F-036), 7.2 s: the new sink starts at the keyframe its swap asks for, held 2.2 s after the encoder's last. |
 | Encoder overrun | Drop frames before the encoder (`droppedFrames`), then step down the `DegradeLadder` (one rung, overlay at half rate; amended 2026-10-18, Owed 20). The score is never removed. In production a step down is a sizing alarm: raise the Machine size. | Real time within 10 s |
 | CEF crash / hang | Hold the last overlay frame, restart with backoff. After 3 in 5 min, `graphics: failed`, and the camera goes out without the overlay. A hang is detected by the page's 2 s `seazn:alive` beat stopping for 10 s. A hang **hides the overlay at once** (no stale score), then restarts it. The overlay returns at the next page's ready (amended 2026-10-18, Owed 18; C05b; owner-approved design (2026-10-18); "at once" is the coordinator's reading of it). A crash below the count still holds the last frame, for at most 10 s, then hides until a reload is ready (amended 2026-10-18, C05b PR #22 review; coordinator decision derived from the owner-approved 10 s rule). Generalised the same day (the review's second round, coordinator decision): no overlay frame stays on air more than 10 s after the last ready or beat of the page that drew it, whether that page hung, crashed or was recycled and its reload has not come ready; the hide names which. | n/a |
 | Score feed stale | The page keeps the last state and signals `scoreStale` after 10 s. The compositor relays it in the heartbeat. | First good poll |
@@ -268,6 +268,8 @@ and drop the oldest. CEF is capped at about 600 MB. CPU ≤70 % sustained across
 
 **Budgets:** input frame→encoder ≤150 ms; slate after camera loss ≤3.1 s; return to live ≤1.2 s;
 output reconnect ≤5 s; score event on screen by the next frame after its scheduled time.
+**Amended 2026-11-24** (the owner's apply-rec ruling, the C1 review's I2(a), `docs/_INDEX.md`): the reconnect budget is ≤5 s + forced-key floor (F-036), 7.2 s
+(`BUDGET_OUTPUT_RECONNECT_MS`).
 
 Where the spike measures a different number, the measured number wins. The change is recorded in
 `config.rs` (with its F-id) and in `docs/_INDEX.md`.
@@ -374,7 +376,7 @@ Findings are recorded as F-ids in `_FINDINGS.md`, and `config.rs` numbers cite t
 | Camera stops 10 s, resumes | Slate ≤3.1 s, live ≤1.2 s after resume, no output gap |
 | Camera flaps every 5 s for 2 min | Output continuous; no state change faster than 1 s |
 | Relay kicks the reader every 20 s | Reconnect each time; alert flag after 3 kicks |
-| Destination disconnects 30 s | Reconnect ≤5 s after availability; ≤2 s lost; input untouched |
+| Destination disconnects 30 s | Reconnect ≤5 s after availability; ≤2 s lost; input untouched. **Amended 2026-11-24** (the owner's apply-rec ruling, the C1 review's I2(a), `docs/_INDEX.md`): the reconnect reads ≤5 s + forced-key floor (F-036), 7.2 s. |
 | Destination accepts but stalls | Detected ≤5 s; sink replaced |
 | CPU starved (another process at 100 %) | Frames dropped before encoder; clock holds; ladder steps down |
 | Score feed down 60 s | Last score stays; `scoreStale` reported; recovers on first poll |

@@ -3104,6 +3104,45 @@ const OWED84_MARGIN_TICKS: u64 = 10;
 /// encoder's own next keyframe could be a whole GOP away (F-036's 3 s, `OutputProfile::gop_frames`),
 /// so a sink that waited for it would lose up to 90 ticks.
 const OWED84_KEY_WAIT_TICKS: u64 = 6;
+
+// F-036 (the C1 re-review's m2): the GOP less the forced keyframe's floor leaves these tests their
+// margin and key wait, in both profiles, mirroring `config`'s bound. The compiler checks it, frames
+// counted as `OutputProfile`'s `frames_in` counts them (whole frames, rounded down), so raising the
+// floor, shortening the GOP or raising either tick constant fails the build of this file on any host
+// (clippy compiles it without GStreamer); `owed84_margins_fit_between_the_floor_and_the_gop` checks
+// the same through the profiles' own methods where the file runs.
+const _: () = {
+    let profiles = [OutputProfile::P720, OutputProfile::P1080];
+    let mut i = 0;
+    while i < profiles.len() {
+        let fps = profiles[i].fps as u64;
+        let gop = fps * PROGRAMME_GOP_MS / 1_000;
+        let floor = fps * FORCED_KEYFRAME_MIN_INTERVAL_MS / 1_000;
+        assert!(gop >= floor + OWED84_MARGIN_TICKS + OWED84_KEY_WAIT_TICKS);
+        i += 1;
+    }
+};
+
+#[test]
+fn owed84_margins_fit_between_the_floor_and_the_gop() {
+    let mut checked = 0;
+    for profile in [P720, OutputProfile::P1080] {
+        let (gop, floor) = (
+            u64::from(profile.gop_frames()),
+            u64::from(profile.forced_keyframe_min_frames()),
+        );
+        assert!(
+            gop >= floor + OWED84_MARGIN_TICKS + OWED84_KEY_WAIT_TICKS,
+            "{}p: GOP {gop} less floor {floor} frames under {} + {}",
+            profile.height,
+            OWED84_MARGIN_TICKS,
+            OWED84_KEY_WAIT_TICKS
+        );
+        checked += 1;
+    }
+    eprintln!("profiles checked: {checked}");
+    assert_eq!(checked, 2);
+}
 /// The most a received message may run ahead of real time, measured from the first frame received.
 /// A stale backlog runs at least a whole 2 s ring ahead (F-023: about 4 s); this covers the AAC
 /// encoder's lead on the video (about 60 ms) and the mux's interleave, and stays a quarter of a ring.
