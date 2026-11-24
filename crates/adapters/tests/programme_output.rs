@@ -3562,11 +3562,14 @@ fn publish_late(case: &str, profile: &OutputProfile, late: u64, total: u64, dir:
     }
 }
 
-/// Checks a leg that started at the encoder's first keyframe: the feeder said so and asked for no
-/// keyframe; the destination got every frame paced, the first a keyframe at PTS 0, the camera in
-/// each; its keyframes are the GOP's own (none forced a floor in); and the backlog came in no burst
-/// (Owed 84's bound, `OWED84_BURST_SLACK_MS`). Returns the frames checked.
-fn assert_first_gop_start(case: &str, leg: &LatePublish, total: u64, gop: u64) -> usize {
+/// Checks a leg that started at the encoder's first keyframe, `late` frames queued: the feeder said
+/// so and asked for no keyframe; the destination got every frame paced, the first a keyframe at PTS
+/// 0, the camera in each; its keyframes are the GOP's own (none forced a floor in); and nothing ran
+/// further ahead of real time than the backlog taken (the `late - 1` frame periods from the first
+/// keyframe to the newest; at the bound it is `FIRST_GOP_CATCH_UP_MAX_MS`, CI read 1 122 ms) and Owed
+/// 84's slack (`OWED84_BURST_SLACK_MS`), so no frame from before the encoder's first was sent.
+/// Returns the frames checked.
+fn assert_first_gop_start(case: &str, leg: &LatePublish, late: u64, total: u64, gop: u64) -> usize {
     let d = &leg.d;
     let keys = key_indexes(d);
     eprintln!(
@@ -3596,9 +3599,10 @@ fn assert_first_gop_start(case: &str, leg: &LatePublish, total: u64, gop: u64) -
         "{case}: the stream starts at frame 0"
     );
     assert_eq!(keys, vec![0, gop], "{case}: the GOP's own keyframes, none forced");
+    let backlog_ms = (late - 1) * 1_000 / u64::from(P720.fps);
     assert!(
-        leg.ahead_most_ms <= OWED84_BURST_SLACK_MS as i128,
-        "{case}: the backlog ran {} ms ahead of real time",
+        leg.ahead_most_ms <= i128::from(backlog_ms) + OWED84_BURST_SLACK_MS as i128,
+        "{case}: ran {} ms ahead of real time for a {backlog_ms} ms backlog",
         leg.ahead_most_ms
     );
     let checked = assert_all_camera(case, d);
@@ -3621,7 +3625,7 @@ fn a_publish_that_lands_frames_after_the_first_starts_at_the_first_keyframe() {
         let gop = u64::from(profile.gop_frames());
         let total = gop + OWED84_MARGIN_TICKS;
         let leg = publish_late(&case, &profile, late, total, &dir);
-        let checked = assert_first_gop_start(&case, &leg, total, gop);
+        let checked = assert_first_gop_start(&case, &leg, late, total, gop);
         eprintln!("{case}: frames checked {checked}");
         legs += 1;
     }
@@ -3647,7 +3651,7 @@ fn a_first_gop_backlog_at_the_bound_is_taken_and_one_frame_past_it_is_dropped() 
     let case = "owed112-at-the-bound";
     let dir = Tmp::new(case);
     let leg = publish_late(case, &P720, bound + 1, total, &dir);
-    assert_first_gop_start(case, &leg, total, gop);
+    assert_first_gop_start(case, &leg, bound + 1, total, gop);
 
     let case = "owed112-past-the-bound";
     let dir = Tmp::new(case);

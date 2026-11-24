@@ -1398,6 +1398,8 @@ mod tests {
         let lines = [
             (0, "output gen=1: the sink can send after 11 ms; the 0 video frames queued before it are dropped, and it starts at the next keyframe"),
             (40_135, "output gen=3: the sink can send after 2649 ms; the 61 video frames queued before it are dropped, and it starts at the next keyframe"),
+            // Owed 112's form: the encoder's first frames start the stream.
+            (40_500, "output gen=4: the sink can send after 37 ms; the 1 video frames queued before it are the encoder's first, 0 ms from its first keyframe (Owed 112), so it starts at the encoder's first keyframe and no keyframe is asked"),
             // Near misses: none is a publish line.
             (41_000, "output gen=x: the sink can send after 5 ms; the 0 video frames queued"),
             (41_100, "output gen=4: the sink can send after soon ms; the 0 video frames queued"),
@@ -1414,7 +1416,7 @@ mod tests {
             .iter()
             .map(|p| (p.at_ms - NOON_MS, p.gen))
             .collect();
-        assert_eq!(read, vec![(0, 1), (40_135, 3)]);
+        assert_eq!(read, vec![(0, 1), (40_135, 3), (40_500, 4)]);
         assert!(
             f.output_errors.iter().any(|e| e.gen == 6),
             "an error line stays an error"
@@ -1430,9 +1432,9 @@ mod tests {
         ))
         .expect("gst_output.rs");
         assert_eq!(
-            src.matches("\"output gen={}: the sink can send after {} ms; the {held} video frames queued \\")
+            src.matches("\"output gen={}: the sink can send after {waited} ms; the {held} video frames")
                 .count(),
-            1,
+            2,
             "gst_output.rs's publish line changed: update `sink_publishes`"
         );
         eprintln!("log lines checked: {}, publishes read: {}", f.lines, read.len());
