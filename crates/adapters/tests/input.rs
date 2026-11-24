@@ -1968,10 +1968,42 @@ fn a_taken_back_build_delivers_again_without_a_rebuild() {
     input.take_back(1);
     assert_eq!(input.taken_back(), 0, "an open gate is not taken back");
     input.abandon(1);
-    let seen = events_until(&rx, Duration::from_secs(3), |e| {
-        *e == Event::InputAgain { gen: 1 }
-    });
+    // Every `InputFrame` is sent under the gate lock, which `abandon` takes to shut the gate, so all
+    // the build sent before the call is in the channel when it returns (CI run 45484166097 read one
+    // such frame here): drained at once, it may hold frames, then at most the `InputAgain`. After
+    // the drain, nothing of the build passes the shut gate.
+    let queued: Vec<Event> = rx
+        .try_iter()
+        .filter_map(|m| match m {
+            Inbound::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    let again_at = queued.iter().position(|e| *e == Event::InputAgain { gen: 1 });
+    if let Some(i) = again_at {
+        assert_eq!(
+            frames_in(&queued[i..]),
+            0,
+            "no frame after the report: {queued:?}"
+        );
+    }
+    let seen = if again_at.is_some() {
+        Vec::new()
+    } else {
+        events_until(&rx, Duration::from_secs(3), |e| {
+            *e == Event::InputAgain { gen: 1 }
+        })
+    };
     assert_eq!(frames_in(&seen), 0, "nothing passed the shut gate: {seen:?}");
+    assert_eq!(
+        queued
+            .iter()
+            .chain(&seen)
+            .filter(|e| **e == Event::InputAgain { gen: 1 })
+            .count(),
+        1,
+        "reported once: {queued:?} then {seen:?}"
+    );
     let pts = camera_pts(&frames);
     input.take_back(2);
     assert_eq!(input.taken_back(), 0, "not the current build");
