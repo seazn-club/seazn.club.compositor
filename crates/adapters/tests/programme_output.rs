@@ -26,8 +26,8 @@ use app::ports::{Inbound, Metrics, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
 use domain::config::{
     OutputProfile, Thresholds, CF_KEYFRAME_INTERVAL_MAX_MS, CF_KEYFRAME_INTERVAL_MIN_MS,
-    ENCODER_SPEED_REALTIME_MIN, FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_FPS_MIN_WINDOW_MS,
-    OUTPUT_SINK_TIMEOUT_MS, PROGRAMME_GOP_MS,
+    ENCODER_SPEED_REALTIME_MIN, FIRST_GOP_CATCH_UP_MAX_MS, FORCED_KEYFRAME_MIN_INTERVAL_MS,
+    OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS, PROGRAMME_GOP_MS,
 };
 use domain::ladder::Rung;
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -3480,6 +3480,215 @@ fn a_drain_while_the_sink_is_still_connecting_ends_without_waiting_for_it() {
         "{seen:?}"
     );
     assert_eq!(server.record().published, 0);
+}
+
+// Owed 112 (C3b; chaos run 45480676592, `cef-hung`): the boot's first publish lands after the
+// encoder's first frame. Owed 84 dropped that frame at the gate and asked for a keyframe, which the
+// encoder holds to F-036's floor after frame 0, so the stream started up to 2.2 s late (an 813 ms
+// head outage on the case). A backlog of the encoder's first frames up to
+// `FIRST_GOP_CATCH_UP_MAX_MS` now starts the stream at the encoder's first keyframe, and nothing is
+// asked.
+
+/// The feeder's line when sink 1's gate opens, either way.
+const GATE_OPEN_LINE: &str = "output gen=1: the sink can send after";
+/// The same line's ending when it starts from the encoder's first keyframe (Owed 112).
+const FIRST_GOP_TAKEN: &str = "so it starts at the encoder's first keyframe";
+
+/// What one Owed 112 leg's destination received, and what its feeder logged.
+struct LatePublish {
+    d: Decoded,
+    lines: Lines,
+    /// The most a received message ran ahead of real time, from the first one received (F-023).
+    ahead_most_ms: i128,
+}
+
+/// One Owed 112 leg: sink 1 is swapped in before the programme's first frame, and its publish is
+/// held until `late` camera frames are in the ring, then accepted; `total` ticks are paced in all.
+fn publish_late(case: &str, profile: &OutputProfile, late: u64, total: u64, dir: &Tmp) -> LatePublish {
+    let server = FakeRtmp::held();
+    let (mut p, rx, frames, lines) = programme_with(profile);
+    frames.set_camera(solid(
+        gst_video::VideoFormat::I420,
+        profile.width,
+        profile.height,
+        [255, 0, 0, 255],
+    ));
+    let stats = p.stats();
+    p.swap_sink(1, &rtmp_target(&server));
+    pace(&mut p, 0..late, FrameChoice::Emit);
+    thread::sleep(OWED84_ENCODED_SETTLE);
+    assert_eq!(
+        stats.snapshot().encoded_frames,
+        Some(late),
+        "{case}: setup: the late frames reached the ring before the publish"
+    );
+    assert_eq!(server.record().published, 0, "{case}: setup: the publish is held");
+    server.release();
+    assert!(
+        wait_for_line(&lines, GATE_OPEN_LINE, Duration::from_secs(3)),
+        "{case}: the gate never opened"
+    );
+    pace(&mut p, late..total, FrameChoice::Emit);
+    let seen = drain_and_wait(&mut p, &rx);
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::OutputError { .. })),
+        "{case}: {seen:?}"
+    );
+    server.settle(Duration::from_millis(400), Duration::from_secs(8));
+    let path = dir.file(&format!("{case}.flv"));
+    let tags = server.write_flv(&path);
+    let rec = server.record();
+    assert_eq!(rec.published, 1, "{case}: one publish");
+    assert_eq!(tags, rec.media.len(), "{case}");
+    let media: Vec<&rtmp::Media> = rec
+        .media
+        .iter()
+        .filter(|m| m.is_avc_frame() || m.is_aac_frame())
+        .collect();
+    let first = media.first().expect("a frame was received");
+    let (anchor_ts, anchor_at) = (first.ts_ms, first.at);
+    let ahead_most_ms = media
+        .iter()
+        .map(|m| {
+            i128::from(m.ts_ms - anchor_ts.min(m.ts_ms)) - m.at.duration_since(anchor_at).as_millis() as i128
+        })
+        .max()
+        .unwrap_or(i128::MIN);
+    drop(rec);
+    LatePublish {
+        d: decode(&path),
+        lines,
+        ahead_most_ms,
+    }
+}
+
+/// Checks a leg that started at the encoder's first keyframe: the feeder said so and asked for no
+/// keyframe; the destination got every frame paced, the first a keyframe at PTS 0, the camera in
+/// each; its keyframes are the GOP's own (none forced a floor in); and the backlog came in no burst
+/// (Owed 84's bound, `OWED84_BURST_SLACK_MS`). Returns the frames checked.
+fn assert_first_gop_start(case: &str, leg: &LatePublish, total: u64, gop: u64) -> usize {
+    let d = &leg.d;
+    let keys = key_indexes(d);
+    eprintln!(
+        "{case}: {} frames for the {total} paced; keyframes at {keys:?}; most ahead of real time {} ms",
+        d.frames.len(),
+        leg.ahead_most_ms
+    );
+    assert_eq!(
+        logged(&leg.lines, FIRST_GOP_TAKEN),
+        1,
+        "{case}: the feeder did not start at the first keyframe"
+    );
+    assert_eq!(
+        logged(&leg.lines, "output gen=1: the keyframe request was"),
+        0,
+        "{case}: a keyframe was asked"
+    );
+    assert!(
+        d.first_is_key(),
+        "{case}: keys {:?}",
+        &d.keys[..d.keys.len().min(5)]
+    );
+    assert_eq!(d.video_pts_ms.first(), Some(&0), "{case}");
+    assert_eq!(
+        d.frames.len() as u64,
+        total,
+        "{case}: the stream starts at frame 0"
+    );
+    assert_eq!(keys, vec![0, gop], "{case}: the GOP's own keyframes, none forced");
+    assert!(
+        leg.ahead_most_ms <= OWED84_BURST_SLACK_MS as i128,
+        "{case}: the backlog ran {} ms ahead of real time",
+        leg.ahead_most_ms
+    );
+    let checked = assert_all_camera(case, d);
+    assert_eq!(checked as u64, total, "{case}");
+    checked
+}
+
+/// Owed 112's witness: the publish lands one, two or three frames after the encoder's first (the
+/// chaos run's race was one, 38 ms), within the first GOP. The stream starts at frame 0, the
+/// encoder's first keyframe, with no head outage: every frame paced reaches the destination. Before
+/// the fix the gate dropped those frames and the keyframe it asked for came at F-036's floor after
+/// frame 0, 66 frames in. Both modes (one leg at 1080p: both are 30 fps, ADR 0005).
+#[test]
+fn a_publish_that_lands_frames_after_the_first_starts_at_the_first_keyframe() {
+    let _s = serial();
+    let mut legs = 0;
+    for (profile, late) in [(P720, 1), (P720, 2), (P720, 3), (OutputProfile::P1080, 1)] {
+        let case = format!("owed112-{}p-{late}-late", profile.height);
+        let dir = Tmp::new(&case);
+        let gop = u64::from(profile.gop_frames());
+        let total = gop + OWED84_MARGIN_TICKS;
+        let leg = publish_late(&case, &profile, late, total, &dir);
+        let checked = assert_first_gop_start(&case, &leg, total, gop);
+        eprintln!("{case}: frames checked {checked}");
+        legs += 1;
+    }
+    eprintln!("Owed 112 legs checked: {legs}");
+    assert_eq!(legs, 4);
+}
+
+/// Owed 112's bound: a backlog of exactly `FIRST_GOP_CATCH_UP_MAX_MS` (33 frames after the first at
+/// 30 fps, from `config`) starts at the first keyframe; one frame more is dropped as Owed 84 drops
+/// it, and the stream starts at the keyframe it asks for, which the encoder holds to the floor after
+/// frame 0 (`key_due`). 720p alone: the bound is in running time, and both modes are 30 fps.
+#[test]
+fn a_first_gop_backlog_at_the_bound_is_taken_and_one_frame_past_it_is_dropped() {
+    let _s = serial();
+    let gop = gop_ticks();
+    let total = gop + OWED84_MARGIN_TICKS;
+    let bound = FIRST_GOP_CATCH_UP_MAX_MS * u64::from(P720.fps) / 1_000;
+    assert!(
+        bound + 2 + OWED84_KEY_WAIT_TICKS < floor_ticks(),
+        "setup: a dropped backlog waits for the floor"
+    );
+
+    let case = "owed112-at-the-bound";
+    let dir = Tmp::new(case);
+    let leg = publish_late(case, &P720, bound + 1, total, &dir);
+    assert_first_gop_start(case, &leg, total, gop);
+
+    let case = "owed112-past-the-bound";
+    let dir = Tmp::new(case);
+    let late = bound + 2;
+    let leg = publish_late(case, &P720, late, total, &dir);
+    let d = &leg.d;
+    let due = key_due(late, last_natural_key(late));
+    let owed = total - due;
+    let n = d.frames.len() as u64;
+    eprintln!(
+        "{case}: {late} late, keyframe due at {due}; {n} frames for the {owed} paced from it; keyframes at {:?}",
+        key_indexes(d)
+    );
+    assert_eq!(
+        logged(&leg.lines, FIRST_GOP_TAKEN),
+        0,
+        "{case}: the backlog was taken"
+    );
+    assert_eq!(
+        logged(&leg.lines, "output gen=1: the keyframe request was taken"),
+        1,
+        "{case}: no keyframe was asked"
+    );
+    assert!(
+        d.first_is_key(),
+        "{case}: keys {:?}",
+        &d.keys[..d.keys.len().min(5)]
+    );
+    assert_eq!(d.video_pts_ms.first(), Some(&0), "{case}");
+    assert!(
+        n <= owed,
+        "{case}: {n} frames for the {owed} from the floor: it started before the floor"
+    );
+    assert!(
+        n + OWED84_KEY_WAIT_TICKS >= owed,
+        "{case}: {n} frames: the keyframe came more than {OWED84_KEY_WAIT_TICKS} ticks after the floor"
+    );
+    let checked = assert_all_camera(case, d);
+    eprintln!("{case}: frames checked {checked}");
+    assert_eq!(checked as u64, n);
+    assert!(checked > 0);
 }
 
 /// The file's size, 0 if it does not exist (filesink creates it when its pipeline starts).

@@ -19,6 +19,11 @@
 //! encoder does not take is asked again at each entry. A drain that reaches an output that has sent
 //! nothing, at the gate or after it, ends with the encoders (`release_unsent`).
 //!
+//! **One exception: the encoder's first frames** (Owed 112). A sink that can send only after the
+//! encoder's first frames, while the ring still holds all of them and at most
+//! `FIRST_GOP_CATCH_UP_MAX_MS` of them, starts at the encoder's first keyframe and asks nothing:
+//! dropping them would hold the stream to F-036's floor after frame 0, a head outage of up to 2.2 s.
+//!
 //! **Progress** (Owed 13). A poll every `OUTPUT_PROGRESS_POLL_MS` reads the sink's bytes-SENT total,
 //! rtmp2sink `stats` field `out-bytes-total` (F-010), or the file's size for `file://`, and sends
 //! `Event::OutputProgress { gen, total_bytes, encoded }`. Never acknowledged bytes: CF Input B sends
@@ -44,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use app::ports::{Inbound, TargetSpec};
 use crossbeam_channel::Sender;
-use domain::config::OUTPUT_SINK_TIMEOUT_MS;
+use domain::config::{FIRST_GOP_CATCH_UP_MAX_MS, OUTPUT_SINK_TIMEOUT_MS};
 use domain::output_link::Encoded;
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -72,6 +77,8 @@ const _: () = assert!(
 
 /// The encoded ring's span (plan, Global Constraints: "Encoded ring buffer 2 s, dropping the oldest").
 pub const ENCODED_RING_SPAN: Duration = Duration::from_secs(2);
+// Owed 112: the first-GOP backlog a sink starts from is one the ring can still hold.
+const _: () = assert!((FIRST_GOP_CATCH_UP_MAX_MS as u128) < ENCODED_RING_SPAN.as_millis());
 /// A hard cap on the ring's entries beside its span, so that samples with no PTS cannot grow it:
 /// 2 s holds 60 video frames at 30 fps and about 94 AAC frames at 48 kHz (1 024 samples each), 154 in
 /// all; twice that is the cap.
@@ -637,6 +644,19 @@ enum Next {
     Stop,
 }
 
+/// Where an output generation's stream may start, read when its sink can send (`reconnect_point`).
+struct Reconnect {
+    /// The seq of the first entry that may start the stream (`Picker::new`): the first encoded after
+    /// the gate opened, or, with `first_gop`, the oldest of those entries.
+    seq: u64,
+    /// The running time a keyframe serves from: 1 ns after the newest video the ring has taken;
+    /// `None` before any, when nothing is asked (`run`).
+    serves_from: Option<gst::ClockTime>,
+    /// Owed 112: the encoder's first frames, taken out of the ring at the gate, from which the
+    /// stream starts at the encoder's first keyframe; empty on every other path.
+    first_gop: VecDeque<Entry>,
+}
+
 /// The keyframe asked for at the reconnect point (Owed 84): asked again at each entry until the
 /// encoder takes it or the stream has started, so a refused request does not leave the stream
 /// waiting for the encoder's own keyframe, up to a GOP away (3 s, F-036; PR #57 review m-6). The
@@ -651,11 +671,22 @@ struct KeyAsk {
 
 impl Feeder {
     fn run(self) {
-        let Some((reconnect, serves_from)) = self.reconnect_point() else {
+        let Some(Reconnect {
+            seq,
+            serves_from,
+            first_gop,
+        }) = self.reconnect_point()
+        else {
             return;
         };
-        let mut pick = Picker::new(reconnect);
+        let mut pick = Picker::new(seq);
         let mut ask = KeyAsk::default();
+        // Owed 112: the encoder's first frames, taken out of the ring at the reconnect point, start
+        // the stream at its first keyframe; nothing is asked then (`pick.started()` below). Empty
+        // on every other path.
+        for e in first_gop {
+            pick.take(e, |e, base| self.push(e, base));
+        }
         // F-036 (CI on PR #109): before the ring has taken any video, nothing is asked. x264's first
         // frame is a keyframe, and every video entry comes after the reconnect point, so that frame
         // starts the stream. A request there would also be matched on that frame at a running time
@@ -667,7 +698,9 @@ impl Feeder {
         // every later forced keyframe (1600-1607) until the encoder stops: each later sink waits for
         // the GOP's own keyframe, up to 3 s. `ask_key`'s `None` branch is that guard, and it writes
         // the line the tests wait on (the C1 review's m1: the line and the guard are one branch).
-        self.ask_key(&mut ask, serves_from);
+        if !pick.started() {
+            self.ask_key(&mut ask, serves_from);
+        }
         loop {
             match self.next() {
                 Next::Stop => return,
@@ -738,35 +771,58 @@ impl Feeder {
         }
     }
 
-    /// Waits, taking nothing, until the sink can send (`Gate`), and returns the reconnect point: the
-    /// seq of the first entry encoded after it (`run` then asks for the keyframe), and the running
-    /// time a keyframe serves from (1 ns after the newest video the ring has taken; `None` before
-    /// any, when nothing is asked: `run`). `None` in all: retired,
-    /// the ring is another generation's, or both encoders ended first. That last is the programme's
-    /// drain reaching a sink that never connected: nothing is owed to it (whatever the ring holds
-    /// predates any connect), so `release_unsent`.
-    fn reconnect_point(&self) -> Option<(u64, Option<gst::ClockTime>)> {
+    /// Waits, taking nothing, until the sink can send (`Gate`), and returns the reconnect point
+    /// (`Reconnect`). `None`: retired, the ring is another generation's, or both encoders ended
+    /// first. That last is the programme's drain reaching a sink that never connected: nothing is
+    /// owed to it (whatever the ring holds predates any connect), so `release_unsent`.
+    ///
+    /// Owed 112: when the ring holds only the encoder's first frames, at most
+    /// `FIRST_GOP_CATCH_UP_MAX_MS` of them (`first_gop_backlog`), they are taken out of it under the
+    /// same lock, so the ring cannot drop the first keyframe before the feeder sends it.
+    fn reconnect_point(&self) -> Option<Reconnect> {
         let since = Instant::now();
         loop {
             if self.retired.load(Ordering::SeqCst) {
                 return None;
             }
             if self.gate.is_open() {
-                let r = locked(&self.ring.state);
+                let mut r = locked(&self.ring.state);
                 if r.owner != self.gen {
                     return None;
                 }
-                let first = r.next_seq;
                 let serves_from = r.newest_video.map(|t| t + gst::ClockTime::from_nseconds(1));
                 let held = r.entries.iter().filter(|e| e.video).count();
+                let waited = since.elapsed().as_millis();
+                if let Some(backlog) = first_gop_backlog(&r.entries, r.encoded.video) {
+                    let first_gop = std::mem::take(&mut r.entries);
+                    let seq = first_gop.front().map_or(r.next_seq, |e| e.seq);
+                    drop(r);
+                    self.shared.log(&format!(
+                        "output gen={}: the sink can send after {waited} ms; the {held} video frames \
+                         queued before it are the encoder's first, {} ms from its first keyframe \
+                         (Owed 112), so it starts at the encoder's first keyframe and no keyframe is \
+                         asked",
+                        self.gen,
+                        backlog.mseconds()
+                    ));
+                    return Some(Reconnect {
+                        seq,
+                        serves_from,
+                        first_gop,
+                    });
+                }
+                let seq = r.next_seq;
                 drop(r);
                 self.shared.log(&format!(
-                    "output gen={}: the sink can send after {} ms; the {held} video frames queued \
+                    "output gen={}: the sink can send after {waited} ms; the {held} video frames queued \
                      before it are dropped, and it starts at the next keyframe",
-                    self.gen,
-                    since.elapsed().as_millis()
+                    self.gen
                 ));
-                return Some((first, serves_from));
+                return Some(Reconnect {
+                    seq,
+                    serves_from,
+                    first_gop: VecDeque::new(),
+                });
             }
             let r = locked(&self.ring.state);
             if r.owner != self.gen {
@@ -900,6 +956,24 @@ impl<S> Picker<S> {
             send(&e, base);
         }
     }
+}
+
+/// Owed 112: whether a sink that can send only now starts from the encoder's first keyframe rather
+/// than dropping what the ring holds (Owed 84). It does when the ring still holds every video frame
+/// the encoders have pushed (`encoded_video`: none was dropped, none taken by an output), the oldest
+/// is a keyframe (x264's first frame is one), and the newest is at most `FIRST_GOP_CATCH_UP_MAX_MS`
+/// after it. Returns that backlog, the newest's running time less the keyframe's; `None` to drop.
+/// Never with no video: that is F-036 fact 8's path, where the first frame starts the stream anyway.
+pub(crate) fn first_gop_backlog<S>(
+    entries: &VecDeque<Entry<S>>,
+    encoded_video: u64,
+) -> Option<gst::ClockTime> {
+    let mut video = entries.iter().filter(|e| e.video);
+    let first = video.next()?;
+    let (held, newest) = video.fold((1u64, first.pts), |(n, newest), e| (n + 1, newest.max(e.pts)));
+    let backlog = newest.saturating_sub(first.pts);
+    let bound = gst::ClockTime::from_mseconds(FIRST_GOP_CATCH_UP_MAX_MS);
+    (held == encoded_video && first.key && backlog <= bound).then_some(backlog)
 }
 
 /// `sample` with its PTS and DTS moved back by `base` (a shallow copy: the memory is shared).
@@ -1137,6 +1211,97 @@ mod tests {
             assert_eq!(sent_any, reconnect <= 12, "{reconnect}");
         }
         assert_eq!(checked, 3 * ring_with_an_old_keyframe().len());
+    }
+
+    /// The encoder's first `n` frames as the ring holds them: video at 30 fps (ADR 0005), stamped
+    /// `i × 10⁹ / fps` ns as the programme stamps its ticks (F-036 fact 4), the first a keyframe
+    /// (x264's first frame), each after an AAC frame of its own.
+    fn first_frames(n: u64) -> VecDeque<Entry<u64>> {
+        let fps = u64::from(domain::config::OutputProfile::P720.fps);
+        let mut out = VecDeque::new();
+        for i in 0..n {
+            let pts = gst::ClockTime::from_nseconds(i * 1_000_000_000 / fps);
+            let mut a = Entry::new(2 * i, false, false, pts);
+            a.seq = 2 * i;
+            let mut v = Entry::new(2 * i + 1, true, i == 0, pts);
+            v.seq = 2 * i + 1;
+            out.extend([a, v]);
+        }
+        out
+    }
+
+    /// Owed 112: a sink that can send only after the encoder's first frames starts from the first
+    /// keyframe when the ring still holds every video frame the encoder made and the newest is at
+    /// most `FIRST_GOP_CATCH_UP_MAX_MS` after it; a frame more, and the backlog is dropped (Owed 84).
+    /// The bound in frames comes from `config` and the profile, not from the rule: 33 at 30 fps.
+    /// Each start it takes is run through the `Picker` from the ring's oldest entry, as the feeder
+    /// does, and must start at the encoder's first keyframe, its PTS the base.
+    #[test]
+    fn the_encoders_first_frames_within_the_bound_start_the_stream_from_its_first_keyframe() {
+        let fps = u64::from(domain::config::OutputProfile::P720.fps);
+        let bound = domain::config::FIRST_GOP_CATCH_UP_MAX_MS * fps / 1_000;
+        assert_eq!(bound, 33, "setup: the bound in frames at 30 fps");
+        let (mut taken, mut dropped) = (0, 0);
+        for n in 1..=bound + 3 {
+            let ring = first_frames(n);
+            let got = first_gop_backlog(&ring, n);
+            if n - 1 <= bound {
+                let newest = gst::ClockTime::from_nseconds((n - 1) * 1_000_000_000 / fps);
+                assert_eq!(got, Some(newest), "{n} frames: within the bound");
+                let front = ring.front().expect("non-empty").seq;
+                let mut pick = Picker::new(front);
+                let mut out = Vec::new();
+                for e in ring {
+                    pick.take(e, |e, base| out.push((e.sample, e.video, base)));
+                }
+                assert_eq!(
+                    out.first(),
+                    Some(&(1, true, gst::ClockTime::ZERO)),
+                    "{n} frames: the stream starts at the first keyframe"
+                );
+                assert_eq!(
+                    out.iter().filter(|o| o.1).count() as u64,
+                    n,
+                    "{n} frames: every video frame is sent"
+                );
+                taken += 1;
+            } else {
+                assert_eq!(got, None, "{n} frames: past the bound");
+                dropped += 1;
+            }
+        }
+        eprintln!("first-GOP backlogs taken {taken}, dropped {dropped}");
+        assert_eq!((taken, dropped), (bound + 1, 2));
+    }
+
+    /// Owed 112's rule is the encoder's FIRST frames only: no video (fact 8's path), a video frame the
+    /// ring dropped or an output took (so the oldest held is not the encoder's first), or an oldest
+    /// held frame that is not a keyframe each leave Owed 84's drop in place.
+    #[test]
+    fn a_ring_without_every_first_frame_or_its_keyframe_is_not_taken() {
+        let mut checked = 0;
+        // Empty, and audio alone: no video to start from.
+        assert_eq!(first_gop_backlog(&VecDeque::<Entry<u64>>::new(), 0), None);
+        let audio: VecDeque<_> = first_frames(3).into_iter().filter(|e| !e.video).collect();
+        assert_eq!(first_gop_backlog(&audio, 0), None);
+        checked += 2;
+        for n in [1, 2, 3, 20] {
+            // The encoders pushed one video frame more than the ring holds: the first was dropped or
+            // taken, whether or not the oldest held is a keyframe.
+            assert_eq!(first_gop_backlog(&first_frames(n), n + 1), None, "{n}: one gone");
+            let mut gone = first_frames(n + 1);
+            gone.retain(|e| !(e.video && e.key));
+            assert_eq!(first_gop_backlog(&gone, n + 1), None, "{n}: the keyframe gone");
+            // Every frame held, but the oldest is no keyframe.
+            let mut delta = first_frames(n);
+            for e in delta.iter_mut() {
+                e.key = false;
+            }
+            assert_eq!(first_gop_backlog(&delta, n), None, "{n}: no keyframe");
+            checked += 3;
+        }
+        eprintln!("refusals checked {checked}");
+        assert_eq!(checked, 14);
     }
 
     #[test]

@@ -299,6 +299,18 @@ pub const fn input_decode_wait_ms(input_stall_after_ms: Ms) -> Ms {
     input_stall_after_ms + CAMERA_GOP_MS
 }
 
+/// Owed 112 (C3b; chaos run 45480676592, `cef-hung`, an 813 ms head outage): the longest backlog of
+/// the encoder's first frames that a sink whose publish lands after them starts from, at the
+/// encoder's first keyframe, instead of dropping it (Owed 84 drops every frame queued before a
+/// sink can send). Dropping it costs a head outage: the keyframe asked for then is held to
+/// `FORCED_KEYFRAME_MIN_INTERVAL_MS` after frame 0 (F-036 fact 4), so the stream starts the floor
+/// less the backlog late. Taking it costs the backlog as latency, sent at once (a burst, F-023's
+/// 4 s there). Half the floor is where the two are equal, so whichever start is taken the head is
+/// at most 1.1 s off. The run's race was 38 ms (one frame). Under the GOP (`PROGRAMME_GOP_MS`), so
+/// only the encoder's first GOP is ever taken, and under the encoded ring's 2 s (C09, the plan's
+/// Global Constraints), so the ring still holds it.
+pub const FIRST_GOP_CATCH_UP_MAX_MS: Ms = FORCED_KEYFRAME_MIN_INTERVAL_MS / 2;
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -942,6 +954,27 @@ mod tests {
     #[test]
     fn the_progress_poll_is_owed_15s_250_ms() {
         assert_eq!(OUTPUT_PROGRESS_POLL_MS, 250);
+    }
+
+    // Owed 112 (C3b): half F-036's floor, whole frames in both modes, inside the first GOP.
+    #[test]
+    fn the_first_gop_catch_up_is_half_the_forced_keyframes_floor() {
+        assert_eq!(FIRST_GOP_CATCH_UP_MAX_MS, 2_200 / 2, "half the floor");
+        // Constant against constant: the compiler checks it (clippy refuses a runtime assert).
+        const _: () = assert!(FIRST_GOP_CATCH_UP_MAX_MS < PROGRAMME_GOP_MS);
+        let mut checked = 0;
+        for p in BOTH_MODES {
+            let fps = Ms::from(p.fps);
+            assert_eq!(
+                fps * FIRST_GOP_CATCH_UP_MAX_MS % 1_000,
+                0,
+                "{p:?}: not whole frames"
+            );
+            // 30 fps (ADR 0005): 33 frames.
+            assert_eq!(fps * FIRST_GOP_CATCH_UP_MAX_MS / 1_000, 33, "{p:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "modes checked: {checked}");
     }
 
     // F-011 (Owed 38): a refused publish counted bytes until its refusal arrived, the last total at
