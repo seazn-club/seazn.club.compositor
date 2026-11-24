@@ -283,3 +283,48 @@ fn a_slates_entry_and_exit_each_beat_on_their_own_tick() {
     eprintln!("edge beats checked: {checked}");
     assert_eq!(checked, 3 * steps().len());
 }
+
+/// The gap against the programme's own behaviour (C2 review, m3): the reconnecting slate's shortest
+/// stay, read off the real supervisor. The camera stops for exactly `slate_after_ms`, so its frames
+/// return on the slate's first ticks, and the stay from the slate's entry to the return to Live is
+/// the shortest the table allows. It is at least the gap, so the exit beats on its own tick too.
+#[test]
+fn a_slates_shortest_stay_is_at_least_the_gap() {
+    let th = Thresholds::default();
+    let gap = th.phase_beat_gap_ms();
+    let sc = [(true, 2_000), (false, th.slate_after_ms), (true, 4_000)];
+    let span = 2_000 + th.slate_after_ms + 4_000;
+    let mut checked = 0;
+    for step in steps() {
+        let seen = drive(&th, th.heartbeat_interval_ms, step, &sc, span);
+        let entry = seen
+            .changes
+            .iter()
+            .find(|c| c.1 == ProgrammePhase::Reconnecting)
+            .map(|c| c.0)
+            .expect("setup: the slate goes up");
+        let exit = seen
+            .changes
+            .iter()
+            .find(|c| c.1 == ProgrammePhase::Live && c.0 > entry)
+            .map(|c| c.0)
+            .expect("setup: the camera returns");
+        let stay = exit - entry;
+        eprintln!("step {step}: the slate up at {entry}, down at {exit}: {stay} ms");
+        assert!(
+            stay <= th.resume_after_ms + 2 * step,
+            "setup: the frames return on the slate's first ticks ({stay} ms)"
+        );
+        assert!(
+            stay >= gap,
+            "step {step}: a {stay} ms stay is under the {gap} ms gap"
+        );
+        assert!(
+            seen.beats.contains(&(exit, ProgrammePhase::Live)),
+            "step {step}: the exit beats on its own tick"
+        );
+        checked += 1;
+    }
+    eprintln!("shortest slate stays checked: {checked}");
+    assert_eq!(checked, steps().len());
+}

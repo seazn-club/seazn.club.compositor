@@ -338,7 +338,8 @@ impl Thresholds {
     /// exit each beat on their own tick when the beat before them did, and a phase that flaps faster
     /// costs at most one beat a gap (1 000 ms today: one beat a second at most, against the cadence's
     /// one in five), each carrying the phase of its tick. A change the gap holds beats on the first
-    /// tick the gap allows. The pins: `the_phase_beat_gap_lets_a_slates_entry_and_exit_each_beat`.
+    /// tick the gap allows. The pins: `the_phase_beat_gap_lets_a_slates_entry_and_exit_each_beat`, and the
+    /// slate's shortest stay as the supervisor makes it, `a_slates_shortest_stay_is_at_least_the_gap`.
     pub fn phase_beat_gap_ms(&self) -> Ms {
         self.resume_after_ms
     }
@@ -473,18 +474,16 @@ mod tests {
         }
     }
 
-    // C2 (S3): the edge beat's gap is the reconnecting slate's shortest stay, so its entry and exit
-    // each beat on their own tick; it is under the cadence (or no edge beat would ever come early)
-    // and above 0 (or a flapping phase would beat every tick).
+    // C2 (S3): the edge beat's gap lets the slate's entry beat after a freeze; it is under the cadence
+    // (or no edge beat would ever come early) and above 0 (or a flapping phase would beat every
+    // tick). That it is no longer than the slate's shortest stay is read off the real supervisor, not
+    // here (the gap IS `resume_after_ms`): `a_slates_shortest_stay_is_at_least_the_gap` in
+    // `tests/phase_beat.rs` (C2 review, m3).
     #[test]
     fn the_phase_beat_gap_lets_a_slates_entry_and_exit_each_beat() {
         let t = Thresholds::default();
         let gap = t.phase_beat_gap_ms();
         assert!(gap > 0, "a flap would beat every tick");
-        assert!(
-            gap <= t.resume_after_ms,
-            "the slate's exit, a return's length after its entry"
-        );
         assert!(
             gap <= t.slate_after_ms - t.frozen_after_ms,
             "the slate's entry, after the freeze"
