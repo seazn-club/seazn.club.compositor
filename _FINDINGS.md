@@ -423,6 +423,7 @@ The full item (go-live, B-frames question, time to live, health) is owed to an o
   - if leg 2 also went Poor, the remaining suspects are our stream's *structure* or YouTube itself;
   - if leg 2 stayed Excellent, the Poor flips are transient.
 - Structure means anything still untested: FLV timestamps, the silent `voaacenc` track, `profile=main`, CBR+HRD signalling, and 2 s GOPs against YouTube's recommendation of 2 s *or less*.
+- *Forward, 2026-11-24 (F-036):* the programme's GOP is now a fixed 3 s with x264's scene cut off, over YouTube's "2 s or less"; how YouTube reads it through Cloudflare's restream is not measured (Owed 109).
 
 **Next probes (not run):**
 1. A real-audio or no-audio variant (the silent AAC track is a candidate).
@@ -579,6 +580,7 @@ The snapshot of the composite (overlay over camera) was checked visually. It is 
 - **ADR 0005** (720p default, 1080p behind a flag) holds on cost grounds. 1080p costs +0.28 cores.
 - performance-4x leaves about 2.7–3.1 cores of headroom. A smaller size is plausible but not measured; that is for C16 to measure if wanted.
 - C09's encoder settings sustain real time with margin. The filler question is in F-004.
+- *Forward, 2026-11-24 (F-036):* C09's 2 s keyframe interval is now a fixed 3 s GOP with x264's scene cut off, which codes fewer keyframes; not re-measured here.
 
 **Teardown:** done. 0 Machines remain; see the record at the end of this file.
 
@@ -2004,6 +2006,8 @@ types.
   lost, and x264's next one (`key-int-max` = 2 × fps) came 2.0 s later. If a destination does that at
   each reconnect, each reconnect's recording starts up to 2 s late, which counts against C14's
   `output_reconnect` (Owed 84) and not against `output_lost`.
+  *Forward, 2026-11-24 (F-036): the GOP is now 3 s, so that next keyframe comes up to 3 s later,
+  and a forced keyframe is held to 2 s after the encoder's last one.*
 - Not checked: MediaMTX's source, or what it receives on the wire, and Cloudflare's start.
 
 ## F-026: a GPU crash loop between two child polls, leg by leg (C14 case 15, chaos runs 40051995233, 40056474269 and 40056388445, 2026-10-24)
@@ -2897,6 +2901,8 @@ For {720p, 1080p} × x264 `speed-preset` {`veryfast`, `faster`, `fast`, `medium`
 `config.rs` P720 / P1080): the CPU on the production guest with the real overlay, whether the encoder
 stays real time, and the quality gain at the same bitrate. Owed 20's size rule applies: p95 Machine
 CPU above 50 % of cores ⇒ the next size.
+*Forward, 2026-11-24 (F-036): these legs ran the 2 s GOP with x264's scene cut on; the programme now
+codes a fixed 3 s GOP with the scene cut off (fewer keyframes). Not re-measured.*
 
 **Method.**
 - **CPU, the cost legs** (C15, `harness/soak/README.md` "The cost legs"; F-030's method): one
@@ -3135,3 +3141,103 @@ Machines after. It is the soak of record for 1080p `medium` on performance-6x.*
 
 **Teardown.** Each run's own "Destroy every Machine" step; 0 Machines in `seazn-relay-soak` after
 each (`flyctl machines list`). No stg, prod or product file changed.
+
+## F-036: Cloudflare refuses a programme GOP under 2 s: a fixed 3 s GOP with x264's scene cut off, forced keyframes held to the 2 s floor, and a 9 s input connect timeout (stg 2026-11-24, C1)
+
+**Evidence** (stg, 2026-11-24: Cloudflare's webhooks and the relay's lines, as the C1 brief gives
+them; `seazn.club`'s `.superpowers/sdd/2026-11-20-seazn-hosted-video/compositor-c1-brief.md`).
+
+- **The programme input.** Session `d908c90c`: at 09:33:01Z Cloudflare sent `live_input.errored`
+  `ERR_GOP_OUT_OF_RANGE` on the programme input (the relay's x264 output). Session `5e5403ce` got the
+  same at 09:45:55Z. Cloudflare takes a keyframe interval of 2 to 10 s. The encoder ran
+  `key-int-max` = 2 × fps with x264's scene cut at its default (on), and Owed 84's swap forces a
+  keyframe whenever a new output can send. The phone app hit the same 2 s edge (jitter ±14 ms at
+  2 s) and moved to 3 s.
+- **The camera's return.** Session `5e5403ce`: Cloudflare reported the camera input `connected` at
+  09:55:31.6Z. The relay built gen 4 to 9 from 09:55:32, each `abandoned by the domain` about 5 s
+  after its build (`input_connect_timeout_ms` 5 000), with the back-off between. Frames arrived only
+  at gen 9, 09:56:15–21: about 50 s of the reconnecting scene with the camera back. The phone
+  publishes a 3 s GOP, over SRT at 1 000 ms latency.
+
+**Facts** (source read: GStreamer 1.24.2, x264 at `31e19f92`, Ubuntu 24.04's libx264 164; a local
+libx264 probe, core 165 r3222, through ffmpeg).
+
+1. **x264enc has no property for the scene cut or for `keyint_min`.** It applies its
+   `option-string` before its own properties, and none of those sets the scene cut, so
+   `scenecut=0` goes in the option string. An unknown option name fails the encoder's open.
+2. **`min-keyint` = `key-int-max` cannot be had.** x264 clamps `keyint_min` to
+   `keyint_max / 2 + 1` (`encoder.c` 1111): the probe's `min-keyint=90` came out as `keyint_min=46`
+   in x264's own SEI. With the scene cut off, `keyint_min` decides nothing anyway.
+3. **The probe** (preset `medium`, `zerolatency`, no B-frames, CBR with HRD, keyint 90; 210 frames:
+   `testsrc2`, `smptehdbars`, noise and `testsrc` in turn, so each change is a hard cut):
+
+   | x264 | Keyframes (frame) |
+   |---|---|
+   | scene cut at its default | 0, 30, 60, 69, 78, 87, 177 |
+   | `scenecut=0` | 0, 90, 180 |
+   | `scenecut=0`, a keyframe forced at 70 (IDR or not; 300 frames of `testsrc2`) | 0, 70, 160, 250 |
+
+   A forced keyframe restarts x264's GOP: its next own keyframe is a whole GOP after it.
+4. **GstVideoEncoder's `min-force-key-unit-interval`** (guint64 ns, since 1.18, default 0). At each
+   frame it holds a keyframe request if the last request or the last keyframe made (natural or
+   forced) is less than the interval before the frame's running time. A held request stays queued
+   and is made on the first frame at the interval or later; it is never dropped. The upstream event
+   is answered TRUE at once, so Owed 84's `KeyAsk` reads it taken. The programme stamps tick `i` at
+   `i × 10⁹ / fps` ns, so 60 ticks are exactly 2 s of running time at 30 fps.
+5. **Where Owed 84's forced keyframe cut a short GOP.** One x264enc serves every output, and only
+   one output lives at a time. The GOP a forced keyframe cuts short (the last natural keyframe to
+   the forced one) is on the retired output, never on the new one, which starts at the forced
+   keyframe. The short GOP that did reach a live connection is the in-flight case: the GOP's own
+   keyframe encoded at or after the reconnect point, so the new output starts at it, and the forced
+   one made 1 or 2 frames later. A hard cut started one on any live connection.
+6. **The 2 s floor closes that case.** A request within 2 s of the encoder's last keyframe is held
+   to the floor, and the forced keyframe restarts the GOP (fact 3), so every interval the encoder
+   makes is 2 s or more. A deferral in the domain could not: the domain never sees when the encoder
+   last made a keyframe, and a wall-clock wait still races the frames in flight.
+
+**Changes** (C1, branch `fix/seazn-live-gop-pull`).
+
+- `config.rs`: `CF_KEYFRAME_INTERVAL_MIN_MS` 2 000 and `_MAX_MS` 10 000, `PROGRAMME_GOP_MS` 3 000,
+  `FORCED_KEYFRAME_MIN_INTERVAL_MS` (Cloudflare's 2 000), and `OutputProfile::gop_frames` (90 in
+  both modes) and `forced_keyframe_min_frames` (60).
+- x264enc: `key-int-max` = `gop_frames()`, `option-string` gains `scenecut=0`, and
+  `min-force-key-unit-interval` = the floor. Bitrate, VBV and HRD are unchanged (D2, Owed 109).
+- `input_connect_timeout_ms`: 5 000 → 9 000 (D3, below).
+
+**Consequences.**
+
+- **Owed 84's new output starts up to 2 s later** when its sink can send within 2 s of the encoder's
+  last keyframe: 2 s of every 3, about 0.67 s on average over gate times spread evenly. Owed 84's
+  guarantee holds: the stream still starts at a keyframe encoded after the reconnect point.
+- **C14's `output_reconnect`** (`resume_ms` ≤ 5 000) loses that margin. Chaos run 44962339494 read
+  `resume_ms` 2 443 to 3 877, so the worst leg had 1 123 ms to spare; a gate within 0.88 s after a
+  keyframe (about 29 % of swaps) defers more than that. `lost_ms` (counter gap minus outage span)
+  does not move. Owed to the next chaos run on this branch.
+- **The edge.** A held keyframe lands exactly 2.000 s after the last (FLV 2 000 ms). Whether
+  Cloudflare's check takes exactly 2 s is not measured (Owed 109).
+- **A lost forced keyframe** (F-028) now waits for the GOP's own, up to 3 s. A stall that outlasts
+  the ring's 2 s resumes at the next natural keyframe, up to 3 s on (Owed 88's `Picker`).
+- **YouTube** recommends a GOP of 2 s or less (F-004). How it reads 3 s through Cloudflare's restream
+  is not measured (Owed 109).
+
+**D3: the input connect timeout, 9 000 ms** (the brief's rule).
+
+- F-032 measured the first decoded frame 1.8 to 4.2 s after the connect, with a 2 s publisher GOP.
+  The phone's 3 s GOP adds up to 1 s (5.2 s, over the old 5 s), and SRT latency is 1 s. The
+  timeout keeps a first frame 6 to 8 s after the build (domain test `slow_first_frame.rs`, in both
+  modes), and a dead pull is still given up at 9 s.
+- The phone-live nudge discards only a Connecting generation that carries no media byte, once an
+  outage, so it never gives up a slow first frame; no floor is owed on it. The stall rule reads
+  Running only. The hold-end gate holds: 20 000 > 5 000 + 9 000.
+- **The stg line's `0 B`** is the bytes of audio the abandoned generation flushed, not the bytes it
+  received. Whether gens 4 to 8 received any byte is not in the log. If none did, F-032's 30 s hold
+  explains part of the 50 s, and no timeout would.
+- **The schedule at 9 s.** After the last frame: the stall (5 s), the base wait (1 s), a connect
+  (9 s), back-off (2 s), a connect (9 s), back-off (4 s): the third build at +30 s. F-032's typical
+  hold-end close, about 29 s, then falls before a build already due at 30 s, so fix (a) gains
+  nothing there; a close at 27.9 to 29.0 s gains up to 1.1 s. The tests that pinned the 5 s
+  schedule now read F-032's close window (27.9 to 29.2 s).
+
+**Not measured.** All of it on stg after the change (Owed 109): no `ERR_GOP_OUT_OF_RANGE` across
+sessions with swaps and cuts, the 2.000 s edge, YouTube, a phone's return, and the 1080p peak (D2).
+The programme tests that witness the GOP and the floor need GStreamer and run on CI only.
