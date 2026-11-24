@@ -1085,12 +1085,16 @@ fn dest_disconnect_recovers_and_reds_when_nothing_was_dropped_or_the_return_is_l
         "fault_applied",
         "disc-nodrop",
     );
-    let w = dest_disc(7_000, netem(true, 900_000, 700, 4_000), "pending");
-    assert_fails(
-        &judge(&w, "dest-disconnect", "", "disc-late"),
-        "output_reconnect",
-        "disc-late",
-    );
+    // The return 1 ms past the budget (spec §6's 5 s and F-036's floor), from the budget itself: the
+    // literal 7 s it was fell inside the floor-widened 7.2 s (CI on PR #109). The measured return
+    // is at least the fixture's (2 517 ms for 2 500 above).
+    let budget = dest_cut(0, Value::Null).ms("budget_output_reconnect_ms");
+    let w = dest_disc(budget + 1, netem(true, 900_000, 700, 4_000), "pending");
+    let v = judge(&w, "dest-disconnect", "", "disc-late");
+    assert_fails(&v, "output_reconnect", "disc-late");
+    let resume = v.json["measures"]["output_reconnect"]["resume_ms"].as_i64();
+    eprintln!("disc-late: returned at {resume:?} ms for the {budget} ms budget");
+    assert!(resume.is_some_and(|r| r > budget), "disc-late: {resume:?}");
 }
 
 /// CI's swaps (runs 40056474269, 40106770881 and PR #65's): 515-520 ms after the sink's error, the
@@ -1410,7 +1414,7 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
     // Case 12's qdisc in CI: 16 packets through at 8 kbit, one more queued.
     let trickling = || netem_queued(true, 19_271, 16, 0, 65_536, 1);
     let w = dest_stall(5_000, 1, trickling());
-    let budget = w.ms("budget_output_reconnect_ms");
+    let budget = w.ms("spec_output_reconnect_ms");
     // CI's case 12 (run 40106770881): sink 1's socket timeout, the reason line `error`, and the
     // back-off's swap (Owed 87).
     assert_pass(&judge(&w, "dest-trickle", "", "trickle-good"), "trickle-good");
@@ -1428,9 +1432,10 @@ fn dest_trickle_swaps_under_a_trickle_and_reds_when_nothing_trickled() {
         "trickle-err-early",
     );
     checked += 1;
-    // The spec's output budget from the error (§6 "≤5 s"): the swap placed a timeout later (x 2),
-    // so that the error clears the cut's floor and the trickle keeps the growth beat close, and only
-    // the budget is judged: the budget itself passes, 1 ms past it reds on it alone.
+    // The output reconnect budget from the error (§6 "≤5 s"; no keyframe is waited for, so F-036's
+    // floor is not in it: CI on PR #109): the swap placed a timeout later (x 2), so that the error
+    // clears the cut's floor and the trickle keeps the growth beat close, and only the budget is
+    // judged: the budget itself passes, 1 ms past it reds on it alone.
     let w = dest_stall_err(5_000, 2, trickling(), ErrLine::At(1, budget));
     assert_pass(
         &judge(&w, "dest-trickle", "", "trickle-err-budget"),

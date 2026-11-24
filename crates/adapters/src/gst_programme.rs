@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use app::ports::{Inbound, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Sender;
-use domain::config::OutputProfile;
+use domain::config::{OutputProfile, FORCED_KEYFRAME_MIN_INTERVAL_MS};
 use domain::health::ExitDetail;
 use domain::ladder::Rung;
 use domain::programme::FrameChoice;
@@ -63,12 +63,22 @@ const AAC_BITRATE: i32 = 128_000;
 /// 6 CPUs: C:noise, D:noise, D:snow; C:snow's beats unfetched). Only the one-host sweep, on raw
 /// per-pixel noise, fell behind (48.3 to 50.4 s for 45 s of frames), its cause not settled. It drives
 /// 720p too. A 3 h soak of 1080p `medium` on 6 CPUs passed (F-033). The rest are the settings C00
-/// measured real time (F-005): `zerolatency`, a 2 s keyframe interval, no B-frames (F-004), a
-/// 1 000 ms VBV and CBR with filler (POC values).
+/// measured real time (F-005): `zerolatency`, no B-frames (F-004), a 1 000 ms VBV and CBR with
+/// filler (POC values). C00 measured a 2 s keyframe interval with x264's scene cut on; F-036 made it
+/// a fixed 3 s GOP (`OutputProfile::gop_frames`) with the scene cut off (`X264_NO_SCENE_CUT`), which
+/// codes fewer keyframes, never more.
 const X264_SPEED_PRESET: &str = "medium";
 const X264_TUNE: &str = "zerolatency";
 const X264_VBV_MS: u32 = 1_000;
 const X264_OPTIONS: &str = "nal-hrd=cbr:filler=1";
+/// F-036: x264's scene cut off, so a hard cut in the picture (the slate to the camera, a camera
+/// returning) never starts a GOP early: Cloudflare errored the programme input for GOPs under 2 s
+/// (`ERR_GOP_OUT_OF_RANGE`). x264enc 1.24.2 has no property for it, and reads its `option-string`
+/// before its properties, none of which sets the scene cut. F-036's libx264 probe: across 210 frames
+/// with hard cuts, keyframes at frames 0, 30, 60, 69, 78, 87 and 177 with it on, at 0, 90 and 180
+/// with `scenecut=0`. x264's `min-keyint` cannot stand in for it: x264 clamps it to
+/// `keyint / 2 + 1` (46 of 90 in the same probe).
+const X264_NO_SCENE_CUT: &str = "scenecut=0";
 /// The pink-noise filler's peak: 0.001 of full scale, about −60 dBFS (F-004: `audiotestsrc
 /// wave=pink-noise volume=0.001` encodes as real coded AAC, 3.9 % zero bytes, where digital silence
 /// encodes as 94.7 % zero bytes and made YouTube report Poor).
@@ -89,9 +99,10 @@ pub enum SinkStall {
     Hang,
 }
 
-/// How long a planted hang holds: twice F-004's budget, past the backstop and a whole recovery.
+/// How long a planted hang holds: twice F-004's 15 s, past the backstop and a whole recovery (17.2 s
+/// with F-036's floor). The kept gap, not the output's budget, so F-036 left case 18's hold at 30 s.
 #[cfg(feature = "test-hooks")]
-pub const SINK_HANG_HOLD: Duration = Duration::from_millis(2 * domain::config::OUTPUT_GAP_BUDGET_MS);
+pub const SINK_HANG_HOLD: Duration = Duration::from_millis(2 * domain::config::YOUTUBE_KEPT_GAP_MS);
 
 /// A planned stall: what, how long after sink generation 1's build, and that build's instant.
 #[cfg(feature = "test-hooks")]
@@ -564,10 +575,24 @@ impl GstProgramme {
         encoder.set_property_from_str("tune", X264_TUNE);
         encoder.set_property_from_str("speed-preset", X264_SPEED_PRESET);
         encoder.set_property("bitrate", profile.video_kbps);
-        encoder.set_property("key-int-max", fps * 2);
+        encoder.set_property("key-int-max", profile.gop_frames());
         encoder.set_property("bframes", 0u32);
         encoder.set_property("vbv-buf-capacity", X264_VBV_MS);
-        encoder.set_property("option-string", X264_OPTIONS);
+        encoder.set_property("option-string", format!("{X264_OPTIONS}:{X264_NO_SCENE_CUT}"));
+        // F-036: a keyframe an output swap forces (Owed 84) never cuts a GOP under Cloudflare's
+        // floor. GstVideoEncoder holds a request that comes within this of its last keyframe, natural
+        // or forced, and makes it on the first frame that far on, in running time; never dropped.
+        // It depends on x264 having NO frame delay (the C1 review's I3): the encoder notes its last
+        // keyframe when x264 hands it out (`finish_frame`) and checks a request when a frame goes in
+        // (`chain`), so the two agree only because `zerolatency` turns on sliced threads with no
+        // lookahead. Frame threads (`sliced-threads=false`), `rc-lookahead` or `sync-lookahead` would
+        // hold the GOP's own keyframe inside x264 while a request passes unthrottled, and a GOP of a
+        // frame or two would reach the output again
+        // (`a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor`).
+        encoder.set_property(
+            "min-force-key-unit-interval",
+            gst::ClockTime::from_mseconds(FORCED_KEYFRAME_MIN_INTERVAL_MS).nseconds(),
+        );
         let profile_caps = capsfilter(
             gst::Caps::builder("video/x-h264")
                 .field("profile", "main")
@@ -883,11 +908,16 @@ impl ProgrammeOutput for GstProgramme {
             old.retire(&self.shared);
         }
         // The new output starts at a keyframe encoded after its sink can send (Owed 84): its feeder
-        // asks the encoder for one then, from its own thread.
+        // asks the encoder for one then, from its own thread. The encoder makes it at once, or at
+        // `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later (F-036), or
+        // none, when it has made one at or after `serves_from` already: the GOP's own keyframe,
+        // encoded after the reconnect point, starts the stream (the C1 review's I1). Before the ring
+        // has taken any video the feeder asks nothing: the encoder's first frame is the keyframe
+        // (`gst_output::KeyRequest`; CI on PR #109).
         let parser_src = r.parser_src.clone();
         #[cfg(feature = "test-hooks")]
         let refusals = Arc::clone(&self.key_refusals);
-        let request_key: gst_output::KeyRequest = Arc::new(move || {
+        let request_key: gst_output::KeyRequest = Arc::new(move |serves_from: gst::ClockTime| {
             #[cfg(feature = "test-hooks")]
             if refusals
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -896,6 +926,7 @@ impl ProgrammeOutput for GstProgramme {
                 return false;
             }
             let ev = gst_video::UpstreamForceKeyUnitEvent::builder()
+                .running_time(serves_from)
                 .all_headers(true)
                 .build();
             parser_src.send_event(ev)

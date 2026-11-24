@@ -17,9 +17,13 @@ pub struct Thresholds {
     pub input_backoff_base_ms: Ms,
     /// PDF failure table: input back-off 1 s → 10 s. The cap.
     pub input_backoff_cap_ms: Ms,
-    /// Spec §4.2: a connect that neither succeeds nor fails within this is treated as lost. F-002 kept
-    /// 5 s with a thin margin: the slowest healthy first decoded frame was 4.19 s (F-002) and the
-    /// slowest first AU 4.4 s (F-004 rerun 1), so C10 times "connected" to the first decoded frame.
+    /// Spec §4.2: a connect that neither succeeds nor fails within this is treated as lost. C10 times
+    /// "connected" to the first decoded frame. F-002 kept 5 s with a thin margin (the slowest healthy
+    /// first decoded frame 4.19 s, F-002; the slowest first AU 4.4 s, F-004 rerun 1). F-036 (stg,
+    /// 2026-11-24; the C1 brief's rule): 9 s. A phone that republishes with its 3 s GOP behind the 1 s
+    /// SRT latency can take over 5 s to a first decoded frame (derived: F-032's 4.2 s behind a 2 s
+    /// GOP, plus the GOP's extra second, is 5.2 s; the brief's estimate is 6 to 8 s), and at 5 s the
+    /// relay gave up six connects in a row while the camera was back.
     pub input_connect_timeout_ms: Ms,
     /// Spec §6 "reconnect forever": a Running input that delivers no frame for this long is treated as
     /// a Stalled loss and rebuilt. Set after the 3 s slate so the viewer sees the slate first. F-002
@@ -170,9 +174,24 @@ pub const OUTPUT_FPS_MIN_WINDOW_MS: Ms = 2_500;
 
 /// F-004 (owner-observed; docs/_INDEX.md decision log, the C00 owner session): YouTube kept the
 /// organiser's broadcast through 5 s and 15 s output gaps and started a new broadcast after a 30 s
-/// one. So every recovery path the broadcast must survive finishes its output gap UNDER this. A const,
-/// not a `Thresholds` field: it is YouTube's behaviour, not a setting of ours.
-pub const OUTPUT_GAP_BUDGET_MS: Ms = 15_000;
+/// one. The longest gap it was seen to keep. A const, not a `Thresholds` field: it is YouTube's
+/// behaviour, not a setting of ours. The process restart's budget (spec §6, "Output back ≤15 s") is
+/// this number; the output's recovery paths add F-036's floor to it (`OUTPUT_GAP_BUDGET_MS`).
+pub const YOUTUBE_KEPT_GAP_MS: Ms = 15_000;
+
+/// Every output recovery path the broadcast must survive finishes its output gap UNDER this: F-004's
+/// 15 s and the forced keyframe's floor (F-036; the C1 review's I2, the controller's ruling and the
+/// owner's apply-rec, 2026-11-24). A recovering sink's picture comes back at the keyframe its swap
+/// asks for, which the encoder holds to the floor after its last one: up to the floor after the new
+/// sink's first bytes. The rest of each path keeps F-004's 15 s (`output_egress_flat_ms` takes the
+/// floor back out, so the backstop's threshold does not move: a false hung declaration costs more
+/// than the floor). 17.2 s is past the longest gap YouTube was seen to keep and short of the 30 s that
+/// split the broadcast; the cost if YouTube splits between them is a documented worst gap 2.2 s
+/// longer. Not in it: F-028's lost forced keyframe (a destination that drops it, seen once in two
+/// MediaMTX runs, waits for the encoder's next own keyframe, a GOP after the forced one: up to
+/// floor + GOP = 5.2 s after the reconnect, 2 s before F-036). No recovery path the domain models
+/// loses a keyframe, so it is stated here, not budgeted.
+pub const OUTPUT_GAP_BUDGET_MS: Ms = YOUTUBE_KEPT_GAP_MS + FORCED_KEYFRAME_MIN_INTERVAL_MS;
 
 /// rtmp2sink's `timeout`, which C09 sets on every sink: the only detector of a destination stall (Owed 87;
 /// the owner, 2026-10-24, "A": the output's stall rule is retired). rtmp2 counts a message's bytes only once
@@ -185,6 +204,37 @@ pub const OUTPUT_GAP_BUDGET_MS: Ms = 15_000;
 /// `g_socket_client_set_timeout`: it bounds the TCP connect and every wait of the socket after it. A const,
 /// not a `Thresholds` field: the domain decides nothing on it (the sink's error is its event).
 pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 5_000;
+
+/// F-036: Cloudflare Stream's live input requirements
+/// (<https://developers.cloudflare.com/stream/stream-live/start-stream-live/>, "Requirements": "GOP
+/// duration (keyframe interval) must be between 2 and 10 seconds. Closed GOPs are required"). Outside
+/// it the input errors (`live_input.errored`, `ERR_GOP_OUT_OF_RANGE`), as the programme input (our
+/// x264 output) did twice on stg, sessions d908c90c and 5e5403ce, 2026-11-24. The floor.
+pub const CF_KEYFRAME_INTERVAL_MIN_MS: Ms = 2_000;
+/// F-036: Cloudflare's keyframe interval range, its ceiling (`CF_KEYFRAME_INTERVAL_MIN_MS`).
+pub const CF_KEYFRAME_INTERVAL_MAX_MS: Ms = 10_000;
+
+/// F-036: the programme's GOP, one keyframe every 3 s (the C1 brief): the capture app's own fix for
+/// the same 2 s edge (it measured ±14 ms of jitter at 2 s), a second inside Cloudflare's floor. C09
+/// sets x264enc's `key-int-max` to it in frames (`OutputProfile::gop_frames`) with x264's scene cut
+/// off (`scenecut=0`, which x264 honours and its `min-keyint` cannot replace: x264 clamps that to
+/// `key-int-max / 2 + 1`, F-036), so every GOP is this long, unless an output swap forces a keyframe
+/// (Owed 84; `FORCED_KEYFRAME_MIN_INTERVAL_MS` bounds that one).
+pub const PROGRAMME_GOP_MS: Ms = 3_000;
+
+/// F-036 (the C1 review's I1, the controller's ruling 2026-11-24): the margin a forced keyframe keeps
+/// over Cloudflare's floor. A held keyframe lands exactly at the floor (the programme stamps tick `i`
+/// at `i × 10⁹ / fps` ns, and GstVideoEncoder throttles on a strict `>`), and whether Cloudflare takes
+/// exactly 2 000 ms is not measured; the phone errored at 2 s ±14 ms. 200 ms: whole frames at 25, 30
+/// and 60 fps, and a GOP less the floor still leaves Owed 84's tests their 16 ticks (`config` test).
+pub const FORCED_KEYFRAME_MARGIN_MS: Ms = 200;
+
+/// F-036: the shortest GOP a forced keyframe may cut, Cloudflare's floor and a margin. Owed 84's
+/// output swap asks the encoder every output shares for a keyframe; asked within this of the last
+/// keyframe, it is deferred to this interval, never dropped. C09 sets it as x264enc's
+/// `min-force-key-unit-interval` (GstVideoEncoder, since 1.18), which holds the request in running
+/// time, the stream's own clock: a wall-clock rule cannot see when the last keyframe was encoded.
+pub const FORCED_KEYFRAME_MIN_INTERVAL_MS: Ms = CF_KEYFRAME_INTERVAL_MIN_MS + FORCED_KEYFRAME_MARGIN_MS;
 
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
@@ -205,13 +255,17 @@ pub const TICK_WIDEST_MS: Ms = {
     }
 };
 
-/// Owed 94's threshold, derived (the one place it is): F-004's budget less the backstop path's other
-/// terms, the next sink's whole connect, the base back-off (the swap is failure 1 from Connected), the
-/// poll that sees the last growth late, and a tick each for the backstop and the build; then floored
-/// to the poll's grid. With today's numbers 15 000 − 5 000 − 500 − 250 − 2 × 34 = 9 182, so 9 000 ms.
-/// A threshold the budget cannot hold is a compile error (the subtraction underflows).
+/// Owed 94's threshold, derived (the one place it is): the output gap budget less the backstop path's
+/// other terms, the forced keyframe's floor (F-036: the picture comes back up to it after the next
+/// sink's first bytes), the next sink's whole connect, the base back-off (the swap is failure 1 from
+/// Connected), the poll that sees the last growth late, and a tick each for the backstop and the
+/// build; then floored to the poll's grid. With today's numbers
+/// 17 200 − 2 200 − 5 000 − 500 − 250 − 2 × 34 = 9 182, so 9 000 ms, as before F-036 (the C1 review's
+/// I2: the floor does not shorten hung detection). A threshold the budget cannot hold is a compile
+/// error (the subtraction underflows).
 pub const fn output_egress_flat_ms(backoff_base_ms: Ms, connect_timeout_ms: Ms) -> Ms {
     let room = OUTPUT_GAP_BUDGET_MS
+        - FORCED_KEYFRAME_MIN_INTERVAL_MS
         - connect_timeout_ms
         - backoff_base_ms
         - OUTPUT_PROGRESS_POLL_MS
@@ -276,7 +330,7 @@ impl Default for Thresholds {
             resume_after_ms: 1_000,
             input_backoff_base_ms: 1_000,
             input_backoff_cap_ms: 10_000,
-            input_connect_timeout_ms: 5_000,
+            input_connect_timeout_ms: 9_000,
             input_stall_after_ms: 5_000,
             input_srt_latency_ms: 1_000,
             input_hold_end_after_ms: 20_000,
@@ -338,6 +392,16 @@ impl OutputProfile {
         1_000.0 / f64::from(self.fps)
     }
 
+    /// F-036: `PROGRAMME_GOP_MS` in this profile's frames (x264enc's `key-int-max`).
+    pub fn gop_frames(&self) -> u32 {
+        frames_in(self.fps, PROGRAMME_GOP_MS)
+    }
+
+    /// F-036: `FORCED_KEYFRAME_MIN_INTERVAL_MS` in this profile's frames.
+    pub fn forced_keyframe_min_frames(&self) -> u32 {
+        frames_in(self.fps, FORCED_KEYFRAME_MIN_INTERVAL_MS)
+    }
+
     /// Owed 86: the real output frame rate below which the output is starved
     /// (`OUTPUT_FPS_FLOOR_SHARE` of this profile's `fps`).
     pub fn fps_floor(&self) -> f64 {
@@ -349,6 +413,12 @@ impl OutputProfile {
     pub fn fps_recovered(&self) -> f64 {
         f64::from(self.fps) * OUTPUT_FPS_RECOVERED_SHARE
     }
+}
+
+/// `ms` at `fps`, in whole frames (rounded down; the config tests hold every interval to a whole
+/// number of frames in both profiles).
+fn frames_in(fps: u32, ms: Ms) -> u32 {
+    u32::try_from(u64::from(fps) * ms / 1_000).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -482,6 +552,21 @@ mod tests {
         );
     }
 
+    // F-036 (the C1 brief's rule, 2026-11-24): 9 s. Each term from its source, written here: the
+    // brief's estimate of the stg session's slow returns, 6 to 8 s after the connect (an estimate, not
+    // a measurement); F-032's first frames after the hold came up to 4.2 s after the connect behind a
+    // 2 s publisher GOP, and the phone's GOP is now 3 s, so up to a second more (5.2 s, derived). The
+    // timeout clears both, and the hold-end gate (F-032) still sits after a stall and a whole connect.
+    #[test]
+    fn input_connect_timeout_is_f036s_9_s_and_clears_a_3_s_gop_return() {
+        let t = Thresholds::default();
+        assert_eq!(t.input_connect_timeout_ms, 9_000, "F-036's rule");
+        let (brief_estimate, f032_slowest, gop_now, gop_then) = (8_000, 4_200, 3_000, 2_000);
+        assert!(t.input_connect_timeout_ms > brief_estimate);
+        assert!(t.input_connect_timeout_ms > f032_slowest + (gop_now - gop_then));
+        assert!(t.input_hold_end_after_ms > t.input_stall_after_ms + t.input_connect_timeout_ms);
+    }
+
     // C10: the SRT latency is the one every F-002 reader used (1 000 ms), so the measured first-frame
     // times and the in-chain overlay delay (ADR 0006's default) hold for it. A different value owes a
     // re-measure and moves the overlay delay with it.
@@ -509,13 +594,19 @@ mod tests {
     }
 
     // F-004 addendum: YouTube split the organiser's broadcast after a 30 s output gap and kept it
-    // through 15 s, so every recovery path must finish its gap under 15 s. The output's own worst
-    // single-attempt recovery from a destination stall: the sink's own timeout reports it (Owed 87),
-    // one capped back-off, then a connect that uses its whole timeout.
+    // through 15 s, so every recovery path must finish its gap under 15 s, and under F-036's floor
+    // more for the keyframe the new sink starts at. The output's own worst single-attempt recovery
+    // from a destination stall: the sink's own timeout reports it (Owed 87), one capped back-off, a
+    // connect that uses its whole timeout, then the keyframe held to the floor.
     #[test]
     fn a_destination_stall_and_one_reconnect_fit_inside_youtubes_15_s_split() {
         let t = Thresholds::default();
-        let gap = OUTPUT_SINK_TIMEOUT_MS + t.output_backoff_cap_ms + t.output_connect_timeout_ms;
+        let connect_path = OUTPUT_SINK_TIMEOUT_MS + t.output_backoff_cap_ms + t.output_connect_timeout_ms;
+        assert!(
+            connect_path < YOUTUBE_KEPT_GAP_MS,
+            "output recovery to the connect {connect_path} ms"
+        );
+        let gap = connect_path + FORCED_KEYFRAME_MIN_INTERVAL_MS;
         assert!(gap < OUTPUT_GAP_BUDGET_MS, "output recovery gap {gap} ms");
     }
 
@@ -531,10 +622,11 @@ mod tests {
     // Owed 94 (the owner, 2026-10-24, "B"): the egress backstop's worst path, each term from its own
     // source and written here, not read from the derivation: the last growth is seen up to one poll late
     // (C09's poll), the backstop fires on the first tick at or after its threshold, the swap waits the
-    // base back-off (failure 1 from Connected) and then the first tick after it, and the next sink's
-    // first bytes come 1 ms before its connect timeout. All of it stays under F-004's 15 s, and a
-    // threshold one poll longer would not: the threshold is as long as the budget allows, on the poll's
-    // grid (nothing finer can see a flat total).
+    // base back-off (failure 1 from Connected) and then the first tick after it, the next sink's
+    // first bytes come 1 ms before its connect timeout, and its keyframe up to F-036's floor after
+    // them. All of it stays under the output gap budget, and a threshold one poll longer would not:
+    // the threshold is as long as the budget allows, on the poll's grid (nothing finer can see a flat
+    // total). F-036 did not move it (the C1 review's I2(b)): 9 000 ms, as Owed 94 set it.
     #[test]
     fn the_egress_backstop_is_the_longest_threshold_that_keeps_the_15_s_budget() {
         let t = Thresholds::default();
@@ -551,8 +643,10 @@ mod tests {
                 + t.output_backoff_base_ms
                 + tick
                 + (t.output_connect_timeout_ms - 1)
+                + FORCED_KEYFRAME_MIN_INTERVAL_MS
         };
         let flat = t.output_egress_flat_ms;
+        assert_eq!(flat, 9_000, "Owed 94's threshold, unmoved by F-036's floor");
         assert!(
             worst(flat) < OUTPUT_GAP_BUDGET_MS,
             "backstop path {} ms",
@@ -590,6 +684,67 @@ mod tests {
         );
     }
 
+    // F-036, each number against its source, written here: Cloudflare's 2 to 10 s (its live input
+    // requirements), the 3 s GOP (the brief; the capture app's fix), and the forced keyframe's floor at
+    // Cloudflare's plus 200 ms (the controller's ruling on the C1 review's I1). In both modes each is
+    // a whole number of frames, so x264's frame counts land on the millisecond, and the GOP and the
+    // floor sit inside Cloudflare's range, the floor strictly above its edge.
+    //
+    // The bound: Owed 84's programme tests (`adapters/tests/programme_output.rs`) place a swap a
+    // floor after the GOP's keyframe and need the encoder's own next keyframe at least
+    // `OWED84_MARGIN_TICKS` (10) + `OWED84_KEY_WAIT_TICKS` (6) ticks after it, so the GOP less the
+    // floor is at least 16 frames (24 today; a 2 500 ms floor would leave 15).
+    #[test]
+    fn the_gop_and_the_forced_keyframe_floor_sit_inside_cloudflares_range() {
+        assert_eq!(
+            (CF_KEYFRAME_INTERVAL_MIN_MS, CF_KEYFRAME_INTERVAL_MAX_MS),
+            (2_000, 10_000),
+            "Cloudflare's range"
+        );
+        assert_eq!(PROGRAMME_GOP_MS, 3_000, "the brief's 3 s");
+        assert_eq!(FORCED_KEYFRAME_MARGIN_MS, 200, "the ruling's margin");
+        assert_eq!(
+            FORCED_KEYFRAME_MIN_INTERVAL_MS,
+            2_000 + 200,
+            "Cloudflare's floor and the margin"
+        );
+        // Constant against constant: the compiler checks it (clippy refuses a runtime assert).
+        const _: () = assert!(FORCED_KEYFRAME_MIN_INTERVAL_MS > CF_KEYFRAME_INTERVAL_MIN_MS);
+        let (owed84_margin_ticks, owed84_key_wait_ticks) = (10, 6);
+        let mut checked = 0;
+        for p in BOTH_MODES {
+            assert!(
+                p.gop_frames() - p.forced_keyframe_min_frames()
+                    >= owed84_margin_ticks + owed84_key_wait_ticks,
+                "{p:?}: GOP {} less floor {} frames",
+                p.gop_frames(),
+                p.forced_keyframe_min_frames()
+            );
+            for ms in [PROGRAMME_GOP_MS, FORCED_KEYFRAME_MIN_INTERVAL_MS] {
+                let fps = Ms::from(p.fps);
+                assert_eq!(fps * ms % 1_000, 0, "{p:?}: {ms} ms is not whole frames");
+                assert!(
+                    (CF_KEYFRAME_INTERVAL_MIN_MS..=CF_KEYFRAME_INTERVAL_MAX_MS).contains(&ms),
+                    "{ms} ms"
+                );
+                checked += 1;
+            }
+            // 30 fps (ADR 0005): 90 frames a GOP, the floor 66.
+            assert_eq!(
+                (p.gop_frames(), p.forced_keyframe_min_frames()),
+                (90, 66),
+                "{p:?}"
+            );
+            assert!(p.forced_keyframe_min_frames() < p.gop_frames(), "{p:?}");
+        }
+        // The margin holds whole frames at the rates the ruling names, not only ours.
+        for fps in [25, 30, 60] {
+            assert_eq!(fps * FORCED_KEYFRAME_MIN_INTERVAL_MS % 1_000, 0, "{fps} fps");
+            checked += 1;
+        }
+        assert_eq!(checked, 7, "intervals checked: {checked}");
+    }
+
     // Owed 15 (the choice recorded in `_FINDINGS.md` F-011): C09 reads the sink's total every 250 ms.
     #[test]
     fn the_progress_poll_is_owed_15s_250_ms() {
@@ -615,10 +770,15 @@ mod tests {
         }
     }
 
-    // F-004: the same broadcast survived a 15 s gap, and a 30 s gap split it.
+    // F-004: the same broadcast survived a 15 s gap, and a 30 s gap split it. F-036 (the C1 review's
+    // I2, 2026-11-24): the output's budget is that and the forced keyframe's 2.2 s floor, still short
+    // of the gap that split it.
     #[test]
     fn output_gap_budget_is_the_15_s_youtube_kept_in_f004() {
-        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000);
+        assert_eq!(YOUTUBE_KEPT_GAP_MS, 15_000);
+        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_200);
+        // Short of F-004's split; constant against constant, so the compiler checks it.
+        const _: () = assert!(OUTPUT_GAP_BUDGET_MS < 30_000);
     }
 
     // C11b, each number against its own source. Owner ruling 2026-10-19 "B": an early in-place restart

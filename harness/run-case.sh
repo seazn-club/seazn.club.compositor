@@ -350,6 +350,9 @@ require_restart_outage() {
 }
 
 # The output's checks after a fault cleared at mark "clear" (cases 4, 5, 12 and 17). 4 checks.
+# `budget_output_reconnect_ms` is spec §6's "≤5 s" and F-036's forced-keyframe floor, 7.2 s (the C1
+# review's I2(a), the owner's apply-rec ruling 2026-11-24): the new sink starts at the keyframe its
+# swap asks for, which the encoder holds to the floor after its last one.
 require_output_recovers() {
   require outage_spans_fault '[.output_outages[] | select(.to_wall_ms > mark_at("cut") and .from_wall_ms < mark_at("clear"))] | length >= 1' \
     '[.output_outages[] | {from_wall_ms, to_wall_ms}]'
