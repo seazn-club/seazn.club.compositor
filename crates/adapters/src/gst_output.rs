@@ -87,7 +87,11 @@ const BUS_WAIT: Duration = Duration::from_millis(50);
 
 pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// Asks the programme's encoder for a keyframe (a force-key-unit event); false if it was not taken.
-pub(crate) type KeyRequest = Arc<dyn Fn() -> bool + Send + Sync>;
+/// The argument is the running time from which a keyframe serves (the reconnect point's: just after
+/// the newest video the ring has taken, `RingState::newest_video`): GstVideoEncoder makes none when
+/// it has already made one at or after it (F-036, the C1 review's I1), so a GOP's own keyframe
+/// encoded after the reconnect point starts the stream with no forced one a floor behind it.
+pub(crate) type KeyRequest = Arc<dyn Fn(gst::ClockTime) -> bool + Send + Sync>;
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -129,6 +133,9 @@ struct RingState {
     drained_sent: bool,
     /// The samples each encoder has pushed, dropped ones included: what the encoders delivered.
     encoded: Encoded,
+    /// The running time of the newest video entry ever pushed, dropped ones included (F-036): a
+    /// keyframe after it was encoded after any reconnect point taken now.
+    newest_video: Option<gst::ClockTime>,
 }
 
 /// The programme → output hand-off: bounded by span and by count, dropping the oldest.
@@ -145,6 +152,7 @@ impl EncodedRing {
         r.next_seq += 1;
         if e.video {
             r.encoded.video += 1;
+            r.newest_video = Some(r.newest_video.map_or(e.pts, |n| n.max(e.pts)));
         } else {
             r.encoded.audio += 1;
         }
@@ -629,7 +637,8 @@ enum Next {
 
 /// The keyframe asked for at the reconnect point (Owed 84): asked again at each entry until the
 /// encoder takes it or the stream has started, so a refused request does not leave the stream
-/// waiting for the encoder's own keyframe, up to a GOP away (3 s, F-036; PR #57 review m-6).
+/// waiting for the encoder's own keyframe, up to a GOP away (3 s, F-036; PR #57 review m-6). The
+/// request carries the running time a keyframe serves from (`KeyRequest`).
 #[derive(Default)]
 struct KeyAsk {
     tries: u32,
@@ -638,12 +647,12 @@ struct KeyAsk {
 
 impl Feeder {
     fn run(self) {
-        let Some(reconnect) = self.reconnect_point() else {
+        let Some((reconnect, serves_from)) = self.reconnect_point() else {
             return;
         };
         let mut pick = Picker::new(reconnect);
         let mut ask = KeyAsk::default();
-        self.ask_key(&mut ask);
+        self.ask_key(&mut ask, serves_from);
         loop {
             match self.next() {
                 Next::Stop => return,
@@ -657,7 +666,7 @@ impl Feeder {
                 }
                 Next::Entry(e) => {
                     if !pick.started() {
-                        self.ask_key(&mut ask);
+                        self.ask_key(&mut ask, serves_from);
                     }
                     pick.take(e, |e, base| self.push(e, base));
                 }
@@ -665,23 +674,26 @@ impl Feeder {
         }
     }
 
-    /// Asks the encoder for a keyframe, unless it has taken a request already.
-    fn ask_key(&self, ask: &mut KeyAsk) {
+    /// Asks the encoder for a keyframe, one from `serves_from` on, unless it has taken a request
+    /// already. The take is logged (the C1 review's m4: the line follows the ask, so a reader of it
+    /// knows the request is with the encoder).
+    fn ask_key(&self, ask: &mut KeyAsk, serves_from: gst::ClockTime) {
         if ask.taken {
             return;
         }
         ask.tries += 1;
-        let taken = (self.request_key)();
+        let taken = (self.request_key)(serves_from);
         ask.taken = taken;
-        if !taken && ask.tries == 1 {
+        if taken {
+            self.shared.log(&format!(
+                "output gen={}: the keyframe request was taken at try {}; a keyframe from running \
+                 time {serves_from} serves it",
+                self.gen, ask.tries
+            ));
+        } else if ask.tries == 1 {
             self.shared.log(&format!(
                 "output gen={}: the keyframe request was not taken; it is asked again at each frame",
                 self.gen
-            ));
-        } else if taken && ask.tries > 1 {
-            self.shared.log(&format!(
-                "output gen={}: the keyframe request was taken at try {}",
-                self.gen, ask.tries
             ));
         }
     }
@@ -699,11 +711,13 @@ impl Feeder {
     }
 
     /// Waits, taking nothing, until the sink can send (`Gate`), and returns the reconnect point: the
-    /// seq of the first entry encoded after it (`run` then asks for the keyframe). `None`: retired,
+    /// seq of the first entry encoded after it (`run` then asks for the keyframe), and the running
+    /// time a keyframe serves from (1 ns after the newest video the ring has taken, or 0 before any:
+    /// every video entry encoded later is at or after it). `None`: retired,
     /// the ring is another generation's, or both encoders ended first. That last is the programme's
     /// drain reaching a sink that never connected: nothing is owed to it (whatever the ring holds
     /// predates any connect), so `release_unsent`.
-    fn reconnect_point(&self) -> Option<u64> {
+    fn reconnect_point(&self) -> Option<(u64, gst::ClockTime)> {
         let since = Instant::now();
         loop {
             if self.retired.load(Ordering::SeqCst) {
@@ -715,6 +729,9 @@ impl Feeder {
                     return None;
                 }
                 let first = r.next_seq;
+                let serves_from = r
+                    .newest_video
+                    .map_or(gst::ClockTime::ZERO, |t| t + gst::ClockTime::from_nseconds(1));
                 let held = r.entries.iter().filter(|e| e.video).count();
                 drop(r);
                 self.shared.log(&format!(
@@ -723,7 +740,7 @@ impl Feeder {
                     self.gen,
                     since.elapsed().as_millis()
                 ));
-                return Some(first);
+                return Some((first, serves_from));
             }
             let r = locked(&self.ring.state);
             if r.owner != self.gen {

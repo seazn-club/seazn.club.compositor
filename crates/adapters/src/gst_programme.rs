@@ -99,9 +99,10 @@ pub enum SinkStall {
     Hang,
 }
 
-/// How long a planted hang holds: twice F-004's budget, past the backstop and a whole recovery.
+/// How long a planted hang holds: twice F-004's 15 s, past the backstop and a whole recovery (17.2 s
+/// with F-036's floor). The kept gap, not the output's budget, so F-036 left case 18's hold at 30 s.
 #[cfg(feature = "test-hooks")]
-pub const SINK_HANG_HOLD: Duration = Duration::from_millis(2 * domain::config::OUTPUT_GAP_BUDGET_MS);
+pub const SINK_HANG_HOLD: Duration = Duration::from_millis(2 * domain::config::YOUTUBE_KEPT_GAP_MS);
 
 /// A planned stall: what, how long after sink generation 1's build, and that build's instant.
 #[cfg(feature = "test-hooks")]
@@ -581,6 +582,13 @@ impl GstProgramme {
         // F-036: a keyframe an output swap forces (Owed 84) never cuts a GOP under Cloudflare's
         // floor. GstVideoEncoder holds a request that comes within this of its last keyframe, natural
         // or forced, and makes it on the first frame that far on, in running time; never dropped.
+        // It depends on x264 having NO frame delay (the C1 review's I3): the encoder notes its last
+        // keyframe when x264 hands it out (`finish_frame`) and checks a request when a frame goes in
+        // (`chain`), so the two agree only because `zerolatency` turns on sliced threads with no
+        // lookahead. Frame threads (`sliced-threads=false`), `rc-lookahead` or `sync-lookahead` would
+        // hold the GOP's own keyframe inside x264 while a request passes unthrottled, and a GOP of a
+        // frame or two would reach the output again
+        // (`a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor`).
         encoder.set_property(
             "min-force-key-unit-interval",
             gst::ClockTime::from_mseconds(FORCED_KEYFRAME_MIN_INTERVAL_MS).nseconds(),
@@ -901,11 +909,13 @@ impl ProgrammeOutput for GstProgramme {
         }
         // The new output starts at a keyframe encoded after its sink can send (Owed 84): its feeder
         // asks the encoder for one then, from its own thread. The encoder makes it at once, or at
-        // `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later (F-036).
+        // `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later (F-036), or
+        // none, when it has made one at or after `serves_from` already: the GOP's own keyframe,
+        // encoded after the reconnect point, starts the stream (the C1 review's I1).
         let parser_src = r.parser_src.clone();
         #[cfg(feature = "test-hooks")]
         let refusals = Arc::clone(&self.key_refusals);
-        let request_key: gst_output::KeyRequest = Arc::new(move || {
+        let request_key: gst_output::KeyRequest = Arc::new(move |serves_from: gst::ClockTime| {
             #[cfg(feature = "test-hooks")]
             if refusals
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -914,6 +924,7 @@ impl ProgrammeOutput for GstProgramme {
                 return false;
             }
             let ev = gst_video::UpstreamForceKeyUnitEvent::builder()
+                .running_time(serves_from)
                 .all_headers(true)
                 .build();
             parser_src.send_event(ev)
