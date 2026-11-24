@@ -3346,3 +3346,49 @@ GStreamer and run on CI only.
   1 400 ms. The case runs on CI only, and its next chaos run is owed this bound.
 - The CEF back-off, which mirrored the input's PDF numbers, stays 1 s → 10 s: the camera's evidence
   says nothing of CEF's.
+
+## F-037: a given-up camera generation that delivers again is taken back, bytes still arriving lengthen the stall, the camera's video queue no longer drops, and the slate waits 4.5 s (C3, 2026-11-24)
+
+**Evidence** (this repo, branch `fix/relay-stall-and-loss-policy`; the C3 brief and the owner's
+ruling relayed by the coordinator; no stg run yet).
+
+- **Owed 49's question, answered by design rather than by a measurement.** F-012 could not tell
+  whether Cloudflare wakes a connected, silent reader when its source returns. Either way the
+  adapter's gate is where it shows: a given-up build keeps running until its rebuild, and its first
+  video sample after the abandon reaches the shut gate. C3 makes that sample an event
+  (`InputAgain { gen }`, once an abandon) instead of a log line, and the domain decides. Inside the
+  back-off (`now < until`, the rebuild instant the link already holds), the current generation, given
+  up by the link's own rule and not reported lost since, is taken back: Running with no rebuild. Past
+  it, the rebuild runs at its old instant, as before. So the take-back costs no new number, and its
+  window is exactly the first back-off after a stall (`input_backoff_base_ms`, 1 000 ms).
+- **What a take-back saves.** A phone paused just past the 5 s stall (chaos case 20's 5.2 s)
+  used to cost a rebuild 1 s after the give-up, then Cloudflare's connect (F-036's 9 s timeout bounds
+  it) and the first keyframe of a 3 s GOP. Taken back, the picture returns with the build's next
+  decoded frame.
+- **The stall bound while bytes arrive.** A 3 s GOP that loses its keyframe leaves the decoder
+  withholding pictures to the next one while the source is still delivering. The stall rule read that
+  as a dead camera at 5 s. Now, while the build's received bytes rose within `input_bytes_fresh_ms`
+  (1 000 ms, one SRT latency, F-002), the bound is `input_decode_wait_ms` = 5 000 + `CAMERA_GOP_MS`
+  3 000 = 8 000 ms; once they stop, the plain 5 s. The slate never waits for bytes (it is the
+  viewer's rule, not the connection's), and the hold-end gate still holds (20 000 > 8 000 + 9 000).
+- **The queue before the decoder.** It was leaky downstream at 400 ms: under a stall it dropped
+  compressed access units, and every drop mid-GOP lost a reference and froze the picture to the next
+  keyframe, up to 3 s on the phone's GOP. It is now non-leaky and holds `CAMERA_VIDEO_QUEUE_MS`
+  (4 000 = one GOP + one SRT latency), so libsrt's too-late drop is the one loss on the input leg; a
+  wedged decoder fills it, and the stall rule rebuilds the generation (4 000 < 5 000).
+- **The counters.** Withheld spans (units went in, no picture came out for `frozen_after_ms`,
+  500 ms) and queue overruns are on the `input received` line, on `Measured`, and behind
+  `RELAY_INPUT_BEAT` on the beat (`inputWithheldSpans`, `inputQueueOverruns`, proposed). Their
+  numbers are owed (Owed 111).
+- **The slate (the owner's ruling, 2026-11-24, verbatim: "keep the frozen picture, 4.5 s
+  slate").** `output-corrupt=false` stays (Owed 48), so a loss holds the last good picture.
+  `slate_after_ms` 3 000 → 4 500 (a 3 s GOP + 1.5 s): one lost keyframe's freeze stays a frozen
+  picture, and the slate still comes before the stall (5 000). The slate budget is 4.6 s (the old
+  3.1 s budget's 100 ms of tick jitter, `SLATE_BUDGET_SLACK_MS`).
+
+**Verified here:** domain and app tests (take-back, bytes, both profiles), adapters' pure tests
+under the link stub (stats, contract, control_http, metrics_proc), harness lib and the new verdict
+world. **Owed to CI:** the GStreamer legs (adapters `input.rs`: the `InputAgain` report, the taken
+back build's frames, the byte count's reset, the overrun on a hung decoder, the queue's bounds),
+harness `case_verdicts`/`chaos_table` (bash 4), and chaos case 20's first run, whose expected
+verdicts are every check PASS with `loss_window_gaps` measured.

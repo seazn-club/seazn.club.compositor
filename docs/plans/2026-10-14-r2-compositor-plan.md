@@ -61,7 +61,10 @@ These apply to every task. Values are copied from the spec and ADRs.
 - **Output:** stall when no bytes are acked for 5 s. Reconnect within 5 s. Encoded ring buffer 2 s,
   dropping the oldest.
 - **Queues:** decoded video 1 s, audio 400 ms. All leaky, dropping the oldest. Nothing unbounded,
-  anywhere.
+  anywhere. (Amended 2026-11-24, C3, S5: the queue before the camera's video decoder holds
+  compressed access units and is no longer leaky. A drop there loses a reference mid-GOP and freezes
+  the picture to the next keyframe, so it blocks the source instead, bounded by
+  `CAMERA_VIDEO_QUEUE_MS`; libsrt's own too-late drop is then the one loss on the input leg.)
 - **Memory and CPU:** 1 GB soft limit (alert), 2 GB hard. The OOM order kills CEF before the encoder.
   CEF is capped at about 600 MB and recycled every 2 h. CPU ≤70 % sustained.
 - **Machine:** Fly `performance-4x`, 8 GB, region `lhr`, restart `on-failure` with `max_retries: 2`,
