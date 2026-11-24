@@ -62,6 +62,7 @@
   "resume_after_ms": 1000,
   "slate_after_ms": 3000,
   "source": "cargo run -p harness --bin dump-thresholds > harness/thresholds.json (C14); never edited by hand",
+  "spec_output_reconnect_ms": 5000,
   "teardown_leak_after_ms": 3000,
   "tick_widest_ms": 34
 }

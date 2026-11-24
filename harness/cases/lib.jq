@@ -163,8 +163,9 @@ def stall_swap($cut):
 #   lines' own `ts=`: the error line is written before the domain's `now` for it is read, and the
 #   swap line after the tick that builds, both on the process's ms clock, so a correct swap is never
 #   under the base; a swap that skipped the back-off lands within a tick of the error, far below it)
-#   and inside the output reconnect budget (budget_output_reconnect_ms: §6 "≤5 s" and F-036's
-#   forced-keyframe floor; a swap waits for no keyframe, so the floor only loosens it). Docker's stamps
+#   and inside spec §6's output reconnect "≤5 s" (spec_output_reconnect_ms: the swap is built before
+#   any keyframe, so F-036's forced-keyframe floor, which budget_output_reconnect_ms adds for the
+#   stream's return, does not apply; CI on PR #109). Docker's stamps
 #   cannot judge this: `docker logs --timestamps` stamps each line when its daemon reads it, so the
 #   pair can sit closer than the process wrote them (PR #71's CI run 40137725801: 499.38 ms at ns
 #   precision for a swap whose `ts=` were 500 apart, the error line read about 1.4 ms late);
@@ -184,7 +185,7 @@ def stall_swap_judged($cut):
   | $s.swap_ms != null and $s.swap_beat_ms != null and $s.last_growth_ms != null and $s.reasons_paired
     and $s.reason == "error"
     and $s.error_to_swap_ms >= $t.output_backoff_base_ms
-    and $s.error_to_swap_ms <= $t.budget_output_reconnect_ms
+    and $s.error_to_swap_ms <= $t.spec_output_reconnect_ms
     and $s.from_growth_ms <= $s.bound_ms
     and $s.error_from_cut_ms >= $t.output_sink_timeout_ms - $t.frame_period_ms
     and $s.error_from_cut_ms <= $t.output_sink_timeout_ms + $t.budget_output_lost_max_ms;

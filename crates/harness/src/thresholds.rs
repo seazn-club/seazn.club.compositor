@@ -20,14 +20,16 @@ use serde_json::{json, Map, Value};
 pub const BUDGET_SLATE_AFTER_LOSS_MS: u64 = 3_100;
 /// Spec §6 "Budgets": "return to live ≤1.2 s" (the failure table: "Live 1.2 s after frames return").
 pub const BUDGET_RETURN_TO_LIVE_MS: u64 = 1_200;
-/// Spec §6 "Budgets": "output reconnect ≤5 s", as the spec states it.
+/// Spec §6 "Budgets": "output reconnect ≤5 s", as the spec states it. Read as is where no keyframe
+/// is waited for: lib.jq's error-to-swap bound (a swap is built after the back-off, before any
+/// keyframe; CI on PR #109 found the floor-widened bound loosened that guard by 2.2 s).
 pub const SPEC_OUTPUT_RECONNECT_MS: u64 = 5_000;
 /// The output reconnect budget every case reads: spec §6's ≤5 s and F-036's forced-keyframe floor
 /// (the C1 review's I2(a); the owner's apply-rec ruling 2026-11-24, docs/_INDEX.md: spec §6's "≤5 s"
 /// now reads "≤5 s + forced-key floor"). A reconnected sink starts at the keyframe its swap asks for,
 /// which the encoder holds to the floor after its last one. Its readers: run-case.sh's
-/// `output_reconnect`, lib.jq's error-to-swap bound, case 18 (`output-hung.sh`) and the soak's
-/// verdict 2 (`soak/verdict.jq`).
+/// `output_reconnect`, case 18 (`output-hung.sh`) and the soak's verdict 2 (`soak/verdict.jq`).
+/// Not lib.jq's error-to-swap bound, which waits for no keyframe (`SPEC_OUTPUT_RECONNECT_MS`).
 pub const BUDGET_OUTPUT_RECONNECT_MS: u64 = SPEC_OUTPUT_RECONNECT_MS + FORCED_KEYFRAME_MIN_INTERVAL_MS;
 /// Spec §6, the failure table's output disconnect / stall row: "≤2 s of programme lost".
 pub const BUDGET_OUTPUT_LOST_MAX_MS: u64 = 2_000;
@@ -223,6 +225,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("budget_slate_after_loss_ms", json!(BUDGET_SLATE_AFTER_LOSS_MS));
     put("budget_return_to_live_ms", json!(BUDGET_RETURN_TO_LIVE_MS));
     put("budget_output_reconnect_ms", json!(BUDGET_OUTPUT_RECONNECT_MS));
+    put("spec_output_reconnect_ms", json!(SPEC_OUTPUT_RECONNECT_MS));
     put("budget_output_lost_max_ms", json!(BUDGET_OUTPUT_LOST_MAX_MS));
     put("budget_ladder_realtime_ms", json!(BUDGET_LADDER_REALTIME_MS));
     put(
