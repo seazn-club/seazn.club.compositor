@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use app::ports::{Inbound, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Sender;
-use domain::config::OutputProfile;
+use domain::config::{OutputProfile, FORCED_KEYFRAME_MIN_INTERVAL_MS};
 use domain::health::ExitDetail;
 use domain::ladder::Rung;
 use domain::programme::FrameChoice;
@@ -578,6 +578,13 @@ impl GstProgramme {
         encoder.set_property("bframes", 0u32);
         encoder.set_property("vbv-buf-capacity", X264_VBV_MS);
         encoder.set_property("option-string", format!("{X264_OPTIONS}:{X264_NO_SCENE_CUT}"));
+        // F-036: a keyframe an output swap forces (Owed 84) never cuts a GOP under Cloudflare's
+        // floor. GstVideoEncoder holds a request that comes within this of its last keyframe, natural
+        // or forced, and makes it on the first frame that far on, in running time; never dropped.
+        encoder.set_property(
+            "min-force-key-unit-interval",
+            gst::ClockTime::from_mseconds(FORCED_KEYFRAME_MIN_INTERVAL_MS).nseconds(),
+        );
         let profile_caps = capsfilter(
             gst::Caps::builder("video/x-h264")
                 .field("profile", "main")
@@ -893,7 +900,8 @@ impl ProgrammeOutput for GstProgramme {
             old.retire(&self.shared);
         }
         // The new output starts at a keyframe encoded after its sink can send (Owed 84): its feeder
-        // asks the encoder for one then, from its own thread.
+        // asks the encoder for one then, from its own thread. The encoder makes it at once, or at
+        // `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later (F-036).
         let parser_src = r.parser_src.clone();
         #[cfg(feature = "test-hooks")]
         let refusals = Arc::clone(&self.key_refusals);

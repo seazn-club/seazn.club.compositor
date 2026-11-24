@@ -12,9 +12,10 @@
 //! the stream restarts at the next keyframe, so viewers never get a burst of old frames; F-023).
 //! The feeder takes nothing from the ring until the sink can send (`Gate`): a file at once, and
 //! rtmp2sink once its publish is accepted. Until then the ring stays the only queue, and it drops
-//! its oldest. At that moment (the reconnect point) the feeder asks the encoder for a keyframe, and
-//! no video frame the ring holds then may start the stream (`Picker`): the first frame sent is a
-//! keyframe encoded after the reconnect point, and no audio older than it is sent. A request the
+//! its oldest. At that moment (the reconnect point) the feeder asks the encoder for a keyframe (made
+//! at once, or, within `FORCED_KEYFRAME_MIN_INTERVAL_MS` of the encoder's last keyframe, at that
+//! floor: F-036), and no video frame the ring holds then may start the stream (`Picker`): the first
+//! frame sent is a keyframe encoded after the reconnect point, and no audio older than it is sent. A request the
 //! encoder does not take is asked again at each entry. A drain that reaches an output that has sent
 //! nothing, at the gate or after it, ends with the encoders (`release_unsent`).
 //!
