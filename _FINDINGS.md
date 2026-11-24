@@ -3392,3 +3392,58 @@ world. **Owed to CI:** the GStreamer legs (adapters `input.rs`: the `InputAgain`
 back build's frames, the byte count's reset, the overrun on a hung decoder, the queue's bounds),
 harness `case_verdicts`/`chaos_table` (bash 4), and chaos case 20's first run, whose expected
 verdicts are every check PASS with `loss_window_gaps` measured.
+
+## F-038: when the boot's first publish lands after the encoder's first frames, the stream starts at the encoder's first keyframe, for a backlog of up to half the forced keyframe's floor (C3b, 2026-11-24)
+
+**Evidence** (CI and chaos on this repo; branch `fix/output-first-gop-race`, PR #112).
+
+- **The race, three times in C3's chaos runs (3 of 156 legs).** Each red leg's sink could send just
+  after the encoder's first frame, by when the ring held that frame. Owed 84's gate dropped it
+  (`output gen=1: the sink can send after 37 ms; the 1 video frames queued before it are dropped`).
+  The keyframe the gate then asked for is held to F-036's floor after frame 0 (fact 4), so the
+  stream started about 2.2 s late. Run 45480676592 (`cef-hung`, `no_output_outages`): one head
+  outage of 813 ms. C3's final run 45498019823 (`dest-stall-rule`, `no_outage_outside_fault`): one
+  head outage of 816 ms, the same line. The green legs logged `0 video frames queued` and `no
+  keyframe is asked` (F-036 fact 8's path: no video yet, so the first frame starts the stream).
+- **The fix, read on its first chaos run.** Run 45498205073 (`cef-hung`, PASS 19/19,
+  `no_output_outages` 0) lost the same race and took the new path: `output gen=1: the sink can send
+  after 37 ms; the 1 video frames queued before it are the encoder's first, 0 ms from its first
+  keyframe (Owed 112), so it starts at the encoder's first keyframe and no keyframe is asked`. Run
+  45500994327 (PASS 19/19) took fact 8's path (`0 video frames queued`).
+- **The burst it costs** (CI, `programme_output.rs`, the real rtmp2sink against `FakeRtmp`). A
+  publish 1, 2 or 3 frames late ran 15, 54 and 86 ms ahead of real time at 720p (19 ms at 1080p,
+  1 late). A backlog of exactly the bound ran 1 122 ms ahead. Every paced frame reached the
+  destination, with keyframes at 0 and the GOP's own 90.
+
+**Facts.**
+
+1. **Why the rule is bounded.** Taking the backlog costs it as latency, delivered in one burst at
+   the publish. Dropping it costs a head outage of the floor less the backlog. The two are equal
+   at half the floor, so `FIRST_GOP_CATCH_UP_MAX_MS` = `FORCED_KEYFRAME_MIN_INTERVAL_MS` / 2 =
+   1 100 ms, 33 frames at 30 fps. Either way the head is then at most 1.1 s off. A backlog past it
+   is dropped as Owed 84 drops it.
+2. **Why the whole first GOP is not taken.** Without a bound, F-036 fact 8's guard extended to the
+   first GOP would send up to the ring's 2 s at once: F-023's burst, which Owed 84 refused. Owed 84's
+   own drain tests (`a_publish_accepted_during_the_drain_…`, `a_drain_before_the_asked_keyframe_…`)
+   hold 60 of the encoder's first frames at the gate and pin that they are not sent.
+3. **The encoder's first frames, exactly.** The rule applies only when the ring holds every video
+   frame the encoders pushed (`Encoded.video`: none dropped, none taken by an earlier output) and
+   the oldest of them is a keyframe (x264's first frame). The feeder takes those entries out of the
+   ring under the gate's lock, so the ring cannot drop the keyframe before it is sent, and it asks
+   for no keyframe. So no forced keyframe follows a floor later, and the first GOP stays the GOP's
+   own 3 s.
+
+**Changes** (C3b). `config.rs`: `FIRST_GOP_CATCH_UP_MAX_MS`. `gst_output.rs`: `first_gop_backlog`
+and `Reconnect` (the gate's start: the first-GOP entries, or the old drop), with a new gate line.
+The old line is unchanged in its prefix, so the harness's `sink_publishes` reads both
+(`logfacts.rs`, its source pin now counts the two). Witnesses: the host unit tests
+`the_encoders_first_frames_within_the_bound_…` and `a_ring_without_every_first_frame_…` (4 mutants,
+each killed), and the GStreamer tests `a_publish_that_lands_frames_after_the_first_…` and
+`a_first_gop_backlog_at_the_bound_is_taken_and_one_frame_past_it_is_dropped` (CI only).
+
+**Consequences.**
+
+- A first publish up to 1.1 s late now carries that backlog as latency for its sink's life (the
+  next swap's Owed 84 start ends it). How Cloudflare's ingest and YouTube take a burst of up to
+  1.1 s at the publish is not measured. MediaMTX's recorder discarded F-023's 4 s burst; the races
+  seen so far were 37 to 38 ms.
