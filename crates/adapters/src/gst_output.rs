@@ -645,6 +645,8 @@ enum Next {
 struct KeyAsk {
     tries: u32,
     taken: bool,
+    /// `ask_key` has said that nothing is asked (no video yet): said once, at its first call.
+    said_none: bool,
 }
 
 impl Feeder {
@@ -663,14 +665,8 @@ impl Feeder {
         // x264enc's min-pts has moved that frame's PTS on by 1 000 h (gstx264enc.c 1418; 1574-1583).
         // The 1 000 h becomes `last_force_key_unit_request` (1696), and the floor then throttles
         // every later forced keyframe (1600-1607) until the encoder stops: each later sink waits for
-        // the GOP's own keyframe, up to 3 s.
-        if serves_from.is_none() {
-            self.shared.log(&format!(
-                "output gen={}: no keyframe is asked: the ring has taken no video yet, so the \
-                 encoder's first frame, a keyframe, starts the stream",
-                self.gen
-            ));
-        }
+        // the GOP's own keyframe, up to 3 s. `ask_key`'s `None` branch is that guard, and it writes
+        // the line the tests wait on (the C1 review's m1: the line and the guard are one branch).
         self.ask_key(&mut ask, serves_from);
         loop {
             match self.next() {
@@ -696,9 +692,18 @@ impl Feeder {
     /// Asks the encoder for a keyframe, one from `serves_from` on, unless it has taken a request
     /// already or there is nothing to ask (`None`: no video yet, `run`). The take is logged (the C1
     /// review's m4: the line follows the ask, so a reader of it knows the request is with the
-    /// encoder).
+    /// encoder), and so is the `None` refusal, at the first call only (the C1 review's m1: the line
+    /// `swap_before_the_first_frame` waits on is written by the branch that refuses, so a request
+    /// made with no video cannot leave that line standing).
     fn ask_key(&self, ask: &mut KeyAsk, serves_from: Option<gst::ClockTime>) {
         let Some(serves_from) = serves_from else {
+            if !std::mem::replace(&mut ask.said_none, true) {
+                self.shared.log(&format!(
+                    "output gen={}: no keyframe is asked: the ring has taken no video yet, so the \
+                     encoder's first frame, a keyframe, starts the stream",
+                    self.gen
+                ));
+            }
             return;
         };
         if ask.taken {

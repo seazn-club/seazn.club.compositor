@@ -3236,6 +3236,13 @@ libx264 probe, core 165 r3222, through ffmpeg).
    own keyframe gives 42); the four tests' first swaps wait for that line
    (`swap_before_the_first_frame`), so a request made there reds at the swap. The red CI run on
    `214f674` is this mutant's kill.
+   *Note, 2026-11-24 (C2; the C1 review's m1): the sentence above claims more than the build at
+   `7bd54bc` showed. There the line came from its own `if` in `Feeder::run`, and the guard was
+   `ask_key`'s early return a few lines below it, so the line said what the `if` expected, not what
+   the guard did, and the swap's wait could not tell them apart. The kill on `214f674` was the later
+   file asserts (the second sink's 42 frames, the empty file, the 552 kbps), not the wait. C2 moved
+   the line into `ask_key`'s `None` branch, written at its first call only, so the line and the
+   refusal are one branch. Like every programme test, the wait runs on CI only.*
 
 **Changes** (C1, branch `fix/seazn-live-gop-pull`).
 
