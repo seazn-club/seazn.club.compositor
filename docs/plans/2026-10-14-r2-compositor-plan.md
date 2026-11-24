@@ -66,7 +66,7 @@ These apply to every task. Values are copied from the spec and ADRs.
 - **Machine:** Fly `performance-4x`, 8 GB, region `lhr`, restart `on-failure` with `max_retries: 2`,
   `auto_destroy: true`, no inbound port.
 - **Machine env (R1, unchanged):** `SESSION_ID`, `JOB_TOKEN`, `APP_URL`, `RELAY_DEADLINE_AT`.
-- **Heartbeat:** every 5000 ms. Optional fields are omitted when not measured, **never sent as 0**.
+- **Heartbeat:** every 5000 ms. Optional fields are omitted when not measured, **never sent as 0**. (Amended 2026-11-24, C2: a programme phase change also beats, at most one beat a `phase_beat_gap_ms`, 1 000 ms; either beat restarts the 5 000 ms cadence.)
 - **Exit codes:**
   - `0`: ended, deadline, signal, or session gone (410)
   - `78`: unauthorized or not found (401/404)
