@@ -308,6 +308,13 @@ impl Stream {
 /// a few frames' chunks, enough to smooth a 30 fps camera's ±20 ms frame-vs-chunk phase.
 const INTERLEAVE_WEIGHT: i128 = 8;
 
+/// The readings a re-base settles on (`Playout::settle`): as many as the interleave weighs one by.
+/// A return's first frames come close behind their audio (the decoder starts empty: 13 ms against
+/// the steady ~55 on camera-flap's first return, CI run 45595996718), and a re-base reads the
+/// interleave there; so this many readings after it are the transient's and skipped, and the mean
+/// of the next this many puts it right.
+const SETTLE_SAMPLES: i128 = INTERLEAVE_WEIGHT;
+
 /// The video's stamps as pushed (raw) and as queued (placed). GstVideoDecoder never lets a stamp go
 /// back: a frame whose PTS is below the last it put out leaves with that last PTS instead
 /// (gstvideodecoder.c, "decreasing timestamp"). So when one frame's stamp is too far on (camera-flap's
@@ -437,6 +444,10 @@ pub struct Playout<V> {
     /// the video's newest: the chain's decoders hand the two out apart (the video ~55 ms behind its
     /// audio on camera-flap's log, CI run 45588726031), and a re-base on the newest made that its A/V.
     interleave: Option<i128>,
+    /// A re-base settling: the readings since it, counted, and the sum (ns) of those past the first
+    /// `SETTLE_SAMPLES`; at twice that, their mean is put back on the interleave. The interleave takes no
+    /// reading meanwhile (they are on the re-base's offset, not the camera's).
+    settle: Option<(i128, i128)>,
     /// Stamped audio has arrived in this generation (before it, the filler is not counted).
     audio_seen: bool,
     /// What the pushes since the last tick dropped (handed on with the next tick's counts).
@@ -474,6 +485,7 @@ impl<V> Default for Playout<V> {
             audio_offset: 0,
             skew_prior: None,
             interleave: None,
+            settle: None,
             audio_seen: false,
             pending: Counts::default(),
             audio_raw: None,
@@ -947,7 +959,7 @@ impl<V: Clone> Playout<V> {
                 self.pending.reanchors += 1;
             }
             let d = sample_ns(start) - v;
-            if !self.video_t.clamped && d.abs() <= ms_ns(PLAYOUT_SKEW_REVERT_MS) {
+            if self.settle.is_none() && !self.video_t.clamped && d.abs() <= ms_ns(PLAYOUT_SKEW_REVERT_MS) {
                 let i = self.interleave.unwrap_or(d);
                 self.interleave = Some(i + (d - i) / INTERLEAVE_WEIGHT);
             }
@@ -970,7 +982,28 @@ impl<V: Clone> Playout<V> {
                 self.skew_prior.get_or_insert(self.audio_offset);
                 self.rebase(delta);
                 start += delta;
+                self.settle = Some((0, 0));
                 self.pending.reanchors += 1;
+            } else if let Some((sum, n)) = self.settle {
+                // The first `SETTLE_SAMPLES` readings are the transient's (skipped); the next are
+                // averaged.
+                let n = n + 1;
+                let sum = if n > SETTLE_SAMPLES { sum + d } else { sum };
+                self.settle = Some((sum, n));
+                if n == 2 * SETTLE_SAMPLES {
+                    self.settle = None;
+                    // Within the slack it is one stream already (as two chunks' stamps are).
+                    let by = iota - sum / SETTLE_SAMPLES;
+                    let delta = sample_at(sample_ns(start) + by) - start;
+                    if by.abs() > ms_ns(PLAYOUT_AUDIO_SLACK_MS) {
+                        self.note(
+                            &format!("settle(by_ms={:.1})", sample_ns(delta) as f64 / 1e6),
+                            None,
+                        );
+                        self.rebase(delta);
+                        start += delta;
+                    }
+                }
             }
         }
         start
@@ -1152,6 +1185,7 @@ impl<V: Clone> Playout<V> {
         self.audio_offset = 0;
         self.skew_prior = None;
         self.interleave = None;
+        self.settle = None;
         self.audio_seen = false;
     }
 
@@ -2723,6 +2757,77 @@ mod tests {
             }
         }
         eprintln!("jittered chain returns checked: {checked}, ticks with sound: {ticks}");
+        assert_eq!(checked, 6 * PROFILES.len());
+    }
+
+    /// After the pause the decoder starts with an empty pipeline, so the return's first frames reach
+    /// the queue close behind their audio and only then fall back to the steady interleave (PR #113's
+    /// camera-flap, CI run 45595996718, return 1: the first new frame 13 ms behind its audio, the
+    /// steady ~55 ms). A re-base reads the interleave at the return, inside that transient, and its
+    /// error stood for the whole window: on CI run 45603961130 the returns' audio sat -18 to +28 ms
+    /// off its video's offset, most of them +18 to +28 (A/V p50 23, max 60 against 40). So a re-base
+    /// settles: past the transient (the next `SETTLE_SAMPLES` readings), the mean of as many more is
+    /// put back on the steady interleave (a move, not a re-anchor; the interleave takes no reading
+    /// meanwhile). Here the video reaches the queue `lag` ms after its audio, except the return's
+    /// first `fast` frames, which come at once; the clean return's audio, stamped late from it, is a
+    /// re-base with no clamp (the interleave would read there). Settled, the window is in step.
+    #[test]
+    fn a_re_base_at_a_return_settles_onto_the_steady_interleave() {
+        let (mut checked, mut ticks) = (0, 0);
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            for (name, outlier, audio_outlier, late_ms) in [
+                (
+                    "outlier on the first new frame, audio outlier",
+                    Some(0),
+                    Some(2),
+                    0,
+                ),
+                ("outlier on the second new frame", Some(1), None, 0),
+                // No clamp: the re-base's readings are the unclamped kind the interleave averages.
+                (
+                    "clean, the audio stamped 600 ms late from the return",
+                    None,
+                    None,
+                    600,
+                ),
+            ] {
+                for (lag, fast) in [(60, 3), (90, 4)] {
+                    let tag = format!("{fps} fps, {name}, video {lag} ms behind, {fast} fast");
+                    let (arrivals, kr) = chain_return(fps, 4_900, 2, outlier, audio_outlier, 5, 8);
+                    let late = |a: &Arrival| if a.k >= kr { late_ms * MS } else { 0 };
+                    let arrivals: Vec<Arrival> = arrivals
+                        .into_iter()
+                        .map(|a| Arrival {
+                            at: if (kr..kr + fast).contains(&a.k) {
+                                a.at
+                            } else {
+                                a.at + lag * MS
+                            },
+                            audio_pts: a.audio_pts + late(&a),
+                            label_shift: a.label_shift + late(&a) as i64,
+                            ..a
+                        })
+                        .collect();
+                    let r = run(fps, &arrivals, 5 * fps + 147 + 8 * fps);
+                    ticks += assert_live_in_step(&tag, fps, &arrivals, &r, kr);
+                    // Settled, the sound is in step, not just within a frame: the readings' mean is
+                    // the steady interleave's own measure, so nothing is left over.
+                    let (slack, period) = (i128::from(PLAYOUT_AUDIO_SLACK_MS * MS), i128::from(NS / fps));
+                    let off: Vec<_> = av_by_content(&r, &arrivals, (kr + fps) as usize)
+                        .into_iter()
+                        .filter(|(_, d)| !(-slack..period + slack).contains(d))
+                        .collect();
+                    assert!(
+                        off.is_empty(),
+                        "{tag}: settled off step: {:?}",
+                        &off[..off.len().min(8)]
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        eprintln!("settling returns checked: {checked}, ticks with sound: {ticks}");
         assert_eq!(checked, 6 * PROFILES.len());
     }
 
