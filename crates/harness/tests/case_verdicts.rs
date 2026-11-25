@@ -1135,6 +1135,57 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
     assert_eq!(checked, 14);
 }
 
+/// C4 round 6 (owner 2026-11-25, merge C4 with camera-burst's `av_in_step` red named): the red stays
+/// red (no budget widened) and the verdict prints the row that names it, `Owed 122`, which is a real
+/// open row of docs/_INDEX.md that names camera-burst's `av_in_step`; a good run prints it as holding.
+#[test]
+fn camera_bursts_av_red_is_named_by_its_owed_row_and_stays_red() {
+    let freeze = 300 - PLAYOUT_TARGET_MS as i64;
+    let good = judge(
+        &camera_burst(freeze, |_| {}),
+        "camera-burst",
+        "",
+        "burst-owed-good",
+    );
+    assert_pass(&good, "burst-owed-good");
+    assert!(
+        good.lines
+            .iter()
+            .any(|l| l.starts_with("OWED av_in_step_run_offset (Owed 122): holds")),
+        "{:?}",
+        good.lines
+    );
+    let red = judge(
+        &camera_burst(freeze, |w| {
+            w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 49, Spoil::KeptLevel(49)))
+        }),
+        "camera-burst",
+        "",
+        "burst-owed-red",
+    );
+    assert_fails(&red, "av_in_step", "burst-owed-red");
+    assert!(
+        red.lines
+            .iter()
+            .any(|l| l.starts_with("OWED av_in_step_run_offset (Owed 122): does not hold")),
+        "{:?}",
+        red.lines
+    );
+    let index = std::fs::read_to_string(repo().join("docs/_INDEX.md")).unwrap();
+    let row = index
+        .lines()
+        .find(|l| l.starts_with("| 122 | "))
+        .expect("Owed 122 is a row of docs/_INDEX.md");
+    assert!(
+        row.contains("camera-burst `av_in_step`"),
+        "the row names the check"
+    );
+    assert!(
+        !row.contains("camera-flap `av_in_step`"),
+        "camera-flap is not exempt"
+    );
+}
+
 /// C4 round 6 (owner 2026-11-25): the A/V gate passes AT each of its numbers, camera-flap and
 /// camera-burst alike, so the reds above (51, 73, a median of 41) are a ONE ms step off a pass: a kept
 /// pair at the pair budget (50), an excluded pair at its bound (72), a median at the median's (40).
