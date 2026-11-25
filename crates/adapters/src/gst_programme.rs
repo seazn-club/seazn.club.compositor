@@ -73,8 +73,8 @@ const X264_TUNE: &str = "zerolatency";
 // property takes a u32 of ms, and a value it cannot carry is a compile error.
 const X264_VBV_PROPERTY_MS: u32 = domain::config::X264_VBV_MS as u32;
 const _: () = assert!(domain::config::X264_VBV_MS <= u32::MAX as u64);
-// C5 MEASUREMENT-ONLY spike (never merged): filler off
-const X264_OPTIONS: &str = "nal-hrd=cbr:filler=0";
+// C5 MEASUREMENT-ONLY spike (never merged): filler off via nal-hrd=vbr (filler=0 under cbr is a no-op)
+const X264_OPTIONS: &str = "nal-hrd=vbr";
 /// F-036: x264's scene cut off, so a hard cut in the picture (the slate to the camera, a camera
 /// returning) never starts a GOP early: Cloudflare errored the programme input for GOPs under 2 s
 /// (`ERR_GOP_OUT_OF_RANGE`). x264enc 1.24.2 has no property for it, and reads its `option-string`
