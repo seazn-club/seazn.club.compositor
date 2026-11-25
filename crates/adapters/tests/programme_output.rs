@@ -26,8 +26,8 @@ use app::ports::{Inbound, Metrics, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
 use domain::config::{
     OutputProfile, Thresholds, CF_KEYFRAME_INTERVAL_MAX_MS, CF_KEYFRAME_INTERVAL_MIN_MS,
-    ENCODER_SPEED_REALTIME_MIN, FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_FPS_MIN_WINDOW_MS,
-    OUTPUT_SINK_TIMEOUT_MS, PROGRAMME_GOP_MS,
+    ENCODER_SPEED_REALTIME_MIN, FIRST_GOP_CATCH_UP_MAX_MS, FORCED_KEYFRAME_MIN_INTERVAL_MS,
+    OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS, PROGRAMME_GOP_MS,
 };
 use domain::ladder::Rung;
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -3480,6 +3480,291 @@ fn a_drain_while_the_sink_is_still_connecting_ends_without_waiting_for_it() {
         "{seen:?}"
     );
     assert_eq!(server.record().published, 0);
+}
+
+// Owed 112 (C3b, F-038; chaos runs 45480676592 `cef-hung` and 45498019823 `dest-stall-rule`): the
+// boot's first publish lands after the encoder's first frame. Owed 84 dropped that frame at the gate
+// and asked for a keyframe, which the encoder holds to F-036's floor after frame 0, so the stream
+// started up to 2.2 s late (head outages of 813 and 816 ms). A backlog of the encoder's first frames
+// up to `FIRST_GOP_CATCH_UP_MAX_MS`, and under `OUTPUT_QUEUE_BYTES` a track, now starts the stream at
+// the encoder's first keyframe, and nothing is asked.
+
+/// The feeder's line when sink 1's gate opens, either way.
+const GATE_OPEN_LINE: &str = "output gen=1: the sink can send after";
+/// The same line's ending when it starts from the encoder's first keyframe (Owed 112).
+const FIRST_GOP_TAKEN: &str = "so it starts at the encoder's first keyframe";
+/// The feeder's line when the encoder's first frames are within the time bound but over the output
+/// queue (Owed 112, the C3b review's m2).
+const FIRST_GOP_OVER_QUEUE: &str = "output gen=1: the encoder's first frames hold";
+
+/// What one Owed 112 leg's destination received, and what its feeder logged.
+struct LatePublish {
+    d: Decoded,
+    lines: Lines,
+    /// The most a received message ran ahead of real time, from the first one received (F-023).
+    ahead_most_ms: i128,
+    /// The first AAC message's timestamp, as the destination received it.
+    first_audio_ts_ms: Option<u32>,
+}
+
+/// One Owed 112 leg: sink 1 is swapped in before the programme's first frame, and its publish is
+/// held until `late` camera frames are in the ring, then accepted; `total` ticks are paced in all.
+fn publish_late(case: &str, profile: &OutputProfile, late: u64, total: u64, dir: &Tmp) -> LatePublish {
+    let server = FakeRtmp::held();
+    let (mut p, rx, frames, lines) = programme_with(profile);
+    frames.set_camera(solid(
+        gst_video::VideoFormat::I420,
+        profile.width,
+        profile.height,
+        [255, 0, 0, 255],
+    ));
+    let stats = p.stats();
+    p.swap_sink(1, &rtmp_target(&server));
+    pace(&mut p, 0..late, FrameChoice::Emit);
+    thread::sleep(OWED84_ENCODED_SETTLE);
+    assert_eq!(
+        stats.snapshot().encoded_frames,
+        Some(late),
+        "{case}: setup: the late frames reached the ring before the publish"
+    );
+    assert_eq!(server.record().published, 0, "{case}: setup: the publish is held");
+    server.release();
+    assert!(
+        wait_for_line(&lines, GATE_OPEN_LINE, Duration::from_secs(3)),
+        "{case}: the gate never opened"
+    );
+    pace(&mut p, late..total, FrameChoice::Emit);
+    let seen = drain_and_wait(&mut p, &rx);
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::OutputError { .. })),
+        "{case}: {seen:?}"
+    );
+    server.settle(Duration::from_millis(400), Duration::from_secs(8));
+    let path = dir.file(&format!("{case}.flv"));
+    let tags = server.write_flv(&path);
+    let rec = server.record();
+    assert_eq!(rec.published, 1, "{case}: one publish");
+    assert_eq!(tags, rec.media.len(), "{case}");
+    let media: Vec<&rtmp::Media> = rec
+        .media
+        .iter()
+        .filter(|m| m.is_avc_frame() || m.is_aac_frame())
+        .collect();
+    let first = media.first().expect("a frame was received");
+    let (anchor_ts, anchor_at) = (first.ts_ms, first.at);
+    let ahead_most_ms = media
+        .iter()
+        .map(|m| {
+            i128::from(m.ts_ms - anchor_ts.min(m.ts_ms)) - m.at.duration_since(anchor_at).as_millis() as i128
+        })
+        .max()
+        .unwrap_or(i128::MIN);
+    let first_audio_ts_ms = media.iter().find(|m| m.is_aac_frame()).map(|m| m.ts_ms);
+    drop(rec);
+    for l in lines.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+        if l.contains("output gen=1: the") {
+            eprintln!("{case}: {l}");
+        }
+    }
+    LatePublish {
+        d: decode(&path),
+        lines,
+        ahead_most_ms,
+        first_audio_ts_ms,
+    }
+}
+
+/// Checks a leg that started at the encoder's first keyframe, `late` frames queued: the feeder said
+/// so and asked for no keyframe; the destination got every frame paced, the first a keyframe at PTS
+/// 0, the camera in each; the audio starts with it, the AAC frame at 0 sent (the C3b review's m5:
+/// within one AAC frame of PTS 0, as `ninety_slate_ticks_give_ninety_frames_at_constant_spacing` reads it);
+/// its keyframes are the GOP's own (none forced a floor in); and nothing ran further ahead of real
+/// time than the backlog taken (the `late - 1` frame periods from the first keyframe to the newest;
+/// CI read 1 122 ms for an 1 100 ms one) and Owed 84's slack (`OWED84_BURST_SLACK_MS`), so no frame
+/// from before the encoder's first was sent. Returns the frames checked.
+fn assert_first_gop_start(case: &str, leg: &LatePublish, late: u64, total: u64, gop: u64) -> usize {
+    let d = &leg.d;
+    let keys = key_indexes(d);
+    eprintln!(
+        "{case}: {} frames for the {total} paced; keyframes at {keys:?}; most ahead of real time {} ms; \
+         first AAC at {:?} ms (decoded {:?})",
+        d.frames.len(),
+        leg.ahead_most_ms,
+        leg.first_audio_ts_ms,
+        d.audio_pts_ms.first()
+    );
+    assert_eq!(
+        logged(&leg.lines, FIRST_GOP_TAKEN),
+        1,
+        "{case}: the feeder did not start at the first keyframe"
+    );
+    assert_eq!(
+        logged(&leg.lines, "output gen=1: the keyframe request was"),
+        0,
+        "{case}: a keyframe was asked"
+    );
+    assert!(
+        d.first_is_key(),
+        "{case}: keys {:?}",
+        &d.keys[..d.keys.len().min(5)]
+    );
+    assert_eq!(d.video_pts_ms.first(), Some(&0), "{case}");
+    // The audio starts with the picture, at or after it (no PTS before 0: the rebase clamps none
+    // away) and within one AAC frame (1 024 samples at 48 kHz, 21 ms), so the frame at 0 was sent.
+    let aac_frame_ms = 1_024 * 1_000 / 48_000;
+    let wire = leg.first_audio_ts_ms.expect("an AAC frame was received");
+    assert!(
+        u64::from(wire) <= aac_frame_ms,
+        "{case}: the first AAC frame on the wire is at {wire} ms: the one at 0 was not sent"
+    );
+    let decoded = *d.audio_pts_ms.first().expect("audio");
+    assert!(
+        decoded != u64::MAX && decoded <= aac_frame_ms,
+        "{case}: the first decoded AAC PTS is {decoded} ms: the one at 0 was not sent"
+    );
+    assert_eq!(
+        d.frames.len() as u64,
+        total,
+        "{case}: the stream starts at frame 0"
+    );
+    assert_eq!(keys, vec![0, gop], "{case}: the GOP's own keyframes, none forced");
+    let backlog_ms = (late - 1) * 1_000 / u64::from(P720.fps);
+    assert!(
+        leg.ahead_most_ms <= i128::from(backlog_ms) + OWED84_BURST_SLACK_MS as i128,
+        "{case}: ran {} ms ahead of real time for a {backlog_ms} ms backlog",
+        leg.ahead_most_ms
+    );
+    let checked = assert_all_camera(case, d);
+    assert_eq!(checked as u64, total, "{case}");
+    checked
+}
+
+/// Checks a leg whose backlog was dropped as Owed 84 drops it: nothing taken, the keyframe asked
+/// for, and the stream started at it, held to the floor after frame 0 (`key_due`). `over_queue`:
+/// whether the bytes guard was the one that refused (its line), rather than the time bound.
+fn assert_first_gop_dropped(case: &str, leg: &LatePublish, late: u64, total: u64, over_queue: bool) {
+    let d = &leg.d;
+    let due = key_due(late, last_natural_key(late));
+    let owed = total - due;
+    let n = d.frames.len() as u64;
+    eprintln!(
+        "{case}: {late} late, keyframe due at {due}; {n} frames for the {owed} paced from it; keyframes at {:?}",
+        key_indexes(d)
+    );
+    assert_eq!(
+        logged(&leg.lines, FIRST_GOP_TAKEN),
+        0,
+        "{case}: the backlog was taken"
+    );
+    assert_eq!(
+        logged(&leg.lines, FIRST_GOP_OVER_QUEUE),
+        usize::from(over_queue),
+        "{case}: which guard refused"
+    );
+    assert_eq!(
+        logged(&leg.lines, "output gen=1: the keyframe request was taken"),
+        1,
+        "{case}: no keyframe was asked"
+    );
+    assert!(
+        d.first_is_key(),
+        "{case}: keys {:?}",
+        &d.keys[..d.keys.len().min(5)]
+    );
+    assert_eq!(d.video_pts_ms.first(), Some(&0), "{case}");
+    assert!(
+        n <= owed,
+        "{case}: {n} frames for the {owed} from the floor: it started before the floor"
+    );
+    assert!(
+        n + OWED84_KEY_WAIT_TICKS >= owed,
+        "{case}: {n} frames: the keyframe came more than {OWED84_KEY_WAIT_TICKS} ticks after the floor"
+    );
+    let checked = assert_all_camera(case, d);
+    eprintln!("{case}: frames checked {checked}");
+    assert_eq!(checked as u64, n);
+    assert!(checked > 0);
+}
+
+/// The bytes `late` frames of a profile take at its CBR rate (x264's CBR with filler, F-005): the
+/// legs below are set clear of `OUTPUT_QUEUE_BYTES` by it, so which guard refuses is not a coin toss.
+fn cbr_bytes(profile: &OutputProfile, late: u64) -> u64 {
+    late * u64::from(profile.video_kbps) * 1_000 / 8 / u64::from(profile.fps)
+}
+
+/// Owed 112's witness: the publish lands one, two or three frames after the encoder's first (the
+/// chaos runs' race was one, 37 to 38 ms), within the first GOP. The stream starts at frame 0, the
+/// encoder's first keyframe, with no head outage: every frame paced reaches the destination. Before
+/// the fix the gate dropped those frames and the keyframe it asked for came at F-036's floor after
+/// frame 0, 66 frames in. Both modes (one leg at 1080p: both are 30 fps, ADR 0005).
+#[test]
+fn a_publish_that_lands_frames_after_the_first_starts_at_the_first_keyframe() {
+    let _s = serial();
+    let mut legs = 0;
+    for (profile, late) in [(P720, 1), (P720, 2), (P720, 3), (OutputProfile::P1080, 1)] {
+        let case = format!("owed112-{}p-{late}-late", profile.height);
+        let dir = Tmp::new(&case);
+        let gop = u64::from(profile.gop_frames());
+        let total = gop + OWED84_MARGIN_TICKS;
+        let leg = publish_late(&case, &profile, late, total, &dir);
+        let checked = assert_first_gop_start(&case, &leg, late, total, gop);
+        eprintln!("{case}: frames checked {checked}");
+        legs += 1;
+    }
+    eprintln!("Owed 112 legs checked: {legs}");
+    assert_eq!(legs, 4);
+}
+
+/// Owed 112's two bounds. Within both (720p, 25 frames: 800 ms, about 417 KB at 4 Mbps) the backlog
+/// is taken. Past the time bound (720p, 32 frames: `FIRST_GOP_CATCH_UP_MAX_MS` from `config` and a
+/// frame), it is dropped by the time rule, which is read first (no bytes line). Inside
+/// the time bound and past `OUTPUT_QUEUE_BYTES` (1080p, 30 frames: 967 ms, about 750 KB at 6 Mbps)
+/// it is dropped by the bytes rule (the C3b review's m2). The time legs are 720p because only that
+/// rate stays under the queue for the whole bound; the bytes leg is 1080p because only its rate
+/// passes the queue inside it (the C3b review's m7). A dropped leg starts at the keyframe it asks
+/// for, which the encoder holds to the floor after frame 0 (`key_due`).
+#[test]
+fn a_first_gop_backlog_within_both_bounds_is_taken_and_past_either_is_dropped() {
+    let _s = serial();
+    let p1080 = OutputProfile::P1080;
+    let gop = gop_ticks();
+    let total = gop + OWED84_MARGIN_TICKS;
+    let bound = FIRST_GOP_CATCH_UP_MAX_MS * u64::from(P720.fps) / 1_000;
+    let (inside, past_time, past_bytes) = (25, bound + 2, bound);
+    // Each leg's premise, from `config` and the profiles, never from the rule.
+    assert!(
+        past_time + OWED84_KEY_WAIT_TICKS < floor_ticks(),
+        "setup: a dropped backlog waits for the floor"
+    );
+    assert!(
+        (inside - 1) * 1_000 / u64::from(P720.fps) <= FIRST_GOP_CATCH_UP_MAX_MS
+            && cbr_bytes(&P720, inside) * 5 / 4 < OUTPUT_QUEUE_BYTES,
+        "setup: the inside leg is within both bounds with a quarter to spare"
+    );
+    assert!(
+        (past_time - 1) * 1_000 / u64::from(P720.fps) > FIRST_GOP_CATCH_UP_MAX_MS,
+        "setup: the time leg is past the time bound"
+    );
+    assert!(
+        (past_bytes - 1) * 1_000 / u64::from(p1080.fps) <= FIRST_GOP_CATCH_UP_MAX_MS
+            && cbr_bytes(&p1080, past_bytes) * 4 / 5 >= OUTPUT_QUEUE_BYTES,
+        "setup: the bytes leg is within the time bound and a fifth past the queue"
+    );
+
+    let case = "owed112-inside-both";
+    let dir = Tmp::new(case);
+    let leg = publish_late(case, &P720, inside, total, &dir);
+    assert_first_gop_start(case, &leg, inside, total, gop);
+
+    let case = "owed112-past-the-time-bound";
+    let dir = Tmp::new(case);
+    let leg = publish_late(case, &P720, past_time, total, &dir);
+    assert_first_gop_dropped(case, &leg, past_time, total, false);
+
+    let case = "owed112-past-the-output-queue";
+    let dir = Tmp::new(case);
+    let leg = publish_late(case, &p1080, past_bytes, total, &dir);
+    assert_first_gop_dropped(case, &leg, past_bytes, total, true);
 }
 
 /// The file's size, 0 if it does not exist (filesink creates it when its pipeline starts).

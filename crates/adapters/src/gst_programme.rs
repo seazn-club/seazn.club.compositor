@@ -69,7 +69,10 @@ const AAC_BITRATE: i32 = 128_000;
 /// codes fewer keyframes, never more.
 const X264_SPEED_PRESET: &str = "medium";
 const X264_TUNE: &str = "zerolatency";
-const X264_VBV_MS: u32 = 1_000;
+// The VBV lives in `config` (`X264_VBV_MS`), since the first-GOP bound reads it (Owed 112); the
+// property takes a u32 of ms, and a value it cannot carry is a compile error.
+const X264_VBV_PROPERTY_MS: u32 = domain::config::X264_VBV_MS as u32;
+const _: () = assert!(domain::config::X264_VBV_MS <= u32::MAX as u64);
 const X264_OPTIONS: &str = "nal-hrd=cbr:filler=1";
 /// F-036: x264's scene cut off, so a hard cut in the picture (the slate to the camera, a camera
 /// returning) never starts a GOP early: Cloudflare errored the programme input for GOPs under 2 s
@@ -577,7 +580,7 @@ impl GstProgramme {
         encoder.set_property("bitrate", profile.video_kbps);
         encoder.set_property("key-int-max", profile.gop_frames());
         encoder.set_property("bframes", 0u32);
-        encoder.set_property("vbv-buf-capacity", X264_VBV_MS);
+        encoder.set_property("vbv-buf-capacity", X264_VBV_PROPERTY_MS);
         encoder.set_property("option-string", format!("{X264_OPTIONS}:{X264_NO_SCENE_CUT}"));
         // F-036: a keyframe an output swap forces (Owed 84) never cuts a GOP under Cloudflare's
         // floor. GstVideoEncoder holds a request that comes within this of its last keyframe, natural
@@ -913,7 +916,8 @@ impl ProgrammeOutput for GstProgramme {
         // none, when it has made one at or after `serves_from` already: the GOP's own keyframe,
         // encoded after the reconnect point, starts the stream (the C1 review's I1). Before the ring
         // has taken any video the feeder asks nothing: the encoder's first frame is the keyframe
-        // (`gst_output::KeyRequest`; CI on PR #109).
+        // (`gst_output::KeyRequest`; CI on PR #109), nor when it starts from the encoder's first
+        // frames (Owed 112, `gst_output::first_gop_backlog`).
         let parser_src = r.parser_src.clone();
         #[cfg(feature = "test-hooks")]
         let refusals = Arc::clone(&self.key_refusals);

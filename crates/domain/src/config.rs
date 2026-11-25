@@ -299,6 +299,33 @@ pub const fn input_decode_wait_ms(input_stall_after_ms: Ms) -> Ms {
     input_stall_after_ms + CAMERA_GOP_MS
 }
 
+/// x264's VBV (`vbv-buf-capacity`, ms), CBR with filler: C00's values, measured real time (F-005),
+/// kept through F-033 and F-036. C09 sets it on x264enc (`gst_programme.rs`); here because the
+/// first-GOP bound reads it (`FIRST_GOP_CATCH_UP_MAX_MS`).
+pub const X264_VBV_MS: Ms = 1_000;
+
+/// Owed 112 (C3b, `_FINDINGS.md` F-038; chaos runs 45480676592 `cef-hung` and 45498019823
+/// `dest-stall-rule`, head outages of 813 and 816 ms): the longest backlog of the encoder's first
+/// frames that a sink whose publish lands after them starts from, at the encoder's first keyframe,
+/// instead of dropping it (Owed 84 drops every frame queued before a sink can send). Dropping it
+/// costs a head outage: the keyframe asked for then is held to `FORCED_KEYFRAME_MIN_INTERVAL_MS`
+/// after frame 0 (F-036 fact 4), so the stream starts the floor less the backlog late. Taking it
+/// costs the backlog as latency, sent at once (a burst, F-023's 4 s there). Half the floor is where
+/// the two are equal (1 100 ms), and the burst stays within one coded picture buffer
+/// (`X264_VBV_MS`, the C3b review's m1), so the lesser of the two: 1 000 ms today. The races seen
+/// were 37 to 38 ms (one frame). A bounded exception to Owed 84's option A, PENDING the owner's
+/// ruling (docs/_INDEX.md, "Owed 112 built"): a smaller bound is this one constant. Under the GOP
+/// (`PROGRAMME_GOP_MS`), so only the encoder's first GOP is ever taken, and under the encoded
+/// ring's 2 s (C09, the plan's Global Constraints), so the ring still holds it.
+pub const FIRST_GOP_CATCH_UP_MAX_MS: Ms = {
+    let half_floor = FORCED_KEYFRAME_MIN_INTERVAL_MS / 2;
+    if half_floor < X264_VBV_MS {
+        half_floor
+    } else {
+        X264_VBV_MS
+    }
+};
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -942,6 +969,34 @@ mod tests {
     #[test]
     fn the_progress_poll_is_owed_15s_250_ms() {
         assert_eq!(OUTPUT_PROGRESS_POLL_MS, 250);
+    }
+
+    // Owed 112 (C3b, F-038): the lesser of half F-036's floor and x264's VBV (the C3b review's m1),
+    // whole frames in both modes, inside the first GOP.
+    #[test]
+    fn the_first_gop_catch_up_is_half_the_floor_within_one_vbv() {
+        assert_eq!(X264_VBV_MS, 1_000, "C00's VBV (F-005)");
+        // Half the floor (2 200 / 2 = 1 100) is over one VBV (1 000): the VBV binds.
+        assert_eq!(FIRST_GOP_CATCH_UP_MAX_MS, 1_000, "half the floor, within one VBV");
+        // Constant against constant: the compiler checks it (clippy refuses a runtime assert).
+        const _: () = assert!(
+            FIRST_GOP_CATCH_UP_MAX_MS < PROGRAMME_GOP_MS
+                && FIRST_GOP_CATCH_UP_MAX_MS <= X264_VBV_MS
+                && FIRST_GOP_CATCH_UP_MAX_MS <= FORCED_KEYFRAME_MIN_INTERVAL_MS / 2
+        );
+        let mut checked = 0;
+        for p in BOTH_MODES {
+            let fps = Ms::from(p.fps);
+            assert_eq!(
+                fps * FIRST_GOP_CATCH_UP_MAX_MS % 1_000,
+                0,
+                "{p:?}: not whole frames"
+            );
+            // 30 fps (ADR 0005): 30 frames.
+            assert_eq!(fps * FIRST_GOP_CATCH_UP_MAX_MS / 1_000, 30, "{p:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "modes checked: {checked}");
     }
 
     // F-011 (Owed 38): a refused publish counted bytes until its refusal arrived, the last total at
