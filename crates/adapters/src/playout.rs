@@ -415,7 +415,16 @@ impl VideoStamps {
             (Some(r), Some(p)) if self.clamped && raw > r => {
                 self.clamped = false;
                 self.offset = p + step - raw;
-                self.slew = audio.map_or(0, |a| a - self.offset);
+                // The re-lock removes a frame's error between the two offsets, never a pause: an audio
+                // offset further than `PLAYOUT_STREAM_SKEW_MAX_MS` from the picture's is not a content
+                // offset (audio that stopped keeps its last re-base's, I-r3-1; one just re-based onto an
+                // outlier is a pause off the true one until its stamps come back, CI run 45649360015:
+                // the picture slewed back by a pause and the clock re-anchored for seconds). Refused
+                // there; the settle puts the audio right.
+                self.slew = audio
+                    .map(|a| a - self.offset)
+                    .filter(|m| m.abs() <= ms_ns(PLAYOUT_STREAM_SKEW_MAX_MS))
+                    .unwrap_or(0);
                 self.relocked = self.slew;
                 (self.slewed(raw, p), Clamp::Ends)
             }
@@ -582,10 +591,14 @@ impl<V: Clone> Playout<V> {
             self.video.push_back(Frame { pts: None, v });
             return;
         };
-        // A camera with no audio, or audio that has stopped, has no audio offset: its run's end keeps
-        // its own (I-r3-1: a stopped audio's offset is its last re-base's, stale by however long it
-        // has been quiet, and the picture re-locked onto it slews a pause).
-        let audio = self.audio_live().then(|| sample_ns(self.audio_offset));
+        // A camera with no stamped audio has no audio offset: its run's end keeps its own. The
+        // offset is judged where it is used (`VideoStamps::place`): one a pause off the picture's is
+        // no content offset (C4 fix round 5).
+        let audio = self
+            .audio_s
+            .newest
+            .is_some()
+            .then(|| sample_ns(self.audio_offset));
         let (t, clamp) = self.video_t.place(raw, audio);
         match clamp {
             Clamp::None => {}
@@ -1339,12 +1352,6 @@ impl<V: Clone> Playout<V> {
                 ..c
             });
         }
-    }
-
-    /// The audio is arriving: the last tick that saw a chunk is within `PLAYOUT_REANCHOR_GAP_MS` of
-    /// the last tick (`Stream::live`), the gap whose end makes a stream's return a new clock.
-    fn audio_live(&self) -> bool {
-        self.last_tick.is_some_and(|t| self.audio_s.live(t))
     }
 
     /// The media span of the stamped frames queued.
@@ -4195,12 +4202,12 @@ mod tests {
     /// run's end (GstVideoDecoder never lets a stamp go back): the run is broken, the stamps are not
     /// known true, and the stamps that advance after it re-lock nothing, whatever the audio's offset.
     /// (The re-lock there moved a camera's picture by the audio's whole re-base.) The audio's offset
-    /// is a pause off here, as a stream re-based onto a return's stamps is. A clean run's end
+    /// is two frames off here, within what a re-lock may move (`PLAYOUT_STREAM_SKEW_MAX_MS`). A clean run's end
     /// beside it does re-lock, to the same audio offset: the guard is the difference.
     #[test]
     fn an_older_frame_inside_a_clamped_run_breaks_it_without_a_re_lock() {
         let period = i128::from(NS / 30);
-        let pause = 147 * period;
+        let two_frames = 2 * period;
         let (mut broken, mut ended) = (0, 0);
         for (name, older) in [("an older frame", true), ("no older frame", false)] {
             let mut t = VideoStamps::default();
@@ -4213,7 +4220,7 @@ mod tests {
             let offset_before = t.offset;
             let mut ends = 0;
             for &r in &raw {
-                let (_, c) = t.place(r, Some(pause));
+                let (_, c) = t.place(r, Some(two_frames));
                 ends += usize::from(c == Clamp::Ends);
             }
             if older {
@@ -4229,5 +4236,160 @@ mod tests {
         }
         eprintln!("broken runs checked: {broken}, clean ends: {ended}");
         assert_eq!((broken, ended), (1, 1));
+    }
+
+    /// The camera-flap storm of fad76a2 (CI run 45649360015, windows 8 and 10: 12 and 13 re-anchors,
+    /// 60 repeated ticks, 7 freezes), in the log's own order. The decoder's clamp runs across the
+    /// pause (the last frames held at one stamp) and the camera's stamps are seamless over it, while
+    /// the audio's jump by the pause. At the return the audio's first chunk arrives true and its second
+    /// is the chain's outlier (a pause on again): the outlier is a re-base onto the picture's timeline,
+    /// and its offset a pause off the true one; the picture's clamp ends on the very next frame and
+    /// its re-lock took that provisional offset for the audio's, slewing the picture back by a pause
+    /// (`relock_ms=-9905`), the clock re-anchoring on it for seconds. The re-lock moves the picture
+    /// by no more than the error it exists for, a frame: here none, to within one frame, and nothing
+    /// is re-anchored, repeated or dropped from a second after the return.
+    #[test]
+    fn a_clamp_ending_beside_the_audios_outlier_re_locks_nothing() {
+        let (mut windows, mut ticks) = (0, 0);
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let pause_ms = (147 * 1_000_u64).div_ceil(fps);
+            let paused = pause_ms * fps / 1_000;
+            let tag = format!("{fps} fps");
+            let (mut arrivals, kr) = chain_return(fps, pause_ms, 2, None, Some(1), 5, 10);
+            let (kp, jump) = (kr - paused, paused * NS / fps);
+            for a in &mut arrivals {
+                if a.k >= kr {
+                    a.pts -= jump;
+                }
+            }
+            let repeated = arrivals.iter().find(|a| a.k == kr).expect("the return").pts + NS / fps / 2;
+            for a in &mut arrivals {
+                if (kp - 6..kp).contains(&a.k) || a.k == kr {
+                    a.pts = repeated;
+                }
+            }
+            let mut r = run(fps, &arrivals, kr + 10 * fps + 8);
+            let notes = r.p.take_notes().0;
+            let ends: Vec<&Note> = notes
+                .iter()
+                .filter(|n| n.what.starts_with("video_unclamped"))
+                .collect();
+            assert_eq!(
+                ends.len(),
+                1,
+                "{tag}: the clamp's end: {:?}",
+                ends.iter().map(|n| &n.what).collect::<Vec<_>>()
+            );
+            let relock: f64 = ends[0]
+                .what
+                .split("relock_ms=")
+                .nth(1)
+                .and_then(|x| x.trim_end_matches(')').parse().ok())
+                .expect("the re-lock");
+            let frame_ms = 1_000.0 / fps as f64;
+            assert!(
+                relock.abs() <= frame_ms,
+                "{tag}: the clamp's end moved the picture {relock} ms: {}",
+                ends[0].what
+            );
+            let (live, until) = ((kr + fps) as usize, r.last_air());
+            let mut c = Counts::default();
+            for x in &r.recs[live..=until] {
+                c.add(&x.counts);
+            }
+            assert_eq!(
+                (c.reanchors, c.repeated, c.unaired),
+                (0, 0, 0),
+                "{tag}: after the return"
+            );
+            windows += 1;
+            ticks += until - live;
+        }
+        eprintln!("clamp ends beside an audio outlier checked: {windows}, ticks: {ticks}");
+        assert_eq!(windows, PROFILES.len());
+    }
+
+    /// The re-lock's bound is `PLAYOUT_STREAM_SKEW_MAX_MS`, the re-base's own: an audio offset that far
+    /// from the picture's is taken (to the millisecond under it), one past it is refused whole (not
+    /// clipped), either sign. A clean clamp's end, as in the broken-run test.
+    #[test]
+    fn the_re_lock_takes_an_audio_offset_up_to_the_skew_bound_and_no_further() {
+        let period = i128::from(NS / 30);
+        let bound = ms_ns(PLAYOUT_STREAM_SKEW_MAX_MS);
+        let (mut taken, mut refused) = (0, 0);
+        // The re-lock an audio offset of 0 asks of the same stamps: minus the picture's own offset.
+        let zero = {
+            let mut t = VideoStamps::default();
+            let mut raw: Vec<i128> = (0..10).map(|k| k * period).collect();
+            raw.extend([9 * period + period / 2; 4]);
+            raw.extend((0..5).map(|k| 10 * period + k * period));
+            for &r in &raw {
+                t.place(r, Some(0));
+            }
+            t.relocked
+        };
+        assert_ne!(zero, 0, "the picture's offset is not 0 at the end: the premise");
+        for (name, moves, want) in [
+            ("just under, ahead", bound - NS_PER_MS, true),
+            ("just under, behind", -(bound - NS_PER_MS), true),
+            ("just over, ahead", bound + NS_PER_MS, false),
+            ("just over, behind", -(bound + NS_PER_MS), false),
+        ] {
+            // The audio offset that asks the picture for `moves`.
+            let by = moves - zero;
+            let mut t = VideoStamps::default();
+            let mut raw: Vec<i128> = (0..10).map(|k| k * period).collect();
+            raw.extend([9 * period + period / 2; 4]);
+            raw.extend((0..5).map(|k| 10 * period + k * period));
+            let mut ends = 0;
+            for &r in &raw {
+                let (_, c) = t.place(r, Some(by));
+                ends += usize::from(c == Clamp::Ends);
+            }
+            assert_eq!(ends, 1, "{name}: the run ended");
+            if want {
+                assert_eq!(t.relocked, moves, "{name}: taken whole");
+                taken += 1;
+            } else {
+                assert_eq!(t.relocked, 0, "{name}: refused");
+                refused += 1;
+            }
+        }
+        eprintln!("bounds checked: taken {taken}, refused {refused}");
+        assert_eq!((taken, refused), (2, 2));
+    }
+
+    /// The same, inside the re-lock's bound (a short pause: the picture's offset is under
+    /// `PLAYOUT_STREAM_SKEW_MAX_MS`, so only the missing audio keeps the end from moving it by the
+    /// pause, taking an audio offset of 0 for the audio's): the end's note says no audio offset and
+    /// no re-lock.
+    #[test]
+    fn a_video_only_cameras_short_pause_is_not_re_locked_onto_nothing() {
+        let (mut ends, mut cameras) = (0, 0);
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let pause_ms = PLAYOUT_STREAM_SKEW_MAX_MS - 100;
+            let (mut arrivals, kr) = chain_return(fps, pause_ms, 2, Some(0), None, 2, 4);
+            for a in &mut arrivals {
+                a.audio_at = NO_AUDIO;
+            }
+            let mut r = run(fps, &arrivals, kr + 4 * fps + 8);
+            let notes = r.p.take_notes().0;
+            let end: Vec<&Note> = notes
+                .iter()
+                .filter(|n| n.what.starts_with("video_unclamped"))
+                .collect();
+            assert_eq!(end.len(), 1, "{fps} fps: the clamp's end");
+            assert!(
+                end[0].what.contains("audio_offset_ms=-,relock_ms=0.0"),
+                "{fps} fps: {}",
+                end[0].what
+            );
+            ends += end.len();
+            cameras += 1;
+        }
+        eprintln!("video-only short pauses checked: {cameras}, clamp ends: {ends}");
+        assert_eq!((cameras, ends), (PROFILES.len(), PROFILES.len()));
     }
 }

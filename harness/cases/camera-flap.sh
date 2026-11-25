@@ -44,11 +44,6 @@
 
 CASE_LIVE_S=125
 CASE_KEY=flap_hysteresis
-# C4 fix round 4 (the W0 diagnostic, `docs/_INDEX.md` Owed 117): input-tap (compose's `probe` profile)
-# beside the compositor, tap.jsonl (the decoded frames' stamps) and tap-audio.jsonl (the decoded
-# audio's), so the input chain's stamps are on record against the camera's own on the wire
-# (wire.jsonl). The camera is not impaired here, so a second decode costs the case nothing.
-export COMPOSE_PROFILES=probe
 FLAPS=12
 FLAP_EVERY_S=10
 
