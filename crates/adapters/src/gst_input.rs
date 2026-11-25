@@ -105,7 +105,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use crate::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_RATE};
+use crate::frame_store::{media_time, FrameStore, AUDIO_CHANNELS, AUDIO_RATE};
 use crate::gst_output::LogFn;
 #[cfg(feature = "test-hooks")]
 pub use crate::input_threads::WorkerCounts;
@@ -803,7 +803,7 @@ impl GstInput {
         self.link_demux(&demux, &vqueue, &aqueue, gen);
         let abandoned_at = Arc::new(Mutex::new(None));
         self.wire_video(&vsink, build, gen, Arc::clone(&abandoned_at), withheld);
-        self.wire_audio(&asink, build);
+        self.wire_audio(&asink, build, gen);
         let errored = Arc::new(Mutex::new(None));
         self.sync_handler(&pipeline, build, &errored)?;
         Ok(Live {
@@ -904,7 +904,7 @@ impl GstInput {
                         }
                         return Ok(gst::FlowSuccess::Ok);
                     }
-                    shared.frames.set_camera(sample);
+                    shared.frames.push_camera(gen, sample);
                     shared.last_frame_gen.store(gen, Ordering::SeqCst);
                     if !connected
                         && shared
@@ -928,13 +928,16 @@ impl GstInput {
     }
 
     /// Audio passes the same gate as the video, so a build the domain gave up (`abandon`) is off air
-    /// for its audio too (the C10 confirm pass's m2), and no rule of the domain's is read here.
-    fn wire_audio(&self, sink: &gst_app::AppSink, build: u64) {
+    /// for its audio too (the C10 confirm pass's m2), and no rule of the domain's is read here. It is
+    /// stamped with its media time and generation, so the programme plays it on the camera's playout
+    /// clock with the picture (C4).
+    fn wire_audio(&self, sink: &gst_app::AppSink, build: u64, gen: u64) {
         let shared = Arc::clone(&self.shared);
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |s| {
                     let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let pts = media_time(&sample);
                     let Some(buffer) = sample.buffer() else {
                         return Ok(gst::FlowSuccess::Ok);
                     };
@@ -946,7 +949,7 @@ impl GstInput {
                         shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
                         return Ok(gst::FlowSuccess::Ok);
                     }
-                    shared.frames.push_audio(map.as_slice());
+                    shared.frames.push_audio_at(gen, pts, map.as_slice());
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),

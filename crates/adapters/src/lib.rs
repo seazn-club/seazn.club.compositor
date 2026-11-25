@@ -9,6 +9,7 @@ pub mod gst_programme;
 mod input_threads;
 pub mod metrics_proc;
 pub mod phase_http;
+pub mod playout;
 pub mod redact;
 pub mod slate;
 pub mod sponsor_line;

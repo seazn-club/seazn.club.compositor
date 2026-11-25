@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use adapters::metrics_proc::{parse_proc_stat, parse_proc_status, parse_vm_rss_kb, ProcMetrics};
 use adapters::stats::{Stats, StatsSnapshot};
-use app::ports::{CefPoll, CefPss, KindPss, Metrics, ProcStatus};
+use app::ports::{CefPoll, CefPss, KindPss, Metrics, PlayoutTotals, ProcStatus};
 
 /// A CEF poll as the graphics adapter hands it (made-up numbers).
 fn a_cef_poll() -> CefPoll {
@@ -151,6 +151,13 @@ fn copies_every_stats_field_into_measured() {
         egress_bytes: Some(123_456_789),
         encoder_speed: Some(0.97),
         camera_frames_replaced: Some(41),
+        camera_playout: Some(PlayoutTotals {
+            repeat_ticks: 7,
+            audio_pad_bytes: 8,
+            audio_overflow_bytes: 9,
+            audio_late_bytes: 10,
+            reanchors: 11,
+        }),
     };
     stats.force_snapshot(set);
     let got = ProcMetrics::new(Arc::clone(&stats)).sample();
@@ -159,6 +166,7 @@ fn copies_every_stats_field_into_measured() {
     assert_eq!(got.egress_bytes, set.egress_bytes);
     assert_eq!(got.encoder_speed, set.encoder_speed);
     assert_eq!(got.camera_frames_replaced, set.camera_frames_replaced);
+    assert_eq!(got.camera_playout, set.camera_playout);
     let fresh = ProcMetrics::new(Arc::new(Stats::default())).sample();
     assert_eq!(
         (
@@ -166,9 +174,10 @@ fn copies_every_stats_field_into_measured() {
             fresh.bitrate_kbps,
             fresh.egress_bytes,
             fresh.encoder_speed,
-            fresh.camera_frames_replaced
+            fresh.camera_frames_replaced,
+            fresh.camera_playout
         ),
-        (None, None, None, None, None),
+        (None, None, None, None, None, None),
         "a field C09 reports as None stays absent"
     );
 }

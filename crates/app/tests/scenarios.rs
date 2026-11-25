@@ -8,7 +8,8 @@ use app::airings::Airings;
 use app::driver::Driver;
 use app::frame_grab::{spawn, FrameGrabs, FrameWorker, GrabRun};
 use app::ports::{
-    ControlRequest, FrameUploadError, Inbound, Measured, MemorySplit, Metrics, ProcStatus, SessionConfig,
+    ControlRequest, FrameUploadError, Inbound, Measured, MemorySplit, Metrics, PlayoutTotals, ProcStatus,
+    SessionConfig,
 };
 use domain::airings::{AiringLine, AiringSource, AiringStyle};
 use domain::config::{
@@ -1734,6 +1735,100 @@ fn camera_frames_replaced_is_logged_once_a_beat_with_the_beats_rise() {
     assert_eq!(lines(), want, "the final beat's line");
     eprintln!("camera frames replaced lines checked: {}", want.len());
     assert_eq!(want.len(), script.len() + 1);
+}
+
+/// A `Metrics` whose replaced total and playout totals (C4) the test sets between beats (the rest
+/// stays `metrics()`'s: no camera rates, so the `input received` line is the playout's alone).
+struct ScriptedPlayout(Arc<Mutex<Option<(u64, PlayoutTotals)>>>);
+
+impl Metrics for ScriptedPlayout {
+    fn sample(&mut self) -> Measured {
+        let s = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Measured {
+            camera_frames_replaced: s.map(|(r, _)| r),
+            camera_playout: s.map(|(_, t)| t),
+            ..metrics()
+        }
+    }
+}
+
+/// C4 (Owed 89): a beat whose sample carries the playout's totals extends the two camera lines with
+/// each total's rise since the last beat: the repeat ticks beside `camera frames replaced` (with
+/// their total, as the replaced count has), and the audio and clock counts on `input received`.
+/// The second beat's totals are below the first's in one field (a fault): it reads 0 there and the
+/// next beat counts from it. Every expected number is the script's own difference; the fields are
+/// distinct so a swapped pair reads wrong. Before the totals are measured, neither line is written.
+#[test]
+fn camera_playout_totals_are_logged_once_a_beat_with_their_rise() {
+    let log = Log::default();
+    let cell = Arc::new(Mutex::new(None));
+    let set = |v: Option<(u64, PlayoutTotals)>| *cell.lock().unwrap_or_else(PoisonError::into_inner) = v;
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedPlayout(Arc::clone(&cell)));
+    let mut d = Driver::new(th(), p, FAR, 0);
+    assert_eq!(d.tick_due(0), None);
+    assert_eq!(d.step(Inbound::Session(session_720p()), SESSION_AT), None);
+    let is_beat = |c: &Call| matches!(c, Call::Control(ControlRequest::Heartbeat(..)));
+    let next_beat = |d: &mut Driver| loop {
+        let mark = log.len();
+        let at = d.next_tick_at();
+        assert!(at < FAR, "no beat");
+        assert_eq!(d.tick_due(at), None);
+        if log.calls_from(mark).iter().any(is_beat) {
+            return at;
+        }
+    };
+    let camera = || lines_starting(&log, "camera frames replaced");
+    let received = || lines_starting(&log, "input received");
+    next_beat(&mut d);
+    assert!(
+        camera().is_empty() && received().is_empty(),
+        "not measured: no line"
+    );
+    let totals = |r, a, b, c, e| PlayoutTotals {
+        repeat_ticks: r,
+        audio_pad_bytes: a,
+        audio_overflow_bytes: b,
+        audio_late_bytes: c,
+        reanchors: e,
+    };
+    let script = [
+        (
+            2,
+            totals(3, 6_400, 0, 1_200, 1),
+            "beat=2 total=2 repeat_ticks=3 repeat_ticks_total=3",
+            "audio_pad_bytes=6400 audio_overflow_bytes=0 audio_late_bytes=1200 reanchors=1",
+        ),
+        (
+            2,
+            totals(5, 6_400, 800, 1_600, 1),
+            "beat=0 total=2 repeat_ticks=2 repeat_ticks_total=5",
+            "audio_pad_bytes=0 audio_overflow_bytes=800 audio_late_bytes=400 reanchors=0",
+        ),
+        (
+            7,
+            totals(4, 19_200, 800, 1_600, 3),
+            "beat=5 total=7 repeat_ticks=0 repeat_ticks_total=4",
+            "audio_pad_bytes=12800 audio_overflow_bytes=0 audio_late_bytes=0 reanchors=2",
+        ),
+        (
+            7,
+            totals(9, 19_200, 800, 1_600, 3),
+            "beat=0 total=7 repeat_ticks=5 repeat_ticks_total=9",
+            "audio_pad_bytes=0 audio_overflow_bytes=0 audio_late_bytes=0 reanchors=0",
+        ),
+    ];
+    let (mut want_c, mut want_r) = (Vec::new(), Vec::new());
+    for (replaced, t, c, r) in script {
+        set(Some((replaced, t)));
+        let at = next_beat(&mut d);
+        want_c.push(format!("camera frames replaced {c}"));
+        want_r.push(format!("input received fps=- kbps=- {r}"));
+        assert_eq!(camera(), want_c, "the beat at {at}");
+        assert_eq!(received(), want_r, "the beat at {at}");
+    }
+    eprintln!("playout beats checked: {}", want_c.len());
+    assert_eq!(want_c.len(), script.len());
 }
 
 /// The camera's two rates as a sample carries them: fps, kbit/s; and (C3, S5) its two loss totals,

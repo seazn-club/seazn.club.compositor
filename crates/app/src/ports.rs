@@ -217,13 +217,16 @@ pub struct Measured {
     pub encoder_speed: Option<f64>,
     pub cpu_pct: Option<f64>,
     pub mem_mb: Option<u64>,
-    /// Camera frames no tick put on air, this session (Owed 81 (i)). The driver logs it once a beat
-    /// (`camera frames replaced beat=<n> total=<n>`). It is NOT on the heartbeat: the contract's
-    /// `heartbeat` refuses an unknown key (a 400 loses the beat), so it waits for web to declare it
-    /// (`docs/_INDEX.md` Owed 90). It counts the frames above one a camera tick, so a source faster
-    /// than the programme (60 fps on 30) and a late tick thread raise it too, judder or not (the
-    /// stats module's `ReplacedFrames` says how).
+    /// Camera frames no tick put on air, this session (Owed 81 (i)): since C4, the frames that left
+    /// the camera's playout queue unaired. The driver logs it once a beat (`camera frames replaced
+    /// beat=<n> total=<n>`). It is NOT on the heartbeat: the contract's `heartbeat` refuses an unknown
+    /// key (a 400 loses the beat), so it waits for web to declare it (`docs/_INDEX.md` Owed 90). A
+    /// source faster than the programme (60 fps on 30) and a late tick thread raise it too, judder or
+    /// not (the stats module's `CameraTally` says how).
     pub camera_frames_replaced: Option<u64>,
+    /// The camera playout's other counts, this session (C4, Owed 89). Logged once a beat, never on
+    /// the wire (Owed 90, as above).
+    pub camera_playout: Option<PlayoutTotals>,
     /// The camera as the relay received it (C2, S4): decoded camera frames written into the
     /// programme's camera slot over the beat window, per second (the adapter's `CameraTotals`). The
     /// driver logs it once a beat (`input received fps=<x> kbps=<n>`); the heartbeat carries it as
@@ -241,6 +244,39 @@ pub struct Measured {
     /// The times the queue before the camera's decoder was full and blocked the source, this process
     /// (C3, S5 item 1): `inputQueueOverruns`, as above.
     pub input_queue_overruns: Option<u64>,
+}
+
+/// The camera's playout over the session (C4, S1, Owed 89; the adapters' `playout.rs`), counted on
+/// camera ticks only (PR #60's slate rule). Totals that only grow. The driver logs their rise once a
+/// beat: the repeats beside `camera frames replaced`, the rest on the `input received` line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayoutTotals {
+    /// Camera ticks that aired no new frame and kept the last one on air (#59's second count).
+    pub repeat_ticks: u64,
+    /// Filler bytes played where the camera's audio due had not arrived.
+    pub audio_pad_bytes: u64,
+    /// Camera audio bytes dropped because the ring was full (its cap is the playout's).
+    pub audio_overflow_bytes: u64,
+    /// Camera audio bytes dropped unplayed because their period had already played.
+    pub audio_late_bytes: u64,
+    /// The playout clock's re-anchors after a gap or past the cap (not a first anchor, not a new
+    /// generation's).
+    pub reanchors: u64,
+}
+
+impl PlayoutTotals {
+    /// Each total's rise since `before` (a lower one, a fault, reads 0).
+    pub fn since(&self, before: &PlayoutTotals) -> PlayoutTotals {
+        PlayoutTotals {
+            repeat_ticks: self.repeat_ticks.saturating_sub(before.repeat_ticks),
+            audio_pad_bytes: self.audio_pad_bytes.saturating_sub(before.audio_pad_bytes),
+            audio_overflow_bytes: self
+                .audio_overflow_bytes
+                .saturating_sub(before.audio_overflow_bytes),
+            audio_late_bytes: self.audio_late_bytes.saturating_sub(before.audio_late_bytes),
+            reanchors: self.reanchors.saturating_sub(before.reanchors),
+        }
+    }
 }
 
 /// This process's memory from `/proc/self/status` (the soak's memory split). Each field is absent

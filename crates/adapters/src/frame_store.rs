@@ -1,16 +1,19 @@
-//! The latest-frame slots the four pipelines share (C09; spec §3.3's refinement). The input pipeline
-//! (C10) writes the camera slot and the audio ring, the graphics pipeline (C11) writes the overlay
-//! slot, and the programme pipeline (C09) reads all three once per tick. Every slot is bounded: a
-//! video slot holds one sample (the newest replaces it), and the audio ring holds at most 400 ms and
-//! drops the oldest bytes (plan, Global Constraints: "audio 400 ms … leaky, dropping the oldest").
-//! The camera slot also counts the frames written to it, so the programme can tell how many a tick
-//! passed over (`Stats::on_camera_tick`, Owed 81 (i)).
-use std::collections::VecDeque;
+//! The slots the four pipelines share (C09; spec §3.3's refinement). The input pipeline (C10)
+//! writes the camera's playout queue and its audio ring, the graphics pipeline (C11) writes the
+//! overlay slot, and the programme pipeline (C09) reads them once per tick. Every slot is bounded:
+//! the overlay slot holds one sample (the newest replaces it); the camera's frames and audio wait in
+//! the playout (C4, `playout.rs`: a queue played on a clock slaved to the camera's PTS) of at most
+//! `PLAYOUT_CAP_MS`, dropping the oldest, counted (the plan's Global Constraints, "audio 400 ms …
+//! leaky, dropping the oldest", amended by C4 to the playout's cap). The playout also counts the
+//! frames written, and the frames and audio a tick passed over (`Stats::on_camera_tick`, Owed 81).
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use domain::config::PLAYOUT_CAP_MS;
 use gstreamer as gst;
+
+use crate::playout::{AudioTake, Playout, Tick};
 
 /// The audio the programme encodes: S16LE, 48 kHz, stereo, interleaved (C10's capsfilter; the F-004
 /// verdict's AAC-LC 128 kbps 48 kHz stereo is encoded from it).
@@ -18,9 +21,9 @@ pub const AUDIO_RATE: u32 = 48_000;
 pub const AUDIO_CHANNELS: u32 = 2;
 /// One S16LE stereo frame: two channels of two bytes.
 pub const AUDIO_FRAME_BYTES: usize = 4;
-/// The ring's cap: 400 ms (plan, Global Constraints, "audio 400 ms") of 48 kHz stereo S16LE,
-/// 0.4 × 48 000 × 4 = 76 800 bytes.
-pub const AUDIO_RING_BYTES: usize = 76_800;
+/// The ring's cap: the playout's, `PLAYOUT_CAP_MS` (C4; the plan's "audio 400 ms", amended so the
+/// audio holds what the camera's queue may) of 48 kHz stereo S16LE: 0.5 × 48 000 × 4 = 96 000 bytes.
+pub const AUDIO_RING_BYTES: usize = PLAYOUT_CAP_MS as usize * AUDIO_RATE as usize / 1_000 * AUDIO_FRAME_BYTES;
 
 /// Shared by every pipeline; a clone shares the same slots.
 #[derive(Clone, Default)]
@@ -30,22 +33,26 @@ pub struct FrameStore {
 
 #[derive(Default)]
 struct Inner {
-    camera: Mutex<Camera>,
+    /// The camera's frames and audio, under one lock: a tick's picture and its audio are read off
+    /// the same clock.
+    camera: Mutex<Playout<gst::Sample>>,
     overlay: Mutex<Option<gst::Sample>>,
-    audio: Mutex<VecDeque<u8>>,
     /// Audio pushes refused because they were not whole S16LE stereo frames.
     audio_refused: AtomicU64,
     /// The ring's real bytes handed out by `take_audio*` (the padding is not counted).
     audio_taken: AtomicU64,
 }
 
-/// The camera slot: the newest frame, and how many frames the slot has taken (a plain count under
-/// the slot's lock, so a reader gets the frame and the count of the same write, and the per-frame
-/// cost is one add).
-#[derive(Default)]
-struct Camera {
-    sample: Option<gst::Sample>,
-    written: u64,
+/// A sample's media time (ns): its buffer's PTS as running time in its segment (the time base the
+/// camera's video and audio appsinks share, one input build's pipeline), else the raw PTS; `None`
+/// without a PTS.
+pub fn media_time(s: &gst::Sample) -> Option<u64> {
+    let pts = s.buffer()?.pts()?;
+    let running = s
+        .segment()
+        .and_then(|seg| seg.downcast_ref::<gst::ClockTime>())
+        .and_then(|seg| seg.to_running_time(pts));
+    Some(running.unwrap_or(pts).nseconds())
 }
 
 /// A slot's lock, taken even if a writer panicked while holding it: the slot holds plain data, so
@@ -55,26 +62,38 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl FrameStore {
+    /// An unstamped camera frame (the programme's tests): due at once, the newest wins (the old
+    /// slot's rule, `playout.rs`).
     pub fn set_camera(&self, s: gst::Sample) {
-        let mut slot = locked(&self.inner.camera);
-        slot.sample = Some(s);
-        slot.written += 1;
+        locked(&self.inner.camera).push_video(None, None, s);
     }
 
+    /// A decoded camera frame of input generation `gen`, queued on its media time (`media_time`).
+    pub fn push_camera(&self, gen: u64, s: gst::Sample) {
+        let pts = media_time(&s);
+        locked(&self.inner.camera).push_video(Some(gen), pts, s);
+    }
+
+    /// The newest camera frame written, aired or not.
     pub fn camera(&self) -> Option<gst::Sample> {
-        locked(&self.inner.camera).sample.clone()
+        locked(&self.inner.camera).newest().cloned()
     }
 
-    /// The newest camera frame and the frames the slot has taken so far, read under one lock: the
-    /// count includes the frame returned.
+    /// The newest camera frame written and the frames written so far, read under one lock.
     pub fn camera_frame(&self) -> (Option<gst::Sample>, u64) {
-        let slot = locked(&self.inner.camera);
-        (slot.sample.clone(), slot.written)
+        let p = locked(&self.inner.camera);
+        (p.newest().cloned(), p.written())
     }
 
-    /// The frames the camera slot has taken so far (a slate tick reads it without the frame).
+    /// The camera frames written so far, every generation's.
     pub fn camera_written(&self) -> u64 {
-        locked(&self.inner.camera).written
+        locked(&self.inner.camera).written()
+    }
+
+    /// The programme's tick at `at_ns` of its own timeline: the camera frame on air after it, and
+    /// the playout's counts (`playout::Playout::tick`). Every tick calls it, a slate's too.
+    pub fn playout_tick(&self, at_ns: u64) -> Tick<gst::Sample> {
+        locked(&self.inner.camera).tick(at_ns)
     }
 
     pub fn set_overlay(&self, s: gst::Sample) {
@@ -92,23 +111,35 @@ impl FrameStore {
         *locked(&self.inner.overlay) = None;
     }
 
-    /// Appends `bytes` (whole S16LE stereo frames) and drops the oldest bytes past 400 ms. A push that
-    /// is not a whole number of frames is refused and counted: taking it would shift every later
-    /// sample by a byte, and the rest of the session would encode as noise.
+    /// Appends unstamped `bytes` (whole S16LE stereo frames), played first in, first out, and drops
+    /// the oldest bytes past `AUDIO_RING_BYTES`. A push that is not a whole number of frames is
+    /// refused and counted: taking it would shift every later sample by a byte, and the rest of the
+    /// session would encode as noise.
     pub fn push_audio(&self, bytes: &[u8]) {
-        if !bytes.len().is_multiple_of(AUDIO_FRAME_BYTES) {
-            self.inner.audio_refused.fetch_add(1, Ordering::Relaxed);
-            return;
+        if self.whole(bytes) {
+            locked(&self.inner.camera).push_audio(None, None, bytes);
         }
-        let mut ring = locked(&self.inner.audio);
-        ring.extend(bytes.iter().copied());
-        let excess = ring.len().saturating_sub(AUDIO_RING_BYTES);
-        ring.drain(..excess);
+    }
+
+    /// `push_audio` for input generation `gen`, stamped `pts` ns of media time (`media_time`), so
+    /// the programme plays it on the camera's clock (`take_audio_due`).
+    pub fn push_audio_at(&self, gen: u64, pts: Option<u64>, bytes: &[u8]) {
+        if self.whole(bytes) {
+            locked(&self.inner.camera).push_audio(Some(gen), pts, bytes);
+        }
+    }
+
+    fn whole(&self, bytes: &[u8]) -> bool {
+        let whole = bytes.len().is_multiple_of(AUDIO_FRAME_BYTES);
+        if !whole {
+            self.inner.audio_refused.fetch_add(1, Ordering::Relaxed);
+        }
+        whole
     }
 
     /// Exactly `n` bytes: the oldest `min(n, level)` bytes of the ring, after `n − level` bytes of
     /// digital silence when the ring holds less than `n`. The programme never encodes these zeros
-    /// (F-004): it calls `take_audio_padded` with its noise filler.
+    /// (F-004): it calls `take_audio_due` with its noise filler.
     pub fn take_audio(&self, n: usize) -> Vec<u8> {
         self.take_audio_padded(n, |pad| pad.fill(0))
     }
@@ -116,28 +147,32 @@ impl FrameStore {
     /// `take_audio` with the padding written by `pad`. The padding comes FIRST and the ring's bytes
     /// last: the bytes kept are the newest of the timeline, so they stay at its end.
     pub fn take_audio_padded(&self, n: usize, pad: impl FnOnce(&mut [u8])) -> Vec<u8> {
-        let mut out = vec![0u8; n];
-        let mut ring = locked(&self.inner.audio);
-        let real = n.min(ring.len());
-        let gap = n - real;
-        for (slot, b) in out[gap..].iter_mut().zip(ring.drain(..real)) {
-            *slot = b;
-        }
+        let mut p = locked(&self.inner.camera);
+        let take = p.take_audio_fifo(n, pad);
         // Counted under the ring's lock, so a `clear_audio` that returns has seen every take before it.
-        self.inner.audio_taken.fetch_add(real as u64, Ordering::Relaxed);
-        drop(ring);
-        pad(&mut out[..gap]);
-        out
+        self.inner
+            .audio_taken
+            .fetch_add(take.real as u64, Ordering::Relaxed);
+        take.bytes
+    }
+
+    /// One period of `n` bytes for the programme's tick at `at_ns`: the camera's audio its clock has
+    /// due then, `pad` writing the filler wherever the ring has none (`playout::Playout::take_audio_due`;
+    /// unstamped audio plays first in, first out, as `take_audio_padded`).
+    pub fn take_audio_due(&self, at_ns: u64, n: usize, pad: impl FnMut(&mut [u8])) -> AudioTake {
+        let mut p = locked(&self.inner.camera);
+        let take = p.take_audio_due(at_ns, n, pad);
+        self.inner
+            .audio_taken
+            .fetch_add(take.real as u64, Ordering::Relaxed);
+        take
     }
 
     /// Empties the ring and returns the bytes it dropped. The input calls it when a build stops
     /// passing (its abandon, its loss, its rebuild), with that build's gate shut, so none of the
     /// build's audio still in the ring plays after it (the PR #35 review's m1).
     pub fn clear_audio(&self) -> usize {
-        let mut ring = locked(&self.inner.audio);
-        let dropped = ring.len();
-        ring.clear();
-        dropped
+        locked(&self.inner.camera).clear_audio()
     }
 
     /// The ring's real bytes handed out by `take_audio*` so far; the padding is not counted.
@@ -147,7 +182,7 @@ impl FrameStore {
 
     /// The bytes the ring holds now.
     pub fn audio_level(&self) -> usize {
-        locked(&self.inner.audio).len()
+        locked(&self.inner.camera).audio_level()
     }
 
     /// Audio pushes refused so far (not whole frames).
@@ -159,7 +194,7 @@ impl FrameStore {
 impl fmt::Debug for FrameStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrameStore")
-            .field("camera", &locked(&self.inner.camera).sample.is_some())
+            .field("camera", &locked(&self.inner.camera).newest().is_some())
             .field("overlay", &locked(&self.inner.overlay).is_some())
             .field("audio_bytes", &self.audio_level())
             .finish()

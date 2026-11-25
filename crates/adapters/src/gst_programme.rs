@@ -833,13 +833,15 @@ impl ProgrammeOutput for GstProgramme {
         let (pts, next) = (at(index), at(index + 1));
         let period = next - pts;
 
-        // The base layer. The camera slot's count goes to the stats on every tick, a slate's too, so
-        // a camera tick counts only the frames since the tick before it (Owed 81 (i)).
+        // The base layer. The camera's playout ticks every tick, a slate's too (C4): its clock anchors
+        // and its queue drains on this timeline whatever is on air. Its counts, and the audio's
+        // below, go to the stats with whether the camera is on air (Owed 81 (i), PR #60's rule).
+        let on_air = matches!(choice, FrameChoice::Emit | FrameChoice::Repeat);
+        let tick = self.frames.playout_tick(pts.nseconds());
+        let mut counts = tick.counts;
         let camera = match choice {
             FrameChoice::Emit | FrameChoice::Repeat => {
-                let (sample, written) = self.frames.camera_frame();
-                self.shared.stats.on_camera_tick(written, true);
-                let fitted = sample.and_then(|s| r.camera_fit.fit(&s));
+                let fitted = tick.frame.and_then(|s| r.camera_fit.fit(&s));
                 if fitted.is_none() {
                     self.camera_missing += 1;
                     if let Some(shape) = r.camera_fit.take_refusal() {
@@ -850,12 +852,7 @@ impl ProgrammeOutput for GstProgramme {
                 }
                 fitted
             }
-            FrameChoice::Slate(_) => {
-                self.shared
-                    .stats
-                    .on_camera_tick(self.frames.camera_written(), false);
-                None
-            }
+            FrameChoice::Slate(_) => None,
         };
         let base = match (camera, choice) {
             (Some(b), _) => b,
@@ -881,20 +878,23 @@ impl ProgrammeOutput for GstProgramme {
 
         // The audio: every missed period's first (Owed 40, owner 2026-10-19: no hole, no click; the
         // compositor repeats the picture across the gap), then this tick's. Each is one period of
-        // the ring's real audio, and pink noise for whatever it lacks. The ring holds 400 ms, so a
-        // longer gap keeps the rest of its hole (marked DISCONT).
+        // the camera's audio its playout clock has due then (C4), and pink noise for whatever it
+        // lacks. The ring holds the playout's cap, so a longer gap keeps the rest of its hole
+        // (marked DISCONT).
         let filled = missed.min(r.audio_fill_periods);
         let mut audio_gap = missed > filled;
         for m in index - filled..=index {
             let noise = &mut r.noise;
-            let pcm = self
+            let take = self
                 .frames
-                .take_audio_padded(r.period_bytes, |pad| noise.fill(pad));
-            let buffer = gst::Buffer::from_mut_slice(pcm);
+                .take_audio_due(at(m).nseconds(), r.period_bytes, |pad| noise.fill(pad));
+            counts.add(&take.counts);
+            let buffer = gst::Buffer::from_mut_slice(take.bytes);
             let res = push_timed(&r.audio, buffer, at(m), at(m + 1) - at(m), audio_gap);
             note_push(res, 2, &mut r.failing, &mut self.push_errors, &self.shared);
             audio_gap = false;
         }
+        self.shared.stats.on_camera_tick(&counts, on_air);
     }
 
     fn swap_sink(&mut self, gen: u64, target: &TargetSpec) {
