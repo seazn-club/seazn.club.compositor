@@ -795,8 +795,97 @@ fn flap_beat(w: &mut World, at: i64, repeat_ticks: u64, reanchors: u64, late: u6
     );
 }
 
+/// C4's A/V gate (owner ruling, 2026-11-25): how a fixture's pair list is spoiled.
+#[derive(Clone, Copy)]
+enum Spoil {
+    /// The list as a good run reads it.
+    None,
+    /// One kept pair (the last) at this many ms.
+    OneKept(i64),
+    /// One excluded pair (the first) at this many ms.
+    OneExcluded(i64),
+    /// Every pair inside a settle: no kept pair at all.
+    NoKept,
+    /// No kept pair in window `n` (0 is the run's own start): its kept pairs are dropped.
+    EmptyWindow(usize),
+    /// Only the first `n` pairs.
+    Few(usize),
+    /// No pair list at all.
+    Empty,
+}
+
+/// The checker's A/V pairs for a camera case's report, one a second from the first start (the first
+/// beat, the run's start) to the last beat, each `excluded_ms` inside `av_settle_cut_ms` of the latest
+/// start (the run's, or a return's first frame shown) and `kept_ms` after it. The cut and the starts
+/// are read from the report and thresholds.json, never typed.
+fn gate_av(r: &mut Value, excluded_ms: i64, kept_ms: i64, spoil: Spoil) {
+    let t: Value =
+        serde_json::from_str(&std::fs::read_to_string(repo().join("harness/thresholds.json")).unwrap())
+            .unwrap();
+    let cut = t["av_settle_cut_ms"].as_i64().unwrap();
+    let beats: Vec<i64> = r["log"]["camera_playout"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["at_ms"].as_i64().unwrap())
+        .collect();
+    // A run with no beat has no start, so no pair to place (the case reds its own window checks).
+    let Some(first) = beats.iter().min().copied() else {
+        r["audio"]["av_offset_ms"] =
+            json!({"p50": 0, "max_abs": 0, "pairs": 0, "camera_codec_delay_ms": 33.3, "list": []});
+        return;
+    };
+    let mut starts = vec![first];
+    starts.extend(
+        r["camera"]["resumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["first_shown_wall_ms"].as_i64()),
+    );
+    let last = *beats.iter().max().unwrap();
+    let mut list: Vec<(i64, i64, usize, bool)> = Vec::new();
+    let mut at = starts[0] + 700;
+    while at <= last {
+        let (w, from) = starts
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s <= at)
+            .max_by_key(|(_, s)| **s)
+            .map(|(i, s)| (i, *s))
+            .unwrap();
+        let kept = at - from >= cut;
+        list.push((at, if kept { kept_ms } else { excluded_ms }, w, kept));
+        at += 1_000;
+    }
+    match spoil {
+        Spoil::None => {}
+        Spoil::OneKept(ms) => list.iter_mut().rev().find(|p| p.3).unwrap().1 = ms,
+        Spoil::OneExcluded(ms) => list.iter_mut().find(|p| !p.3).unwrap().1 = ms,
+        Spoil::NoKept => list.retain(|p| !p.3),
+        Spoil::EmptyWindow(n) => list.retain(|p| !(p.3 && p.2 == n)),
+        Spoil::Few(n) => list.truncate(n),
+        Spoil::Empty => list.clear(),
+    }
+    let mut ms: Vec<i64> = list.iter().map(|p| p.1).collect();
+    ms.sort_unstable();
+    r["audio"]["av_offset_ms"] = json!({
+        "p50": ms.get(ms.len() / 2).copied().unwrap_or(0),
+        "max_abs": ms.iter().map(|m| m.abs()).max().unwrap_or(0),
+        "pairs": ms.len(),
+        "camera_codec_delay_ms": 33.3,
+        "list": list.iter().map(|p| json!({"at_ms": p.0, "ms": p.1})).collect::<Vec<_>>(),
+    });
+}
+
+/// The first second of a start rides the input chain's transient (Owed 121): over the budget (40) and
+/// inside the excluded bound (72, main's pre-C4 max).
+const GATE_EXCLUDED_MS: i64 = 60;
+/// A settled pair as CI read camera-flap's (p50 27 ms).
+const GATE_KEPT_MS: i64 = 27;
+
 fn flap_av(r: &mut Value) {
-    r["audio"]["av_offset_ms"] = json!({"p50": 2, "max_abs": 13, "pairs": 35, "camera_codec_delay_ms": 33.3});
+    gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::None);
 }
 
 fn camera_flap() -> World {
@@ -857,7 +946,7 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         edit(&mut w);
         w
     };
-    let reds: [(&str, World, &str); 7] = [
+    let reds: [(&str, World, &str); 12] = [
         (
             "flap-nobeats",
             storm(|w| w.log.retain(|(_, l)| !l.starts_with("input received"))),
@@ -897,22 +986,45 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         ),
         (
             "flap-av-out",
-            storm(|w| {
-                w.report_patch = Some(|r| {
-                    r["audio"]["av_offset_ms"] =
-                        json!({"p50": 2, "max_abs": 195, "pairs": 35, "camera_codec_delay_ms": 33.3});
-                })
-            }),
+            storm(|w| w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 195, Spoil::None))),
             "av_in_step",
         ),
         (
             "flap-av-unpaired",
+            storm(|w| w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::Few(11)))),
+            "av_in_step",
+        ),
+        // C4's gate (owner ruling, 2026-11-25): one kept pair over the budget, one excluded pair over
+        // its bound, no kept pair at all, a window with none, and no list.
+        (
+            "flap-av-kept41",
             storm(|w| {
-                w.report_patch = Some(|r| {
-                    r["audio"]["av_offset_ms"] =
-                        json!({"p50": 2, "max_abs": 13, "pairs": 11, "camera_codec_delay_ms": 33.3});
-                })
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::OneKept(41)))
             }),
+            "av_in_step",
+        ),
+        (
+            "flap-av-excluded73",
+            storm(|w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::OneExcluded(73)))
+            }),
+            "av_in_step",
+        ),
+        (
+            "flap-av-nokept",
+            storm(|w| w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::NoKept))),
+            "av_in_step",
+        ),
+        (
+            "flap-av-emptywindow",
+            storm(|w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::EmptyWindow(3)))
+            }),
+            "av_in_step",
+        ),
+        (
+            "flap-av-nolist",
+            storm(|w| w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::Empty))),
             "av_in_step",
         ),
     ];
@@ -922,7 +1034,7 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         checked += 1;
     }
     eprintln!("camera-flap window reds checked: {checked}");
-    assert_eq!(checked, 7);
+    assert_eq!(checked, 12);
 }
 
 /// C3's case 20: netem loss 20 s to 60 s (`dropped` packets), then a `pause_ms` pause at 70 s. As CI
@@ -6892,11 +7004,11 @@ const NOT_CHAOS_RUNS: [&str; 3] = ["smoke", "sponsor-airings", "camera-burst"];
 /// the whole hold for the newest-frame slot C4 replaced), simulated as the camera sending nothing for
 /// that long at the hold's end. Each beat logs the camera's lines, no audio overflow. `edit` changes
 /// the world before it is judged.
-/// The checker's A/V offset as PR #113's first camera-burst run read it (CI run 45575918830): p50
-/// 25 ms, max 27 ms over 66 tone-to-flash pairs. The World draws no audio, so the report carries it.
+/// The checker's A/V pairs as PR #113's camera-burst runs read them (CI run 45575918830: p50 25 ms,
+/// 66 pairs), with the first second's over the budget (the gate's excluded pairs, Owed 121). The World
+/// draws no audio, so the report carries them.
 fn burst_av(r: &mut Value) {
-    r["audio"]["av_offset_ms"] =
-        json!({"p50": 25, "max_abs": 27, "pairs": 66, "camera_codec_delay_ms": 33.3});
+    gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::None);
 }
 
 fn camera_burst(freeze_ms: i64, edit: impl Fn(&mut World)) -> World {
@@ -6946,7 +7058,7 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
              audio_late_bytes=0 reanchors=0",
         );
     };
-    let reds: [(&str, World, &str); 11] = [
+    let reds: [(&str, World, &str); 15] = [
         (
             "burst-newest",
             camera_burst(300, |_| {}),
@@ -7002,20 +7114,44 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
         (
             "burst-av-unstamped",
             camera_burst(freeze, |w| {
-                w.report_patch = Some(|r| {
-                    r["audio"]["av_offset_ms"] =
-                        json!({"p50": -167, "max_abs": 170, "pairs": 66, "camera_codec_delay_ms": 33.3});
-                })
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 170, Spoil::None))
             }),
             "av_in_step",
         ),
         (
             "burst-av-unpaired",
             camera_burst(freeze, |w| {
-                w.report_patch = Some(|r| {
-                    r["audio"]["av_offset_ms"] =
-                        json!({"p50": 25, "max_abs": 27, "pairs": 29, "camera_codec_delay_ms": 33.3});
-                })
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::Few(29)))
+            }),
+            "av_in_step",
+        ),
+        // C4's gate (owner ruling, 2026-11-25), as camera-flap's: a kept pair at 41, an excluded one
+        // at 73, no kept pair, no list.
+        (
+            "burst-av-kept41",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::OneKept(41)))
+            }),
+            "av_in_step",
+        ),
+        (
+            "burst-av-excluded73",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::OneExcluded(73)))
+            }),
+            "av_in_step",
+        ),
+        (
+            "burst-av-nokept",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::NoKept))
+            }),
+            "av_in_step",
+        ),
+        (
+            "burst-av-nolist",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::Empty))
             }),
             "av_in_step",
         ),

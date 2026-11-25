@@ -40,7 +40,8 @@
 #   skip, 12 times a window);
 # - late audio at most one re-anchor's skip, (playout_cap_ms - playout_target_ms) of audio
 #   (`audio_bytes_per_ms`).
-# And the run's A/V within budget_av_offset_ms on at least one tone-to-flash pair a flap.
+# And the run's A/V within budget_av_offset_ms on the tone-to-flash pairs from `av_settle_cut_ms` after each
+# start, the earlier pairs within `budget_av_offset_excluded_ms` (lib.jq's `av_gate`; at least one pair a flap).
 
 CASE_LIVE_S=125
 CASE_KEY=flap_hysteresis
@@ -79,6 +80,11 @@ FLAP_WINDOWS='def flap_windows:
      | . + {reanchors: ([.beats[].reanchors] | add // 0), late: ([.beats[].audio_late_bytes] | add // 0),
             beats: (.beats | length)}];'
 
+# The starts the A/V gate counts from: the run's (the first beat with the camera on air) and each
+# return's first frame shown.
+FLAP_AV_STARTS='def av_starts: [.log.camera_playout[0].at_ms // empty]
+  + [.camera.resumes[] | select(.first_shown_wall_ms != null) | .first_shown_wall_ms];'
+
 CASE_CHECKS=16
 case_verdict() {
   # Anti-vacuity: 12 flaps leave at least 10 resumes the strip judged (each judged resume followed a
@@ -106,8 +112,12 @@ case_verdict() {
     "$FLAP_WINDOWS flap_windows | {freezes: map(.freezes), skips: map(.skips)}"
   require window_late_audio "$FLAP_WINDOWS ((\$t.playout_cap_ms - \$t.playout_target_ms) * \$t.audio_bytes_per_ms)
     as \$most | flap_windows | all(.late <= \$most)" "$FLAP_WINDOWS flap_windows | map(.late)"
-  require av_in_step ".audio.av_offset_ms.pairs >= $FLAPS and .audio.av_offset_ms.max_abs <= \$t.budget_av_offset_ms" \
-    '.audio.av_offset_ms | {p50, max_abs, pairs}'
+  # C4's gate (owner ruling, 2026-11-25): the budget is judged on the pairs from `av_settle_cut_ms` after
+  # each start (the run's, each return's first frame shown), the earlier ones against their own bound
+  # (`budget_av_offset_excluded_ms`, lib.jq's `av_gate`), at least a pair a flap, at least one kept
+  # pair in every window, and the kept and excluded counts in the measure.
+  require av_in_step "$FLAP_AV_STARTS av_gate_ok(av_starts; $FLAPS)" \
+    "$FLAP_AV_STARTS av_gate(av_starts) + {p50: .audio.av_offset_ms.p50}"
   require no_output_outages '.output_outages == []' '.output_outages | length'
   require counter_regressions '.camera.counter_regressions == 0'
   require_no_false_restart

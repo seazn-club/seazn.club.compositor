@@ -275,3 +275,30 @@ def clear_phase:
 # The output's return after a fault cleared at $clear (cases 4, 5, 12): the first outage that ends
 # after it.
 def outage_across($clear): [.output_outages[] | select(.to_wall_ms > $clear)] | first;
+
+# C4's A/V gate (owner ruling, 2026-11-25). The checker's tone-to-flash pairs (`.audio.av_offset_ms.list`,
+# each {at_ms, ms}) are split by where they fall against the starts the case names (`$starts`, wall
+# ms: a return's first frame shown, or the run's start): a pair at least `$t.av_settle_cut_ms` after
+# the latest start at or before it is KEPT, judged against `$t.budget_av_offset_ms`; every other pair is
+# EXCLUDED (the input chain's start-up and return transient rides it, Owed 121) and judged against
+# `$t.budget_av_offset_excluded_ms`. A start with no kept pair after it is an empty window. A report
+# with no pair list has no kept pair, which the verdicts fail.
+def av_gate($starts):
+  ([$starts[] | select(. != null)]) as $s
+  | [(.audio.av_offset_ms.list // [])[] | . as $x
+     | ([$s[] | select(. <= $x.at_ms)] | max) as $from
+     | {at_ms: $x.at_ms, ms: ($x.ms | abs), from: $from,
+        kept: ($from != null and ($x.at_ms - $from) >= $t.av_settle_cut_ms)}] as $a
+  | {pairs: ($a | length), windows: ($s | length),
+     kept: ([$a[] | select(.kept)] | length),
+     excluded: ([$a[] | select(.kept | not)] | length),
+     kept_max: ([$a[] | select(.kept) | .ms] | max // 0),
+     excluded_max: ([$a[] | select(.kept | not) | .ms] | max // 0),
+     empty_windows: ([$s[] | . as $w | select(([$a[] | select(.kept and .from == $w)] | length) == 0)] | length)};
+
+# The gate's verdict: pairs enough (`$pairs_min`: the case's anti-vacuity), at least one kept, no
+# window without a kept pair, the kept pairs within the budget, the excluded within their own bound.
+def av_gate_ok($starts; $pairs_min):
+  av_gate($starts) as $g
+  | $g.pairs >= $pairs_min and $g.kept >= 1 and $g.empty_windows == 0 and $g.windows >= 1
+    and $g.kept_max <= $t.budget_av_offset_ms and $g.excluded_max <= $t.budget_av_offset_excluded_ms;

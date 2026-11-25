@@ -19,14 +19,12 @@
 #
 # Expected (CI-owed, never run locally): repeat ticks under 2 % of the camera's cadence pairs, 0
 # audio overflow bytes over every beat's camera line, the audio in step with the picture within
-# `budget_av_offset_ms` at every tone-to-flash pair, no slate inside the run, a clean exit. The
+# `budget_av_offset_ms` at every tone-to-flash pair from `av_settle_cut_ms` after the run's start (the earlier
+# pairs within `budget_av_offset_excluded_ms`; lib.jq's `av_gate`), no slate inside the run, a clean exit. The
 # compositor's own repeat count is measured beside the checker's, not judged.
 
 CASE_LIVE_S=60
 CASE_KEY=repeat_ticks_under_2pct
-# Owed 81's input-tap (compose's `probe` profile): tap.jsonl, read by scripts/cadence_stages.py's
-# input stage, so the run's arrival cadence at the compositor is on record beside its output's.
-export COMPOSE_PROFILES=probe
 
 case_drive() {
   "$HERE/netem.sh" in limit 10000
@@ -67,8 +65,11 @@ case_verdict() {
   # against the budget: the worst pair, so the median too. Audio that loses its stamp at the input
   # plays first in, first out, ahead of the picture by the playout's target, and reds here.
   # Anti-vacuity: at least half the live window's bursts paired (CI read 66 over the 60 s).
-  require av_in_step '.audio.av_offset_ms.pairs >= 30 and .audio.av_offset_ms.max_abs <= $t.budget_av_offset_ms' \
-    '.audio.av_offset_ms | {p50, max_abs, pairs}'
+  # C4's gate (owner ruling, 2026-11-25): the budget is judged on the pairs from `av_settle_cut_ms` after the
+  # run's start (the first beat with the camera on air; the case has holds, no return), the earlier ones
+  # within `budget_av_offset_excluded_ms`, the kept and excluded counts in the measure (lib.jq).
+  require av_in_step "def av_starts: [.log.camera_playout[0].at_ms // empty]; av_gate_ok(av_starts; 30)" \
+    "def av_starts: [.log.camera_playout[0].at_ms // empty]; av_gate(av_starts) + {p50: .audio.av_offset_ms.p50}"
   measure compositor_repeat_ticks '{repeat_ticks: ([.log.camera_repeats[].repeat_ticks] | add),
     replaced: ([.log.camera_repeats[].replaced] | add)}'
   require no_interior_slates '.camera.slate_frames == 0'

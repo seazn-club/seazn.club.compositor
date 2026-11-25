@@ -758,7 +758,7 @@ jq '{frames, duration_ms, fps_mean, pts_gaps: (.pts_gaps | length), segments: (.
      slate_frames: .camera.slate_frames, regressions: .camera.counter_regressions,
      latency_ms: .camera.latency_ms, cadence: .camera.cadence,
      score_changes: (.overlay.score_index_changes | length),
-     av_offset_ms: .audio.av_offset_ms, beats: .heartbeats.count, rungs: .heartbeats.rungs,
+     av_offset_ms: (.audio.av_offset_ms | del(.list)), beats: .heartbeats.count, rungs: .heartbeats.rungs,
      rung_sequence: .heartbeats.rung_sequence,
      restarts_without_crash: .graphics.restarts_without_crash, checker_failures}' "$OUT/report.json"
 echo "docker events (compositor): $(jq -c '[.events[] | select(.service == "compositor") | "\(.action)\(if .exit_code == null then "" else " \(.exit_code)" end)"]' "$OUT/run.json")"

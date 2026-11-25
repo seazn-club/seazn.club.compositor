@@ -212,6 +212,20 @@ fn two_recorded_segments_give_the_fixtures_outage_freeze_slate_and_latency() {
     assert_eq!(r.audio.onsets, 5, "{:?}", r.audio);
     assert_eq!(r.audio.av_offset_ms.pairs, 4, "{:?}", r.audio);
     assert!(r.audio.av_offset_ms.max_abs <= 5, "{:?}", r.audio.av_offset_ms);
+    // C4's gate reads each pair by when it was (owner ruling, 2026-11-25): the four, in time order,
+    // each a second or more after the one before (a burst a second at 30 fps is 30 counters), and
+    // the summary is of exactly those.
+    let list = &r.audio.av_offset_ms.list;
+    assert_eq!(list.len(), 4, "{list:?}");
+    assert!(
+        list.windows(2).all(|w| w[1].at_ms - w[0].at_ms >= 1_000),
+        "{list:?}"
+    );
+    assert_eq!(
+        list.iter().map(|p| p.ms.abs()).max(),
+        Some(r.audio.av_offset_ms.max_abs),
+        "{list:?}"
+    );
     assert!(r.audio.silent_gaps.is_empty(), "{:?}", r.audio.silent_gaps);
 
     assert_eq!(

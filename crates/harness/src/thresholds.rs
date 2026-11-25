@@ -12,7 +12,8 @@
 use domain::config::{
     OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN,
     FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
-    PLAYOUT_CAP_MS, PLAYOUT_EARLY_REANCHOR_MS, PLAYOUT_TARGET_MS, TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
+    PLAYOUT_CAP_MS, PLAYOUT_EARLY_REANCHOR_MS, PLAYOUT_SETTLE_MS, PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_TARGET_MS,
+    TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
 };
 use serde_json::{json, Map, Value};
 
@@ -51,6 +52,15 @@ pub const BUDGET_FRAME_TO_ENCODER_MS: u64 = 150;
 /// failure table, timing budgets and resource bounds are adopted as written"); §6's own text names
 /// no A/V number.
 pub const BUDGET_AV_OFFSET_MS: u64 = 40;
+/// C4's gate ruling (owner, 2026-11-25): the budget above is judged on the pairs taken from
+/// `av_settle_cut_ms` after each start (a return, or the run's start), and the pairs before it have
+/// their own bound, the worst pre-C4 main read. The input chain's start-up and return transient
+/// (decoded stamps +40 to +64 ms, decaying over ~1.5 s, in tsdemux; `docs/_INDEX.md` Owed 121) rides
+/// those first seconds whatever the playout does, so they are bounded, not budgeted: a storm in them
+/// still fails. Source: the checker's A/V max on main's pre-C4 code, 72 ms (camera-flap chaos legs
+/// 45508994483, max 72, and 45498019823, max 65; camera-stop 45508994483, max 72; smoke on ten pre-C4
+/// PR runs of 2026-11-24, max 72 in nine of ten).
+pub const BUDGET_AV_OFFSET_EXCLUDED_MS: u64 = 72;
 /// Spec §6, the failure table's score feed row: the page "signals `scoreStale` after 10 s" (the
 /// page's `SCORE_STALE_AFTER_MS`, R2005). The harness page's own stale rule reads this value from
 /// fake-control (`control::PageControl`), so the page and case 7's bound share one number.
@@ -256,6 +266,16 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     );
     put("budget_frame_to_encoder_ms", json!(BUDGET_FRAME_TO_ENCODER_MS));
     put("budget_av_offset_ms", json!(BUDGET_AV_OFFSET_MS));
+    put(
+        "budget_av_offset_excluded_ms",
+        json!(BUDGET_AV_OFFSET_EXCLUDED_MS),
+    );
+    // The settle's own span: the cut after a start the budget is judged from (`PLAYOUT_SETTLE_SKIP_MS`
+    // and `PLAYOUT_SETTLE_MS`, never a typed number).
+    put(
+        "av_settle_cut_ms",
+        json!(PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS),
+    );
     put("budget_score_stale_after_ms", json!(BUDGET_SCORE_STALE_AFTER_MS));
     put("budget_fps_mean_min", json!(BUDGET_FPS_MEAN_MIN));
     put("budget_zygote_verdict_ms", json!(BUDGET_ZYGOTE_VERDICT_MS));
@@ -334,7 +354,7 @@ mod tests {
             teardown_leak_after_ms: 5,
             audio_bytes_per_ms: 6,
         });
-        let pairs: [(&str, u64); 11] = [
+        let pairs: [(&str, u64); 13] = [
             ("slate_after_ms", t.slate_after_ms),
             ("resume_after_ms", t.resume_after_ms),
             ("output_connect_timeout_ms", t.output_connect_timeout_ms),
@@ -346,6 +366,8 @@ mod tests {
             ("heartbeat_interval_ms", t.heartbeat_interval_ms),
             ("cef_gpu_deaths_to_restart", t.cef_gpu_deaths_to_restart as u64),
             ("playout_target_ms", PLAYOUT_TARGET_MS),
+            ("av_settle_cut_ms", PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS),
+            ("budget_av_offset_excluded_ms", BUDGET_AV_OFFSET_EXCLUDED_MS),
         ];
         for (k, want) in pairs {
             assert_eq!(v[k].as_u64(), Some(want), "{k}");
@@ -404,6 +426,15 @@ mod tests {
         }
         eprintln!("mode budgets checked: {checked}");
         assert!(checked > 0);
+    }
+
+    /// The A/V gate's two numbers (owner, 2026-11-25): the cut is the settle's own span from config
+    /// (650 + 1 000 ms) and the bound before it is above the budget, below a storm's.
+    #[test]
+    fn the_av_gate_cut_is_the_settle_and_its_bound_sits_above_the_budget() {
+        assert_eq!(PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS, 1_650);
+        const _: () = assert!(BUDGET_AV_OFFSET_EXCLUDED_MS > BUDGET_AV_OFFSET_MS);
+        assert_eq!(BUDGET_AV_OFFSET_EXCLUDED_MS, 72, "main's pre-C4 max");
     }
 
     #[test]
