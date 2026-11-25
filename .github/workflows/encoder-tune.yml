@@ -66,6 +66,14 @@ jobs:
           "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" --version
       - name: Self-test
         run: /usr/bin/python3 -I harness/encoder-tune/measure.py selftest
+      - name: Which option turns x264enc's filler off (the SEI is the witness)
+        run: |
+          for opt in "nal-hrd=cbr:filler=1" "nal-hrd=cbr:filler=0" "nal-hrd=vbr" "scenecut=0"; do
+            gst-launch-1.0 -q videotestsrc pattern=ball num-buffers=20 ! video/x-raw,width=1920,height=1080,framerate=30/1 \
+              ! x264enc speed-preset=medium bitrate=6000 vbv-buf-capacity=1000 tune=zerolatency option-string="$opt" \
+              ! h264parse ! filesink location="$RUNNER_TEMP/probe.h264"
+            echo "option-string=$opt ->" "$({ strings "$RUNNER_TEMP/probe.h264" | grep -F 'x264 - core' | tr ' ' '\n' | grep -E '^(nal_hrd|filler|vbv_maxrate|vbv_bufsize)=' | tr '\n' ' '; } || true)"
+          done
       - name: The options each leg gets (x264's own SEI), and its automatic thread count
         run: |
           set -x
@@ -85,6 +93,13 @@ jobs:
               /usr/bin/python3 -I harness/encoder-tune/measure.py clip \
                 --url "$CLIPS_URL/$c.y4m" --out "$RUNNER_TEMP/clips/$c.yuv" --frames "$FRAMES"
             done
+          fi
+          # An easy picture (F-005's "ball" camera is the easy case): what filler does when the picture
+          # needs fewer bits than the CBR target, the encoder's side of scan D2.
+          if [ "$SMOKE" != true ]; then
+            gst-launch-1.0 -q videotestsrc pattern=ball num-buffers="$FRAMES" \
+              ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 \
+              ! filesink location="$RUNNER_TEMP/clips/ball.yuv"
           fi
           ls -l "$RUNNER_TEMP/clips"
       - name: Quality (x264enc offline, libvmaf)

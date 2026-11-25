@@ -64,8 +64,16 @@ def legs(vcpus=6):
         {"id": "L4", "name": "as L2 + bframes=2", "props": {**nt, "bframes": 2}},
         {
             "id": "L5",
-            "name": "as L1, filler=0",
+            "name": "as L1, nal-hrd=vbr (HRD signalled, no filler)",
+            "props": {**today, "option-string": "nal-hrd=vbr:scenecut=0"},
+        },
+        {
+            # The brief's literal leg 5. x264 documents `--nal-hrd cbr` as implying filler, and the first
+            # full run's SEI read `filler=1` under it: kept to prove it is leg 1, so L5 is the real leg.
+            "id": "L5a",
+            "name": "as L1, filler=0 under nal-hrd=cbr (the brief's literal leg)",
             "props": {**today, "option-string": "nal-hrd=cbr:filler=0:scenecut=0"},
+            "quality_only": True,
         },
         {
             "id": "X1",
@@ -630,13 +638,14 @@ def cmd_selftest(_):
     assert x264_options(b"nothing here") is None
     # legs: five of the brief, one extra, R0, one profile each, the product's floor and GOP carried
     ls = legs()
-    assert [lg["id"] for lg in ls] == ["L1", "L2", "L3", "L4", "L5", "X1", "R0"]
+    assert [lg["id"] for lg in ls] == ["L1", "L2", "L3", "L4", "L5", "L5a", "X1", "R0"]
     assert COMMON["key-int-max"] == 3 * FPS and COMMON["min-force-key-unit-interval"] == PRODUCT_FLOOR_MS * 1_000_000
     p = {lg["id"]: lg["props"] for lg in ls}
     assert p["L1"]["tune"] == "zerolatency" and "tune" not in p["L2"]
     assert (p["L2"]["rc-lookahead"], p["L3"]["rc-lookahead"], p["L4"]["bframes"]) == (15, 20, 2)
-    assert p["L5"]["option-string"].count("filler=0") == 1 and "filler=1" in COMMON["option-string"]
-    assert 'option-string="nal-hrd=cbr:filler=0:scenecut=0"' in enc_props(ls[4])
+    assert "nal-hrd=vbr" in p["L5"]["option-string"] and "filler" not in p["L5"]["option-string"]
+    assert p["L5a"]["option-string"].count("filler=0") == 1 and "filler=1" in COMMON["option-string"]
+    assert 'option-string="nal-hrd=cbr:filler=0:scenecut=0"' in enc_props(ls[5])
     print("selftest: ok")
 
 
