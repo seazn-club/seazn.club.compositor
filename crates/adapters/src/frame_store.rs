@@ -43,16 +43,17 @@ struct Inner {
     audio_taken: AtomicU64,
 }
 
-/// A sample's media time (ns): its buffer's PTS as running time in its segment (the time base the
-/// camera's video and audio appsinks share, one input build's pipeline), else the raw PTS; `None`
-/// without a PTS.
+/// A sample's media time (ns): its buffer's PTS as running time in its time segment (the time base
+/// the camera's video and audio appsinks share, one input build's pipeline); a sample with no time
+/// segment (the programme's tests) reads its raw PTS. `None` without a PTS, and for a PTS outside its
+/// segment (it has no running time): the raw PTS there is another time base, a jump of hours on a
+/// live chain (the C4 review's m3), so such a sample plays as unstamped.
 pub fn media_time(s: &gst::Sample) -> Option<u64> {
     let pts = s.buffer()?.pts()?;
-    let running = s
-        .segment()
-        .and_then(|seg| seg.downcast_ref::<gst::ClockTime>())
-        .and_then(|seg| seg.to_running_time(pts));
-    Some(running.unwrap_or(pts).nseconds())
+    match s.segment().and_then(|seg| seg.downcast_ref::<gst::ClockTime>()) {
+        Some(seg) => seg.to_running_time(pts).map(gst::ClockTime::nseconds),
+        None => Some(pts.nseconds()),
+    }
 }
 
 /// A slot's lock, taken even if a writer panicked while holding it: the slot holds plain data, so
@@ -178,6 +179,26 @@ impl FrameStore {
     /// The ring's real bytes handed out by `take_audio*` so far; the padding is not counted.
     pub fn audio_taken(&self) -> u64 {
         self.inner.audio_taken.load(Ordering::Relaxed)
+    }
+
+    /// A build's loss or retire (`gst_input`'s gate): drops the camera's queued frames (counted
+    /// unaired; the frame on air stays, for the domain's freeze) and empties the ring, under one
+    /// lock, so nothing the build pushed airs after it (the C4 review's m5). The ring's bytes dropped.
+    pub fn flush_camera(&self) -> usize {
+        let mut p = locked(&self.inner.camera);
+        p.clear_video();
+        p.clear_audio()
+    }
+
+    /// The camera frames queued, not yet aired or dropped.
+    pub fn camera_queued(&self) -> usize {
+        locked(&self.inner.camera).queued()
+    }
+
+    /// The media time (ns) just past the ring's newest stamped audio, on the video's stamps
+    /// (`playout::Playout::audio_end_ns`); `None` when it holds none.
+    pub fn audio_end_ns(&self) -> Option<i128> {
+        locked(&self.inner.camera).audio_end_ns()
     }
 
     /// The bytes the ring holds now.

@@ -12,10 +12,11 @@
 //!
 //! **Per tick** (`push(i, choice)`): the base layer is the latest camera frame (`Emit`, `Repeat`) or
 //! the textless slate (`Slate`); the overlay layer is the latest CEF frame, or a transparent frame
-//! while the overlay slot is empty (hidden, or never painted); the audio is one period of the 400 ms
-//! ring, and any part the ring lacks is low-level pink noise, never digital zero (F-004). On rung
-//! `OverlayHalfRate` the overlay is pushed on even indices only, each push covering two periods, so
-//! the compositor keeps it on air for the odd ones (owner, 2026-10-18: no rung takes the score off).
+//! while the overlay slot is empty (hidden, or never painted); the audio is one period of the
+//! camera's playout (C4: its ring holds `PLAYOUT_CAP_MS`), and any part the ring lacks is low-level
+//! pink noise, never digital zero (F-004). On rung `OverlayHalfRate` the overlay is pushed on even
+//! indices only, each push covering two periods, so the compositor keeps it on air for the odd ones
+//! (owner, 2026-10-18: no rung takes the score off).
 //! Every tick hands the camera slot's write count to `Stats::on_camera_tick`, which counts the camera
 //! frames no tick put on air (`camera_frames_replaced`, Owed 81 (i)).
 //!
@@ -168,7 +169,8 @@ struct Running {
     camera_fit: Fitter,
     overlay_fit: Fitter,
     last_index: Option<u64>,
-    /// The most missed periods a tick's audio fills (Owed 40): the frame store's ring, 400 ms.
+    /// The most missed periods a tick's audio fills (Owed 40): the frame store's ring
+    /// (`AUDIO_RING_BYTES`, the playout's cap since C4).
     audio_fill_periods: u64,
     /// Each layer's last push failed (a run of failures is logged once).
     failing: [bool; 3],

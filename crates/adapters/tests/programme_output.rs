@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use adapters::frame_store::{FrameStore, AUDIO_RING_BYTES};
+use adapters::frame_store::{media_time, FrameStore, AUDIO_RING_BYTES};
 use adapters::gst_output::{
     ENCODED_RING_MAX_ENTRIES, ENCODED_RING_SPAN, OUTPUT_PROGRESS_POLL_MS, OUTPUT_QUEUE_BYTES,
 };
@@ -917,6 +917,49 @@ fn stamped_camera_frames_air_on_the_playout_clock() {
     assert_eq!(snap.camera_frames_replaced, Some(0), "both frames aired");
     let repeats = (red_tick - green_tick - 1) + (ticks - red_tick - 1);
     assert_eq!(snap.camera_playout.map(|t| t.repeat_ticks), Some(repeats));
+}
+
+/// C4 fix round 1 (the review's I2 and m3): `media_time` reads a sample's PTS as running time in
+/// its time segment, the time base the input's video and audio appsinks share (a segment starting at
+/// 10 s maps a PTS of 10.5 s to 0.5 s; its base adds on), a sample with no segment (the programme's
+/// tests) its raw PTS, and a PTS before its segment's start (no running time) as unstamped, never as
+/// the raw PTS of another time base. Each expected value is GStreamer's running-time rule
+/// (`base + pts − start`) worked by hand.
+#[test]
+fn media_time_is_the_running_time_in_the_samples_segment() {
+    gst::init().expect("gstreamer");
+    let buffer = |pts_ms: u64| {
+        let mut b = gst::Buffer::new();
+        b.get_mut()
+            .expect("a new buffer")
+            .set_pts(gst::ClockTime::from_mseconds(pts_ms));
+        b
+    };
+    let ms = |m: u64| Some(m * 1_000_000);
+    let mut checked = 0;
+    for (pts, start, base, want) in [
+        (10_500, 10_000, 0, ms(500)),
+        (10_500, 10_000, 2_000, ms(2_500)),
+        (10_000, 10_000, 0, ms(0)),
+        (9_000, 10_000, 0, None),
+    ] {
+        let mut seg = gst::FormattedSegment::<gst::ClockTime>::new();
+        seg.set_start(gst::ClockTime::from_mseconds(start));
+        seg.set_base(gst::ClockTime::from_mseconds(base));
+        let s = gst::Sample::builder().buffer(&buffer(pts)).segment(&seg).build();
+        assert_eq!(
+            media_time(&s),
+            want,
+            "PTS {pts} ms, segment from {start} ms, base {base} ms"
+        );
+        checked += 1;
+    }
+    let raw = gst::Sample::builder().buffer(&buffer(7_000)).build();
+    assert_eq!(media_time(&raw), ms(7_000), "no segment: the raw PTS");
+    let unstamped = gst::Sample::builder().buffer(&gst::Buffer::new()).build();
+    assert_eq!(media_time(&unstamped), None, "no PTS");
+    eprintln!("segments checked: {checked}");
+    assert_eq!(checked, 4);
 }
 
 #[test]

@@ -15,15 +15,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use adapters::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
+use adapters::frame_store::{
+    media_time, FrameStore, AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES,
+};
 use adapters::gst_input::{GstInput, InputThreads, StartHold};
 use adapters::gst_programme::GstProgramme;
 use adapters::stats::{InputLoss, ReceivedBytes};
 use app::ports::{Inbound, InputBytes, InputSource, InputSpec, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::{Receiver, Sender};
-use domain::config::{OutputProfile, Thresholds};
+use domain::config::{OutputProfile, Thresholds, PLAYOUT_STREAM_SKEW_MAX_MS};
 use domain::input_link::{BuildFacts, LossReason};
-use domain::programme::FrameChoice;
+use domain::programme::{FrameChoice, SlateKind};
 use domain::supervisor::Event;
 use gstreamer as gst;
 use gstreamer::glib;
@@ -995,6 +997,32 @@ fn srt_uri_encodes_and_never_appears_in_logs() {
     }
 }
 
+/// C4 fix round 1 (the review's I2), the audio seam: `wire_audio` hands `push_audio_at` the
+/// camera's audio stamped with its media time, on the picture's timeline (the running time both
+/// appsinks share). After 1 s connected the ring's newest audio is stamped, and it ends within
+/// `PLAYOUT_STREAM_SKEW_MAX_MS` of the newest frame's media time (the listener sends the two
+/// together). A wire that drops the stamp leaves the ring unstamped (played first in, first out,
+/// ahead of the picture by the playout's target), and reads `None` here.
+#[test]
+fn the_cameras_audio_is_stamped_on_the_pictures_timeline() {
+    let _s = serial();
+    let l = Listener::new(&cfg(640, 360));
+    let (mut input, rx, frames, _lines) = input(&P720);
+    connect(&mut input, &rx, 1, &spec(l.port));
+    thread::sleep(Duration::from_secs(1));
+    let audio = frames.audio_end_ns().expect("the ring's audio is stamped");
+    let video = frames
+        .camera()
+        .and_then(|s| media_time(&s))
+        .expect("a stamped camera frame");
+    let skew_ms = (audio - i128::from(video)).abs() / 1_000_000;
+    eprintln!("audio ends {skew_ms} ms from the newest frame's stamp");
+    assert!(
+        skew_ms <= i128::from(PLAYOUT_STREAM_SKEW_MAX_MS),
+        "{skew_ms} ms apart"
+    );
+}
+
 /// Brief test 6, and the format the frame store declares: after 1 s connected the ring holds real
 /// audio, as S16LE 48 kHz stereo. The listener sends a 440 Hz sine at 44.1 kHz mono, so a ring at the
 /// wrong rate or channel count reads at another pitch or with channels that differ.
@@ -1244,8 +1272,8 @@ fn eos_and_error_are_told_apart_once_a_generation() {
 
 /// After the adapter reports a generation lost, nothing of it reaches the slot or the loop, though its
 /// pipeline (a planted error leaves it running) keeps delivering: the gate drops those samples. The
-/// loss also empties the ring of the generation's audio (the PR #35 review's m1): nothing here drains
-/// it by hand.
+/// loss also empties the ring of the generation's audio (the PR #35 review's m1) and the playout of
+/// its queued frames (the C4 review's m5): nothing here drains them by hand.
 #[test]
 fn a_lost_generation_writes_nothing_more() {
     let _s = serial();
@@ -1254,11 +1282,14 @@ fn a_lost_generation_writes_nothing_more() {
     connect(&mut input, &rx, 1, &spec(l.port));
     events_for(&rx, Duration::from_millis(300));
     let before = frames.audio_level();
+    // No programme ticks here, so the playout holds the frames pushed (up to its cap).
+    let queued_before = frames.camera_queued();
     assert!(input.plant_error("planted"));
     events_until(&rx, LOSS_BUDGET, is_loss);
     let pts = camera_pts(&frames);
     let dropped = input.gate_dropped();
     let at_loss = frames.audio_level();
+    let queued_at_loss = frames.camera_queued();
     let after = events_for(&rx, Duration::from_secs(1));
     let gate = input.gate_dropped() - dropped;
     let ring = frames.audio_level();
@@ -1268,6 +1299,13 @@ fn a_lost_generation_writes_nothing_more() {
     );
     assert!(before > 0, "audio reached the ring before the loss");
     assert_eq!(at_loss, 0, "the loss emptied the ring of the generation's audio");
+    // The C4 review's m5: and the playout of its frames, so none airs over the filler after it.
+    assert!(queued_before > 0, "frames were queued before the loss");
+    assert_eq!(
+        queued_at_loss, 0,
+        "the loss emptied the playout of the generation's frames"
+    );
+    assert_eq!(frames.camera_queued(), 0, "no frame queued after the loss");
     assert!(after.is_empty(), "{after:?}");
     assert_eq!(
         camera_pts(&frames),
@@ -1449,8 +1487,9 @@ fn a_start_srt_refuses_is_lost_as_an_error() {
 }
 
 /// The loop is stalled and its channel full: frames still replace the camera slot (the newest wins),
-/// the audio ring stays at its 400 ms cap, the dropped events are counted, and nothing blocks. Once
-/// the channel has room, the generation's `InputConnected` is delivered.
+/// the audio ring stays at its cap (`AUDIO_RING_BYTES`, the playout's since C4), the dropped events
+/// are counted, and nothing blocks. Once the channel has room, the generation's `InputConnected` is
+/// delivered.
 #[test]
 fn a_full_inbound_channel_never_holds_the_camera_slot() {
     let _s = serial();
@@ -2831,6 +2870,13 @@ fn an_encrypted_listener_is_reached_through_the_encoded_uri() {
 /// The seam end to end: the input's camera, read by the real programme pipeline from the shared frame
 /// store, is what goes on air. The listener sends solid blue; the programme's file shows blue. At the
 /// programme's own 30 fps and at a camera's 25.
+///
+/// Since C4 the camera's frames wait a target in the playout before they are due, so an Emit in
+/// the first ticks after the camera connects finds none on air (PR #113's CI read 5 at 30 fps, the
+/// target's ticks). The domain never emits that early: it goes Live only after `resume_after_ms` of
+/// continuous frames (`domain::config`'s guard: the target and a tick inside it). So the programme
+/// shows the waiting slate for that long, as the supervisor would, then emits; every Emit finds a
+/// camera frame, and every frame emitted is the camera's.
 #[test]
 fn the_programme_puts_the_input_on_air() {
     let _s = serial();
@@ -2863,12 +2909,19 @@ fn on_air(fps: u32) {
         },
     );
     let step = Duration::from_nanos(1_000_000_000 / u64::from(P720.fps));
+    let waiting = Thresholds::default().resume_after_ms * u64::from(P720.fps) / 1_000;
+    let emit = 60u64;
     let t0 = Instant::now();
-    for i in 0..60u64 {
+    for i in 0..waiting + emit {
         if let Some(wait) = (t0 + step * i as u32).checked_duration_since(Instant::now()) {
             thread::sleep(wait);
         }
-        p.push(i, FrameChoice::Emit);
+        let choice = if i < waiting {
+            FrameChoice::Slate(SlateKind::Waiting)
+        } else {
+            FrameChoice::Emit
+        };
+        p.push(i, choice);
     }
     p.drain();
     let end = Instant::now() + Duration::from_secs(15);
@@ -2888,13 +2941,20 @@ fn on_air(fps: u32) {
         .filter(|c| c[2] > 180 && c[0] < 60 && c[1] < 60)
         .count();
     eprintln!(
-        "camera {fps} fps: programme frames decoded: {}; blue at the centre: {blue}; camera missing: \
-         {missing}",
+        "camera {fps} fps: programme frames decoded: {} ({waiting} waiting, {emit} emitted); blue at \
+         the centre: {blue}; camera missing: {missing}",
         centres.len()
     );
-    assert!(centres.len() >= 50, "{} frames", centres.len());
+    assert!(centres.len() as u64 >= emit, "{} frames", centres.len());
     assert_eq!(missing, 0, "every Emit found a camera frame");
-    assert_eq!(blue, centres.len(), "every frame on air is the camera's");
+    // The emitted frames are the file's last (the slate's come first; the sink may drop leading
+    // frames before its first keyframe, never trailing ones): every one is the camera's blue.
+    let tail = &centres[centres.len() - emit as usize..];
+    assert!(
+        tail.iter().all(|c| c[2] > 180 && c[0] < 60 && c[1] < 60),
+        "every frame emitted is the camera's"
+    );
+    assert!(blue as u64 >= emit);
 }
 
 /// The centre pixel (RGB) of every frame in a programme file.
