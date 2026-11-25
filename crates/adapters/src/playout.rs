@@ -197,6 +197,74 @@ enum Judged {
     Reanchor,
 }
 
+/// The most notes held between two drains (`Playout::take_notes`); past it they are counted, not kept.
+const NOTES_MAX: usize = 512;
+/// Ticks traced after a clock event (`Note::trace`), so the stamps around it can be read.
+const TRACE_TICKS: u32 = 20;
+
+/// One clock event or one traced tick, for the log (C4 fix round 2: the review's re-review read a
+/// re-anchor storm on the real chain that no modelled stamp shape gives; these lines read it). The
+/// stamps are media times in ns, the audio's as placed on the video's (its raw stamp beside it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// The rule(s) that fired, `+`-joined, or `tick` for a traced tick.
+    pub what: String,
+    /// The programme time of the tick (the last tick's, for an event at a push).
+    pub at: Option<i128>,
+    pub gen: Option<u64>,
+    /// The media time the clock had due at `at` before the event, and after it.
+    pub due_before: Option<i128>,
+    pub due_after: Option<i128>,
+    pub video_newest: Option<i128>,
+    pub audio_newest: Option<i128>,
+    /// The video's and the audio's newest arrival since the last tick, and how many pushes.
+    pub video_since: Option<i128>,
+    pub audio_since: Option<i128>,
+    pub video_pushes: u32,
+    pub audio_pushes: u32,
+    /// The newest audio push's raw stamp (before the offset).
+    pub audio_raw: Option<i128>,
+    pub audio_offset_ns: i128,
+    pub frames: usize,
+    pub audio_bytes: usize,
+    /// A traced tick: the frame it aired (its stamp), how many it popped, and whether it repeated.
+    pub aired: Option<i128>,
+    pub popped: u64,
+    pub repeated: bool,
+}
+
+impl fmt::Display for Note {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn ms(v: Option<i128>) -> String {
+            v.map_or_else(|| "-".into(), |n| format!("{:.1}", n as f64 / 1e6))
+        }
+        write!(
+            f,
+            "playout {} gen={} at_ms={} due_ms={}->{} video_ms={} audio_ms={} since_video_ms={} \
+             since_audio_ms={} pushes={}/{} audio_raw_ms={} offset_ms={} frames={} audio_bytes={} \
+             aired_ms={} popped={} repeated={}",
+            self.what,
+            self.gen.map_or_else(|| "-".into(), |g| g.to_string()),
+            ms(self.at),
+            ms(self.due_before),
+            ms(self.due_after),
+            ms(self.video_newest),
+            ms(self.audio_newest),
+            ms(self.video_since),
+            ms(self.audio_since),
+            self.video_pushes,
+            self.audio_pushes,
+            ms(self.audio_raw),
+            ms(Some(self.audio_offset_ns)),
+            self.frames,
+            self.audio_bytes,
+            ms(self.aired),
+            self.popped,
+            self.repeated,
+        )
+    }
+}
+
 /// One stream's arrivals (the video's or the audio's), for the clock's rules.
 #[derive(Debug, Clone, Copy, Default)]
 struct Stream {
@@ -210,12 +278,15 @@ struct Stream {
     late_since: Option<i128>,
     /// The clock has taken it into account: it was live at the anchor, or has arrived since.
     anchored: bool,
+    /// Pushes since the last tick (the notes' trace).
+    pushes: u32,
 }
 
 impl Stream {
     fn arrive(&mut self, t: i128) {
         self.newest = Some(self.newest.map_or(t, |n| n.max(t)));
         self.since = Some(self.since.map_or(t, |n| n.max(t)));
+        self.pushes += 1;
     }
 
     /// It arrived within the gap before `at`.
@@ -262,6 +333,16 @@ pub struct Playout<V> {
     audio_seen: bool,
     /// What the pushes since the last tick dropped (handed on with the next tick's counts).
     pending: Counts,
+    /// The newest audio push's raw stamp (ns, before the offset), for the notes.
+    audio_raw: Option<i128>,
+    /// The clock events and traced ticks since the last drain (`take_notes`), and those past
+    /// `NOTES_MAX` not kept.
+    notes: Vec<Note>,
+    notes_dropped: u64,
+    /// Ticks still to trace after the last event.
+    trace_left: u32,
+    /// The last segment each stream's samples carried (video, audio), as `note_segment` saw it.
+    segments: [Option<(u64, u64, u64)>; 2],
 }
 
 impl<V> Default for Playout<V> {
@@ -283,6 +364,11 @@ impl<V> Default for Playout<V> {
             audio_offset: 0,
             audio_seen: false,
             pending: Counts::default(),
+            audio_raw: None,
+            notes: Vec::new(),
+            notes_dropped: 0,
+            trace_left: 0,
+            segments: [None, None],
         }
     }
 }
@@ -309,6 +395,9 @@ impl<V: Clone> Playout<V> {
         let Some(t) = pts.map(i128::from) else {
             // The old slot's rule: due at once, and the newest wins. A stream with no stamps has no
             // clock, so the stamped queue goes with it.
+            if self.clock.is_some() || !self.video.is_empty() {
+                self.note("unstamped_video", None);
+            }
             self.pending.unaired += self.video.len() as u64;
             self.video.clear();
             self.clock = None;
@@ -320,6 +409,7 @@ impl<V: Clone> Playout<V> {
         // old ones (and the span bound would drop the new), so the old go, counted. The clock's own
         // rules re-anchor at the next tick (the frame is more than the cap behind it).
         if self.video_s.newest.is_some_and(|n| t < n - ms_ns(PLAYOUT_CAP_MS)) {
+            self.note(&format!("video_jump_back(to_ms={:.1})", t as f64 / 1e6), None);
             self.pending.unaired += self.video.len() as u64;
             self.video.clear();
             self.video_s.rebased();
@@ -345,6 +435,11 @@ impl<V: Clone> Playout<V> {
         self.enter(gen);
         if bytes.is_empty() {
             return;
+        }
+        if let Some(t) = pts {
+            self.audio_raw = Some(i128::from(t));
+        } else if gen.is_some() && self.audio.back().is_none_or(|c| c.start.is_some()) && self.audio_seen {
+            self.note("unstamped_audio", None);
         }
         let start = pts.map(|t| self.place_audio(sample_at(i128::from(t))));
         // Two chunks whose stamps differ by rounding are one stream: the later starts where the
@@ -375,6 +470,7 @@ impl<V: Clone> Playout<V> {
         let at = i128::from(at_ns);
         let mut counts = std::mem::take(&mut self.pending);
         if self.clock.is_some_and(|c| at < c.at) {
+            self.note("timeline_reset", Some(at));
             self.clock = None;
             self.cursor = None;
             self.last_arrival_at = None;
@@ -385,6 +481,8 @@ impl<V: Clone> Playout<V> {
             }
         }
         self.last_tick = Some(at);
+        let traced = self.trace_left > 0;
+        let mut trace = traced.then(|| self.snapshot("tick", Some(at)));
         let arrived = [self.video_s.since.take(), self.audio_s.since.take()];
         if arrived.iter().any(Option::is_some) {
             let gap = self
@@ -397,15 +495,25 @@ impl<V: Clone> Playout<V> {
                 }
             }
             match self.clock {
-                None => self.anchor(at),
-                Some(c) => match self.judge(c.due(at), at, arrived, gap) {
-                    Judged::Keep => {}
-                    Judged::Join => self.anchor(at),
-                    Judged::Reanchor => {
-                        self.anchor(at);
-                        counts.reanchors += 1;
+                None => {
+                    self.anchor(at);
+                    self.note_with("anchor", Some(at), None, arrived);
+                }
+                Some(c) => {
+                    let (judged, why) = self.judge(c.due(at), at, arrived, gap);
+                    match judged {
+                        Judged::Keep => {}
+                        Judged::Join => {
+                            self.anchor(at);
+                            self.note_with(&format!("join({why})"), Some(at), Some(c.due(at)), arrived);
+                        }
+                        Judged::Reanchor => {
+                            self.anchor(at);
+                            counts.reanchors += 1;
+                            self.note_with(&format!("reanchor({why})"), Some(at), Some(c.due(at)), arrived);
+                        }
                     }
-                },
+                }
             }
         }
         let due = self.clock.map(|c| c.due(at));
@@ -429,6 +537,19 @@ impl<V: Clone> Playout<V> {
         } else if self.on_air.is_some() {
             counts.repeated = 1;
         }
+        if let Some(mut t) = trace.take() {
+            t.video_since = arrived[0];
+            t.audio_since = arrived[1];
+            t.due_after = due;
+            t.aired = if fresh { self.on_air_pts() } else { None };
+            t.popped = popped;
+            t.repeated = counts.repeated == 1;
+            t.frames = self.video.len();
+            self.keep(t);
+            self.trace_left -= 1;
+        }
+        self.video_s.pushes = 0;
+        self.audio_s.pushes = 0;
         Tick {
             frame: self.on_air.as_ref().map(|(_, v)| v.clone()),
             fresh,
@@ -650,6 +771,7 @@ impl<V: Clone> Playout<V> {
             return;
         }
         if self.gen.is_some() {
+            self.note(&format!("new_generation(to={g})"), None);
             self.restart();
         } else {
             self.unanchor();
@@ -669,6 +791,10 @@ impl<V: Clone> Playout<V> {
             .newest
             .is_some_and(|nw| sample_ns(start) < nw - ms_ns(PLAYOUT_CAP_MS))
         {
+            self.note(
+                &format!("audio_jump_back(to_ms={:.1})", sample_ns(start) as f64 / 1e6),
+                None,
+            );
             self.clear_audio();
             self.audio_s.rebased();
         }
@@ -676,6 +802,14 @@ impl<V: Clone> Playout<V> {
             self.video_s.since.is_some() || self.video_s.last_at.is_some_and(|l| Some(l) == self.last_tick);
         if let Some(v) = self.video_s.newest.filter(|_| fresh) {
             if (sample_ns(start) - v).abs() > ms_ns(PLAYOUT_STREAM_SKEW_MAX_MS) {
+                self.note(
+                    &format!(
+                        "rebase(placed_ms={:.1},video_ms={:.1})",
+                        sample_ns(start) as f64 / 1e6,
+                        v as f64 / 1e6
+                    ),
+                    None,
+                );
                 let delta = sample_at(v) - start;
                 self.rebase(delta);
                 start += delta;
@@ -700,23 +834,37 @@ impl<V: Clone> Playout<V> {
     /// stream's arrivals have all been past due for `PLAYOUT_LATE_REANCHOR_MS`. Join (not counted:
     /// it completes the anchor): a stream the clock had not taken into account arrives with less
     /// than the target before it is due.
-    fn judge(&mut self, due: i128, at: i128, arrived: [Option<i128>; 2], gap: bool) -> Judged {
+    fn judge(&mut self, due: i128, at: i128, arrived: [Option<i128>; 2], gap: bool) -> (Judged, String) {
         let (cap, slack) = (ms_ns(PLAYOUT_CAP_MS), ms_ns(PLAYOUT_AUDIO_SLACK_MS));
-        let mut redo = gap;
+        let mut why: Vec<String> = Vec::new();
+        if gap {
+            why.push("gap".into());
+        }
         let mut join = false;
-        for (s, a) in [&mut self.video_s, &mut self.audio_s].into_iter().zip(arrived) {
+        for ((s, a), name) in [&mut self.video_s, &mut self.audio_s]
+            .into_iter()
+            .zip(arrived)
+            .zip(["video", "audio"])
+        {
             let Some(n) = a else { continue };
             let lead = n - due;
             if lead < -slack {
                 let from = *s.late_since.get_or_insert(at);
-                redo |= at - from >= ms_ns(PLAYOUT_LATE_REANCHOR_MS);
+                if at - from >= ms_ns(PLAYOUT_LATE_REANCHOR_MS) {
+                    why.push(format!("{name}_late(lead_ms={:.1})", lead as f64 / 1e6));
+                }
             } else {
                 s.late_since = None;
             }
-            redo |= lead < -cap;
+            if lead < -cap {
+                why.push(format!("{name}_behind(lead_ms={:.1})", lead as f64 / 1e6));
+            }
             if !s.anchored {
                 s.anchored = true;
-                join |= lead < ms_ns(PLAYOUT_TARGET_MS) - slack;
+                if lead < ms_ns(PLAYOUT_TARGET_MS) - slack {
+                    join = true;
+                    why.push(format!("{name}_joins(lead_ms={:.1})", lead as f64 / 1e6));
+                }
             }
         }
         let ahead = [self.video_s, self.audio_s]
@@ -725,13 +873,94 @@ impl<V: Clone> Playout<V> {
             .filter_map(|s| s.newest)
             .map(|n| n - due)
             .min();
-        redo |= ahead.is_some_and(|l| l > cap);
-        if redo {
+        if let Some(l) = ahead.filter(|l| *l > cap) {
+            why.push(format!("ahead(lead_ms={:.1})", l as f64 / 1e6));
+        }
+        let redo = why.iter().any(|w| !w.contains("_joins"));
+        let judged = if redo {
             Judged::Reanchor
         } else if join {
             Judged::Join
         } else {
             Judged::Keep
+        };
+        (judged, why.join("+"))
+    }
+
+    /// A sample of stream `video` (else audio) carried segment `seg` (start, base, time, ns): a note
+    /// when it differs from the stream's last (`detail` says what), so a new segment mid-run reads in
+    /// the log beside the clock's events (C4 fix round 2).
+    pub fn note_segment(&mut self, video: bool, seg: (u64, u64, u64), detail: &str) {
+        let i = usize::from(!video);
+        if self.segments[i] != Some(seg) {
+            self.segments[i] = Some(seg);
+            let name = if video { "video" } else { "audio" };
+            self.note(&format!("segment({name},{detail})"), None);
+        }
+    }
+
+    /// The notes since the last call (clock events and traced ticks), oldest first, and how many past
+    /// `NOTES_MAX` were not kept.
+    pub fn take_notes(&mut self) -> (Vec<Note>, u64) {
+        (
+            std::mem::take(&mut self.notes),
+            std::mem::take(&mut self.notes_dropped),
+        )
+    }
+
+    fn snapshot(&self, what: &str, at: Option<i128>) -> Note {
+        let at = at.or(self.last_tick);
+        Note {
+            what: what.to_owned(),
+            at,
+            gen: self.gen,
+            due_before: at.and_then(|a| self.clock.map(|c| c.due(a))),
+            due_after: None,
+            video_newest: self.video_s.newest,
+            audio_newest: self.audio_s.newest,
+            video_since: self.video_s.since,
+            audio_since: self.audio_s.since,
+            video_pushes: self.video_s.pushes,
+            audio_pushes: self.audio_s.pushes,
+            audio_raw: self.audio_raw,
+            audio_offset_ns: sample_ns(self.audio_offset),
+            frames: self.video.len(),
+            audio_bytes: self.audio_bytes,
+            aired: None,
+            popped: 0,
+            repeated: false,
+        }
+    }
+
+    /// Records a clock event (and traces the ticks after it).
+    fn note(&mut self, what: &str, at: Option<i128>) {
+        let n = self.snapshot(what, at);
+        self.keep(n);
+        self.trace_left = TRACE_TICKS;
+    }
+
+    /// `note` at a tick, after the clock moved: `due_before` as judged, the tick's arrivals.
+    fn note_with(
+        &mut self,
+        what: &str,
+        at: Option<i128>,
+        due_before: Option<i128>,
+        arrived: [Option<i128>; 2],
+    ) {
+        let mut n = self.snapshot(what, at);
+        n.due_before = due_before;
+        n.due_after = at.and_then(|a| self.clock.map(|c| c.due(a)));
+        n.video_since = arrived[0];
+        n.audio_since = arrived[1];
+        self.keep(n);
+        self.trace_left = TRACE_TICKS;
+    }
+
+    fn keep(&mut self, n: Note) {
+        if self.notes.len() < NOTES_MAX {
+            self.notes.push(n);
+        } else {
+            self.notes_dropped += 1;
         }
     }
 
@@ -1377,6 +1606,47 @@ mod tests {
     /// A gap longer than the cap (the camera sends nothing for 600 ms, then comes back 100 ms later
     /// than before): the first tick after it re-anchors the clock, the target behind the newest
     /// arrival, and the camera then runs steady again. Every repeat is inside the gap; nothing drops.
+    /// C4 fix round 2: each clock event leaves a log note naming its rule and the stamps it saw, and
+    /// the ticks after it are traced (`TRACE_TICKS`), so the real chain's stamp sequence can be read
+    /// from the compositor's log. A gap past the cap: the first anchor, then one `reanchor(gap)`.
+    #[test]
+    fn each_clock_event_leaves_a_note_naming_its_rule() {
+        let fps = 30; // One grid: the notes are per event, not per rate.
+        let gap_ms = PLAYOUT_REANCHOR_GAP_MS + 100;
+        let (before, after) = (2 * fps, 2 * fps);
+        let skipped = gap_ms * fps / 1_000;
+        let mut arrivals = source(1, fps, 0..before, MEDIA_BASE_NS, 0);
+        arrivals.extend(source(
+            1,
+            fps,
+            before + skipped..before + skipped + after,
+            MEDIA_BASE_NS,
+            0,
+        ));
+        let mut r = run(fps, &arrivals, before + skipped + after + fps);
+        let (notes, dropped) = r.p.take_notes();
+        let events: Vec<&str> = notes
+            .iter()
+            .map(|n| n.what.as_str())
+            .filter(|w| *w != "tick")
+            .collect();
+        eprintln!("events: {events:?}; first: {}", notes[0]);
+        assert_eq!(events, ["anchor", "reanchor(gap)"]);
+        assert_eq!(dropped, 0);
+        let traced = notes.iter().filter(|n| n.what == "tick").count();
+        assert_eq!(
+            traced,
+            2 * TRACE_TICKS as usize,
+            "each event traces the ticks after it"
+        );
+        assert!(
+            notes[0].to_string().starts_with("playout anchor gen=1 "),
+            "{}",
+            notes[0]
+        );
+        assert!(r.p.take_notes().0.is_empty(), "taken once");
+    }
+
     #[test]
     fn a_gap_longer_than_the_cap_re_anchors_then_runs_steady() {
         let mut checked = 0;

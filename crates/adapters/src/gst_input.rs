@@ -951,6 +951,7 @@ impl GstInput {
                         shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
                         return Ok(gst::FlowSuccess::Ok);
                     }
+                    shared.frames.note_audio_segment(&sample);
                     shared.frames.push_audio_at(gen, pts, map.as_slice());
                     Ok(gst::FlowSuccess::Ok)
                 })

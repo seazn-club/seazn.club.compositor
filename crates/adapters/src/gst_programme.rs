@@ -840,6 +840,9 @@ impl ProgrammeOutput for GstProgramme {
         // below, go to the stats with whether the camera is on air (Owed 81 (i), PR #60's rule).
         let on_air = matches!(choice, FrameChoice::Emit | FrameChoice::Repeat);
         let tick = self.frames.playout_tick(pts.nseconds());
+        for line in self.frames.take_playout_notes() {
+            self.shared.log(&line);
+        }
         let mut counts = tick.counts;
         let camera = match choice {
             FrameChoice::Emit | FrameChoice::Repeat => {

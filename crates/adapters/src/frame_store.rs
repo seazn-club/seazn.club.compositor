@@ -62,6 +62,29 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The sample's time segment, for the playout's notes: (start, base, time) and its PTS, raw and as
+/// running time.
+fn note_segment(p: &mut Playout<gst::Sample>, video: bool, s: &gst::Sample) {
+    let Some(seg) = s
+        .segment()
+        .and_then(|g| g.downcast_ref::<gst::ClockTime>().cloned())
+    else {
+        return;
+    };
+    let ns = |t: Option<gst::ClockTime>| t.map_or(0, gst::ClockTime::nseconds);
+    let key = (ns(seg.start()), ns(seg.base()), ns(seg.time()));
+    let pts = s.buffer().and_then(|b| b.pts());
+    let detail = format!(
+        "start_ms={:.1},base_ms={:.1},time_ms={:.1},pts_ms={:.1},running_ms={:.1}",
+        key.0 as f64 / 1e6,
+        key.1 as f64 / 1e6,
+        key.2 as f64 / 1e6,
+        ns(pts) as f64 / 1e6,
+        ns(pts.and_then(|t| seg.to_running_time(t))) as f64 / 1e6,
+    );
+    p.note_segment(video, key, &detail);
+}
+
 impl FrameStore {
     /// An unstamped camera frame (the programme's tests): due at once, the newest wins (the old
     /// slot's rule, `playout.rs`).
@@ -72,7 +95,15 @@ impl FrameStore {
     /// A decoded camera frame of input generation `gen`, queued on its media time (`media_time`).
     pub fn push_camera(&self, gen: u64, s: gst::Sample) {
         let pts = media_time(&s);
-        locked(&self.inner.camera).push_video(Some(gen), pts, s);
+        let mut p = locked(&self.inner.camera);
+        note_segment(&mut p, true, &s);
+        p.push_video(Some(gen), pts, s);
+    }
+
+    /// The playout's note of a new segment on the camera's audio (`Playout::note_segment`; C4 fix
+    /// round 2): the input calls it with each audio sample before `push_audio_at`.
+    pub fn note_audio_segment(&self, s: &gst::Sample) {
+        note_segment(&mut locked(&self.inner.camera), false, s);
     }
 
     /// The newest camera frame written, aired or not.
@@ -95,6 +126,17 @@ impl FrameStore {
     /// the playout's counts (`playout::Playout::tick`). Every tick calls it, a slate's too.
     pub fn playout_tick(&self, at_ns: u64) -> Tick<gst::Sample> {
         locked(&self.inner.camera).tick(at_ns)
+    }
+
+    /// The playout's clock events and traced ticks since the last call, as log lines
+    /// (`playout::Note`; C4 fix round 2), and one line for any it could not keep.
+    pub fn take_playout_notes(&self) -> Vec<String> {
+        let (notes, dropped) = locked(&self.inner.camera).take_notes();
+        let mut lines: Vec<String> = notes.iter().map(ToString::to_string).collect();
+        if dropped > 0 {
+            lines.push(format!("playout notes dropped={dropped}"));
+        }
+        lines
     }
 
     pub fn set_overlay(&self, s: gst::Sample) {
