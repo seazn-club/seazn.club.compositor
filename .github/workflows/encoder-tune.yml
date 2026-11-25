@@ -53,8 +53,17 @@ jobs:
           gst-launch-1.0 --version | head -1
           dpkg -s libx264-164 | grep -E '^Version'
           ffmpeg -hide_banner -version | head -1
-          ffmpeg -hide_banner -filters | grep -E ' libvmaf ' || { echo "::error::this ffmpeg has no libvmaf"; exit 1; }
           gst-inspect-1.0 x264enc | sed -n '/Element Properties/,$p' | grep -E '^  (tune|speed-preset|rc-lookahead|sync-lookahead|sliced-threads|threads|bframes|b-adapt|min-force-key-unit-interval|option-string|vbv-buf-capacity|key-int-max)\b' -A3 | cut -c1-160
+      - name: libvmaf 3.2.0 (F-033's version), built from its pinned tag; Ubuntu's ffmpeg has no libvmaf
+        run: |
+          scripts/apt-install.sh meson ninja-build nasm
+          git clone --quiet --branch v3.2.0 --depth 1 https://github.com/Netflix/vmaf.git "$RUNNER_TEMP/vmaf"
+          test "$(git -C "$RUNNER_TEMP/vmaf" rev-parse HEAD)" = 3f9e02af258a5c0e30124fc585a3c3af90126dee
+          cd "$RUNNER_TEMP/vmaf/libvmaf"
+          meson setup build --buildtype=release -Dbuilt_in_models=true -Denable_tests=false -Denable_docs=false
+          ninja -C build
+          echo "VMAF_BIN=$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" --version
       - name: Self-test
         run: /usr/bin/python3 -I harness/encoder-tune/measure.py selftest
       - name: The options each leg gets (x264's own SEI), and its automatic thread count

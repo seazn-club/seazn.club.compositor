@@ -144,7 +144,7 @@ def gst():
     gi.require_version("Gst", "1.0")
     gi.require_version("GstApp", "1.0")
     gi.require_version("GstVideo", "1.0")
-    from gi.repository import Gst, GstVideo  # noqa: F401
+    from gi.repository import Gst, GstApp, GstVideo  # noqa: F401  (GstApp adds appsrc and appsink methods)
 
     Gst.init(None)
     return Gst, GstVideo
@@ -215,18 +215,27 @@ def encode_offline(Gst, leg, clip, frames, out_h264):
 
 
 def vmaf(ref, h264, frames, out_json):
-    lavfi = (
-        "[0:v]setpts=PTS-STARTPTS,format=yuv420p[d];[1:v]setpts=PTS-STARTPTS[r];"
-        f"[d][r]libvmaf=log_fmt=json:log_path={out_json}:n_threads={os.cpu_count()}"
-    )
+    """libvmaf's own CLI (v3.2.0, built by the workflow from the pinned tag: Ubuntu's ffmpeg has no
+    libvmaf) on the raw frames: the decoded stream against the uncompressed source."""
+    dist = out_json + ".dist.yuv"
     run(
         [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "h264", "-framerate", str(FPS), "-i", h264,
-            "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{W}x{H}", "-framerate", str(FPS), "-i", ref,
-            "-lavfi", lavfi, "-f", "null", "-",
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "h264", "-framerate", str(FPS),
+            "-i", h264, "-pix_fmt", "yuv420p", "-f", "rawvideo", dist,
         ]
     )
+    got = os.path.getsize(dist)
+    if got != frames * FRAME_BYTES:
+        raise SystemExit(f"decoded {got} bytes, the clip is {frames} frames of {FRAME_BYTES}")
+    run(
+        [
+            os.environ.get("VMAF_BIN", "vmaf"), "--reference", ref, "--distorted", dist,
+            "--width", str(W), "--height", str(H), "--pixel_format", "420", "--bitdepth", "8",
+            "--model", "version=vmaf_v0.6.1", "--output", out_json, "--json",
+            "--threads", str(os.cpu_count()),
+        ]
+    )
+    os.remove(dist)
     r = parse_vmaf(out_json)
     if r["frames"] != frames:
         raise SystemExit(f"libvmaf scored {r['frames']} frames, the clip has {frames}")
