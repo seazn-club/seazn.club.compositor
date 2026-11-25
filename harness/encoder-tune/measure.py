@@ -395,7 +395,8 @@ def free_run(Gst, GstVideo, leg, feed, seconds):
     r = Run(Gst, GstVideo, leg, feed)
     r.start()
     total = int(seconds * FPS)
-    warm = 5 * FPS
+    warm = min(5 * FPS, total // 4)
+    tail = min(3 * FPS, total // 4)
     cpu0 = wall0 = None
     for n in range(total):
         r.push(n)
@@ -419,7 +420,7 @@ def free_run(Gst, GstVideo, leg, feed, seconds):
             n = round(rt * FPS / Gst.SECOND)
             if not 0 <= n < len(r.sched):
                 raise SystemExit(f"{out['leg']}: running time {rt} is frame {n}, outside the {len(r.sched)} pushed")
-            if warm <= n < total - 3 * FPS:
+            if warm <= n < total - tail:
                 lat.append((wall - r.sched[n]) * 1000)
         out["latency_ms"] = stats_ms(lat)
         out["access_units"] = len(outs)
