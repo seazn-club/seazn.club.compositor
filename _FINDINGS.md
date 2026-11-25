@@ -3461,3 +3461,112 @@ mutant fails the build), and the GStreamer tests `a_publish_that_lands_frames_af
   next swap's Owed 84 start ends it). How Cloudflare's ingest and YouTube take a burst of up to
   1 s at the publish is not measured (Owed 113, stg). MediaMTX's recorder discarded F-023's 4 s
   burst; the races seen so far were 37 to 38 ms.
+
+## F-039: the camera's frames and audio now play on a clock slaved to the camera's PTS, 150 ms behind it, so a late-then-burst delivery repeats only what is later than that (C4, S1, Owed 89, 2026-11-25)
+
+**Evidence** (stg, then host tests on this repo; branch `feat/relay-input-dejitter`, unpushed).
+
+- **The judder, through real Cloudflare (stg, 2026-11-24; the improvement scan's §1).** A real phone
+  through stg's Cloudflare logged 17 to 50 `camera frames replaced` per 150-tick beat (PR #60's
+  counter): frames that arrived together, all but the newest overwritten in the one-frame slot,
+  while the ticks around them repeated. That is Owed 89's revisit condition ("a fake-camera run
+  through real Cloudflare shows judder worth it"), met by a real camera. The beats read 30 fps
+  throughout. The audio's side was unmeasured: a burst overfilled the 400 ms ring (a skip) and the
+  late ticks before it were padded (a dropout), neither counted, and the ring's FIFO against the
+  newest-frame picture let the audio trail by up to the ring after a burst (the scan, UNVERIFIED on
+  air).
+- **The rule, on the schedule** (host tests, `adapters::playout`'s 12, both output profiles, every
+  expected count from `config.rs` and the schedule, never from the code; anti-vacuity lines in
+  brackets):
+  - a steady 30 fps camera: every frame airs once on its own tick after the warm-up, 0 repeats, 0
+    dropped, the audio in step (2 profiles);
+  - the fake camera's hold (`POST /burst?ms=300`, 30 fps, delivered 5 ms after its slot): 3 repeats
+    and 3 drops a hold, three holds 9 and 9, 0 re-anchors, 0 audio overflow, repeats under 2 %; a
+    100 ms hold costs 0; a 150 ms hold matches the schedule's own count (6 schedules);
+  - PR #60's bursts of 1 to 3 frames (pairs, threes, mixed): 0 repeats and 0 drops where the
+    newest-frame slot replaced 210 on the mixed schedule (6 schedules);
+  - 25 fps repeats exactly the 5 ticks a second it has no frame for and drops none; 60 fps airs a
+    frame every tick and drops the other, no repeat (4: both rates, both profiles);
+  - a gap of the cap plus 100 ms re-anchors once, then steady; a jump of 4 × the cap in the PTS,
+    either way, re-anchors once (2 and 4);
+  - a new generation while the old one's frames are queued airs none of them and plays none of its
+    audio, fresh clock, also after a hold (4);
+  - A/V: on every tick whose audio opens on real samples with a frame on air, the audio sits within
+    one video period of the picture, allowing the 1 ms slack; after a hold it is back in step on the
+    release tick (N = 1), with 0 overflow.
+
+**Facts.**
+
+1. **The rule.** The clock anchors at the first tick that sees media, `PLAYOUT_TARGET_MS` behind the
+   newest arrival; `due(at) = anchor_media + (at - anchor_at)`. Each tick pops every frame stamped
+   at or before `due`, airs the newest popped (the rest counted unaired), and repeats the frame on
+   air when none is due (counted). The audio is taken from the same `due` (a cursor resynced when it
+   is off by more than `PLAYOUT_AUDIO_SLACK_MS`): bytes behind it are dropped (late), a gap is
+   filled (pad). A chunk within the slack of the last one's end is re-stamped contiguous, so the
+   AAC frame clock's rounding never pads.
+2. **Bounds.** The queue spans at most `PLAYOUT_CAP_MS` (500 ms) of stamps and at most
+   `PLAYOUT_MAX_FRAMES` (31: the cap at `CAMERA_MAX_FPS`, 60, plus one), the oldest dropped and
+   counted. The audio ring is the cap's worth, `AUDIO_RING_BYTES` = 96 000 bytes, derived (the
+   plan's "audio 400 ms" amended: a ring shorter than the video's span would drop audio the clock
+   still owes).
+3. **Re-anchoring.** After a gap in arrivals over `PLAYOUT_REANCHOR_GAP_MS` (= the cap), and when the
+   newest arrival is more than the cap from `due` either way (counted); a stamp more than the cap
+   behind its generation's newest restarts the queue (counted); a new generation restarts it (not
+   counted); a tick earlier than the anchor (a second programme timeline) resets the clock.
+4. **No timer, no thread.** The playout is a plain struct (`adapters::playout::Playout`) under the
+   camera's `FrameStore` lock. The input pushes with each sample's running time; the programme's
+   tick calls `playout_tick(at)` and `take_audio_due(at)` on its own timeline. The domain is
+   untouched: `InputFrame` events still fire at decode time, so the phase machine can go Live up to
+   the target before the first frame airs. `config.rs` pins the margin
+   (`the_playout_airs_a_frame_before_the_domain_goes_live`: target plus the widest tick under
+   `resume_after_ms`, target under `frozen_after_ms`, cap under `slate_after_ms`), so no
+   NEEDS_CONTEXT.
+5. **C3b's first-GOP bound is independent.** `FIRST_GOP_CATCH_UP_MAX_MS` (1 000 ms) bounds the
+   encoder's frames before an output's first publish. The playout changes which camera picture the
+   mixer composites on a tick, never when the encoder makes a frame, so the encoder's first frames
+   and their timing are as before. The start of the camera's picture moves 150 ms later inside the
+   programme; the output's backlog rule does not see the camera.
+6. **C3's loss policy is unchanged.** A take-back of the same generation after a gap re-anchors
+   through the gap rule (fact 3); a rebuild is a new generation. Neither needed a change.
+7. **Unstamped media keeps the old slot.** A frame or chunk with no PTS (the programme's own tests,
+   `set_camera`, `push_audio`) is due at once, newest-wins and first-in-first-out as before, and
+   drops a stamped queue and its clock.
+
+**Counts** (logs only; the beat is strict on web, so no wire key). `Stats::on_camera_tick` adds a
+tick's counts only while the camera is on air (PR #60's slate rule). The driver logs each beat's
+rise: `camera frames replaced beat=<n> total=<n> repeat_ticks=<n> repeat_ticks_total=<n>` (#59's
+second count beside the first), and the `input received …` line (C2's as-received line, C3's loss
+counts) gains ` audio_pad_bytes=<n> audio_overflow_bytes=<n> audio_late_bytes=<n> reanchors=<n>`.
+The harness reads both (`logfacts.rs`: `camera_repeats`, `camera_playout`, producers pinned).
+
+**Changes** (C4). `config.rs`: `PLAYOUT_TARGET_MS`, `PLAYOUT_CAP_MS`, `PLAYOUT_REANCHOR_GAP_MS`,
+`CAMERA_MAX_FPS`, `PLAYOUT_MAX_FRAMES`, `PLAYOUT_AUDIO_SLACK_MS`. New `adapters::playout`.
+`frame_store.rs`: the camera slot and audio ring become one `Playout` (`media_time`, `push_camera`,
+`push_audio_at`, `playout_tick`, `take_audio_due`; `AUDIO_RING_BYTES` from the cap).
+`gst_input.rs`: pushes stamped by generation and running time. `gst_programme.rs`: each tick (a
+slate's too) calls the playout and takes its audio periods from it. `stats.rs`: `CameraTally`
+(replaced and the playout totals). `app::ports::PlayoutTotals`, `Measured::camera_playout`, the
+driver's lines. Harness: `camera-burst` (a pull-request leg), and camera-flap's hysteresis floor
+less `playout_target_ms` (dumped to `thresholds.json`): its `suppressed_ms` reads the hold-off in
+camera time, which the playout shortens by the target (CI's 900 ms flaps would read about 750
+against the old 850 floor; `docs/_INDEX.md`'s decision row). Witnesses: 16 hand mutants, each killed
+(the commit bodies list them).
+
+**Consequences.**
+
+- **The overlay's score delay owes 150 ms** (Owed 114). ADR 0006's default (web's
+  `RELAY_OVERLAY_DELAY_DEFAULT_MS`, 3 100 ms) was measured in-chain before this queue existed; the
+  camera now airs `PLAYOUT_TARGET_MS` later. The compositor has no overlay-delay constant to derive
+  (the scan's `config.rs:29-34` premise is false; the delay arrives from the plane per fixture), so
+  the derivation is web's.
+- **After every freeze the picture waits the target again.** A gap over the cap re-anchors 150 ms
+  behind the returning frames, so they air about 150 ms (4 to 5 ticks at 30 fps) after they
+  arrive, the frame before the gap repeating meanwhile.
+- **A slow drift under the cap is not corrected.** A camera clock running fast or slow against the
+  tick grid moves the depth until it passes the cap, then re-anchors once; between, the depth wanders
+  inside 0 to 500 ms. Not seen; the stg after-measurement reads `reanchors`.
+- **Up to 31 decoded samples are held.** A decoder or converter buffer pool smaller than that could
+  stall the input. UNVERIFIED (GStreamer runs only in CI here): the camera-burst case and the stg
+  session are the first reads.
+- **Owed:** the stg before/after on one real phone session (Owed 115), the camera-burst case's first
+  CI run, and the GStreamer-side mutants (CI, on a throwaway PR).
