@@ -389,6 +389,28 @@ pub const PLAYOUT_STREAM_SKEW_MAX_MS: Ms = PLAYOUT_CAP_MS - PLAYOUT_TARGET_MS;
 /// newest frame is on time.
 pub const PLAYOUT_LATE_REANCHOR_MS: Ms = PLAYOUT_TARGET_MS;
 
+/// C4 fix round 2 (the re-review's n2, a coordinator ruling): a skew re-base is provisional. An
+/// arrival skew (stamps right, one stream late) and a stamp skew (stamps off, both on time) look the
+/// same at the moment, so the re-base may have been wrong; once the audio's stamps agree with the
+/// video's again on the offset it replaced, to within this, it is undone (counted). Half the re-base
+/// threshold, so a skew wandering around the threshold cannot flip it back and forth.
+pub const PLAYOUT_SKEW_REVERT_MS: Ms = PLAYOUT_STREAM_SKEW_MAX_MS / 2;
+
+/// C4 fix round 2 (the re-review's n1, a coordinator ruling): the excess over `PLAYOUT_TARGET_MS`
+/// past which every live stream counts as early. A re-anchor taken while a stream is late (the
+/// lateness rule, a step) anchors on a lagging stamp; when the stream catches up, the picture's delay
+/// stays at the target plus the lag (a 400 ms hold with a slow catch-up read 200 → 400 ms for the
+/// rest of the run), and nothing short of the cap brought it back. Within the target the excess is
+/// the jitter the target exists to absorb (an anchor on an arrival up to the target late leaves at
+/// most that much); past it, it is a ratchet.
+pub const PLAYOUT_EARLY_MARGIN_MS: Ms = PLAYOUT_TARGET_MS;
+
+/// C4 fix round 2: how long every live stream must stay early (`PLAYOUT_EARLY_MARGIN_MS`) before the
+/// clock re-anchors forward to the target (counted; the skipped span airs as unaired frames and late
+/// audio, once). Twice the cap: a catch-up from a backlog the cap bounds, delivered at twice real
+/// time or faster, is over by then, so a catch-up in progress is not cut into several jumps.
+pub const PLAYOUT_EARLY_REANCHOR_MS: Ms = 2 * PLAYOUT_CAP_MS;
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -1287,6 +1309,13 @@ mod tests {
         // the lateness that re-anchors (the target).
         assert_eq!(PLAYOUT_STREAM_SKEW_MAX_MS, 350);
         assert_eq!(PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_TARGET_MS);
+        // Fix round 2: the excess past which the clock is early (the target), and how long it must
+        // last (twice the cap); the early delay stays under the cap, so the early rule fires before
+        // the cap's.
+        assert_eq!(PLAYOUT_EARLY_MARGIN_MS, PLAYOUT_TARGET_MS);
+        assert_eq!(PLAYOUT_SKEW_REVERT_MS, 175);
+        assert_eq!(PLAYOUT_EARLY_REANCHOR_MS, 1_000);
+        const _: () = assert!(PLAYOUT_TARGET_MS + PLAYOUT_EARLY_MARGIN_MS < PLAYOUT_CAP_MS);
         // Constant against constant: the compiler checks it. The target sits inside the cap with room
         // for a burst, and the slack is far under the target.
         const _: () =
