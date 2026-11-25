@@ -68,6 +68,11 @@ def legs(vcpus=6):
             "props": {**today, "option-string": "nal-hrd=cbr:filler=0:scenecut=0"},
         },
         {
+            "id": "X1",
+            "name": "extra (not a brief leg): as L2, sync-lookahead=0",
+            "props": {**nt, "sync-lookahead": 0},
+        },
+        {
             "id": "R0",
             "name": "F-033's settings (keyint 60, scene cut on), as L1",
             "props": {**today, "key-int-max": 60, "option-string": "nal-hrd=cbr:filler=1"},
@@ -623,9 +628,9 @@ def cmd_selftest(_):
     sei = b"\x00\x00\x01\x06x264 - core 164 r3108 - H.264/MPEG-4 AVC codec - options: cabac=1 ref=3\x00tail"
     assert x264_options(sei).endswith("cabac=1 ref=3")
     assert x264_options(b"nothing here") is None
-    # legs: five of the brief plus R0, one profile each, the product's floor and GOP carried
+    # legs: five of the brief, one extra, R0, one profile each, the product's floor and GOP carried
     ls = legs()
-    assert [lg["id"] for lg in ls] == ["L1", "L2", "L3", "L4", "L5", "R0"]
+    assert [lg["id"] for lg in ls] == ["L1", "L2", "L3", "L4", "L5", "X1", "R0"]
     assert COMMON["key-int-max"] == 3 * FPS and COMMON["min-force-key-unit-interval"] == PRODUCT_FLOOR_MS * 1_000_000
     p = {lg["id"]: lg["props"] for lg in ls}
     assert p["L1"]["tune"] == "zerolatency" and "tune" not in p["L2"]
