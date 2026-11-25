@@ -96,10 +96,13 @@ jobs:
           fi
           # An easy picture (F-005's "ball" camera is the easy case): what filler does when the picture
           # needs fewer bits than the CBR target, the encoder's side of scan D2.
+          # snow is the cost legs' picture (per-pixel noise), here for the encoder's CPU seconds only.
           if [ "$SMOKE" != true ]; then
-            gst-launch-1.0 -q videotestsrc pattern=ball num-buffers="$FRAMES" \
-              ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 \
-              ! filesink location="$RUNNER_TEMP/clips/ball.yuv"
+            for pat in ball snow; do
+              gst-launch-1.0 -q videotestsrc pattern="$pat" num-buffers="$FRAMES" \
+                ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 \
+                ! filesink location="$RUNNER_TEMP/clips/$pat.yuv"
+            done
           fi
           ls -l "$RUNNER_TEMP/clips"
       - name: Quality (x264enc offline, libvmaf)
@@ -141,8 +144,12 @@ jobs:
           if [ "$SMOKE" = true ]; then
             /usr/bin/python3 -I harness/encoder-tune/measure.py synth --out "$RUNNER_TEMP/clips/rush.yuv" --frames 30
           else
-            /usr/bin/python3 -I harness/encoder-tune/measure.py clip \
-              --url "$CLIPS_URL/rush_field_cuts_1080p.y4m" --out "$RUNNER_TEMP/clips/rush.yuv" --frames "$FRAMES"
+            # The paced run needs a picture the 4-vCPU runner encodes in real time (the first full run
+            # fed rush_field_cuts: every leg fell behind 30 fps, and its latency was queueing). The
+            # added latency is frames in the encoder, not a property of the picture.
+            gst-launch-1.0 -q videotestsrc pattern=ball num-buffers="$FRAMES" \
+              ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 \
+              ! filesink location="$RUNNER_TEMP/clips/rush.yuv"
           fi
       - name: Paced run
         run: |

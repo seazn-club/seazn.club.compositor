@@ -439,6 +439,7 @@ def free_run(Gst, GstVideo, leg, feed, seconds):
         out["access_units"] = len(outs)
         out["keys"] = sum(1 for o in outs if o[2])
         out["checked_frames"] = len(lat)
+        out["behind_real_time"] = max(r.push_lag_ms[warm:]) > 100 if len(r.push_lag_ms) > warm else None
         if not lat:
             raise SystemExit(f"{out['leg']}: no latency sample, nothing was measured")
     r.close()
