@@ -315,7 +315,7 @@ const INTERLEAVE_WEIGHT: i128 = 8;
 /// 45588726031), every frame after it repeats that stamp until their own pass it, a pause later, and
 /// a clock slaved to the stamps sees a camera that stopped while frames keep coming (C1 on the real
 /// chain: a re-anchor every ~330 ms). A repeated stamp is therefore no stamp: the frame is placed one
-/// step (the last increment the stamps moved by, within the cap) after the last frame placed. When
+/// step (the camera's mean frame period, `VideoStamps::step`) after the last frame placed. When
 /// the stamps advance again they are the frames' own, put on from where the placed ones reached
 /// (`offset`), so the picture neither jumps nor stalls, and the audio, re-based onto the placed stamps
 /// at the return, stays on them.
@@ -323,7 +323,8 @@ const INTERLEAVE_WEIGHT: i128 = 8;
 struct VideoStamps {
     raw: Option<i128>,
     placed: Option<i128>,
-    step: Option<i128>,
+    /// The single-frame increments the raw stamps have moved by: their sum and count (`step`).
+    period: (i128, i128),
     /// Added to the raw stamps (the clamped run's end moves it).
     offset: i128,
     /// The frames are arriving with a repeated stamp.
@@ -341,9 +342,35 @@ enum Clamp {
 }
 
 impl VideoStamps {
+    /// The camera's mean frame period: what a clamped run's frames are placed apart by. A camera
+    /// stamps off its own clock, a few ms either side of each slot (camera-flap's fake camera: 30.1 to
+    /// 34.0 ms at 30 fps, CI run 45595996718), and a run is placed a pause long (147 frames), so one
+    /// increment's error would be carried 147 times over: that run's first return moved the picture
+    /// 37.8 ms off its sound by the clamp's end. The mean of the increments telescopes to the span
+    /// over the count, so the jitter falls out.
+    fn step(&self) -> Option<i128> {
+        let (sum, n) = self.period;
+        (n > 0).then(|| sum / n)
+    }
+
+    /// An increment `d` of the raw stamps, within the cap. Only a single frame's is a period: one
+    /// half again past the mean is frames dropped between (a period twice over), and one under half
+    /// of it shows the mean was never a period (a stall between the camera's first frames), so the
+    /// mean starts over from it.
+    fn measure(&mut self, d: i128) {
+        match self.step() {
+            Some(s) if 2 * d < s => self.period = (d, 1),
+            Some(s) if 2 * d > 3 * s => {}
+            _ => {
+                self.period.0 += d;
+                self.period.1 += 1;
+            }
+        }
+    }
+
     /// The frame stamped `raw`, on the placed stamps.
     fn place(&mut self, raw: i128) -> (i128, Clamp) {
-        let step = self.step.unwrap_or(0);
+        let step = self.step().unwrap_or(0);
         let (placed, seen) = match (self.raw, self.placed) {
             (Some(r), Some(p)) if raw == r => {
                 let seen = if self.clamped { Clamp::None } else { Clamp::Starts };
@@ -357,12 +384,14 @@ impl VideoStamps {
             }
             _ => (raw + self.offset, Clamp::None),
         };
+        // The run's end is no increment: its stamp is the frame's own, the one before it the
+        // repeated one.
         if let Some(d) = self
             .raw
             .map(|r| raw - r)
-            .filter(|d| (1..=ms_ns(PLAYOUT_CAP_MS)).contains(d))
+            .filter(|d| seen != Clamp::Ends && (1..=ms_ns(PLAYOUT_CAP_MS)).contains(d))
         {
-            self.step = Some(d);
+            self.measure(d);
         }
         self.raw = Some(raw);
         self.placed = Some(placed);
@@ -1395,10 +1424,33 @@ mod tests {
         before_s: u64,
         after_s: u64,
     ) -> (Vec<Arrival>, u64) {
+        chain_return_with(
+            fps,
+            pause_ms,
+            held,
+            video_outlier,
+            audio_outlier,
+            (before_s, after_s),
+            |_| {},
+        )
+    }
+
+    /// `chain_return` with the camera's own stamps shaped first (`camera`: its jitter, a dropped
+    /// frame), before the chain's outlier and the decoder's clamp act on them, as on the chain.
+    fn chain_return_with(
+        fps: u64,
+        pause_ms: u64,
+        held: u64,
+        video_outlier: Option<u64>,
+        audio_outlier: Option<u64>,
+        (before_s, after_s): (u64, u64),
+        camera: impl Fn(&mut Vec<Arrival>),
+    ) -> (Vec<Arrival>, u64) {
         let paused = pause_ms * fps / 1_000;
         let (kp, kr) = (before_s * fps, before_s * fps + paused);
-        let all = source(1, fps, 0..kr + after_s * fps, MEDIA_BASE_NS, 0);
+        let mut all = source(1, fps, 0..kr + after_s * fps, MEDIA_BASE_NS, 0);
         let back = all[kr as usize].at;
+        camera(&mut all);
         let jump = paused * NS / fps;
         let mut out: Vec<Arrival> = all.into_iter().filter(|a| !(kp..kr).contains(&a.k)).collect();
         for a in &mut out {
@@ -1420,6 +1472,60 @@ mod tests {
             a.label_shift = jump as i64;
         }
         (out, kr)
+    }
+
+    /// `returns` of camera-flap's returns in one generation, each as `chain_return` models one (the
+    /// last two frames before the pause held to the return, the new frame at `video_outlier` stamped
+    /// a pause on and clamped to until the stamps pass it, the chunk at `audio_outlier` a pause on),
+    /// `run_s` of frames before each pause of `pause_ms` and after the last. Returns the schedule and
+    /// each return's first new frame.
+    fn chain_returns(
+        fps: u64,
+        pause_ms: u64,
+        returns: u64,
+        run_s: u64,
+        video_outlier: u64,
+        audio_outlier: Option<u64>,
+    ) -> (Vec<Arrival>, Vec<u64>) {
+        let paused = pause_ms * fps / 1_000;
+        let jump = paused * NS / fps;
+        let mut out = source(
+            1,
+            fps,
+            0..(returns + 1) * (run_s * fps + paused),
+            MEDIA_BASE_NS,
+            0,
+        );
+        let mut krs = Vec::new();
+        for i in 1..=returns {
+            let kp = i * run_s * fps + (i - 1) * paused;
+            let kr = kp + paused;
+            let back = out.iter().find(|a| a.k == kr).expect("the return").at;
+            out.retain(|a| !(kp..kr).contains(&a.k));
+            for a in &mut out {
+                if (kp - 2..kp).contains(&a.k) {
+                    a.at = back;
+                }
+            }
+            let outlier = out
+                .iter()
+                .find(|a| a.k == kr + video_outlier)
+                .expect("the outlier")
+                .pts
+                + jump;
+            for a in &mut out {
+                if a.k == kr + video_outlier || (a.k > kr + video_outlier && a.pts <= outlier) {
+                    a.pts = outlier;
+                }
+            }
+            if let Some(j) = audio_outlier {
+                let a = out.iter_mut().find(|a| a.k == kr + j).expect("the audio outlier");
+                a.audio_pts += jump;
+                a.label_shift = jump as i64;
+            }
+            krs.push(kr);
+        }
+        (out, krs)
     }
 
     /// From `from` to `until` (programme time) one stream (`video`, else the audio) reaches the queue
@@ -2470,6 +2576,238 @@ mod tests {
         }
         eprintln!("chain returns checked: {checked}");
         assert_eq!(checked, 4 * PROFILES.len());
+    }
+
+    /// The live window of a chain return (`chain_return`'s `kr`, from the switch to live, 1 s on, to
+    /// the run's end): no counted re-anchor, no repeated or unaired frame, no late or filler audio, and
+    /// the sound within a frame of the picture by captured content (`av_by_content`: in step is
+    /// `[0, period)`, so within a frame is `(-period, 2 period)`, plus the slack). Returns the ticks
+    /// with sound it judged.
+    fn assert_live_in_step(tag: &str, fps: u64, arrivals: &[Arrival], r: &Run, kr: u64) -> usize {
+        assert_window_in_step(tag, fps, arrivals, r, kr, r.recs.len())
+    }
+
+    /// `assert_live_in_step` on the live window up to tick `until` (the next pause's).
+    fn assert_window_in_step(
+        tag: &str,
+        fps: u64,
+        arrivals: &[Arrival],
+        r: &Run,
+        kr: u64,
+        until: usize,
+    ) -> usize {
+        let live = (kr + fps) as usize;
+        let mut c = Counts::default();
+        for x in &r.recs[live..until] {
+            c.add(&x.counts);
+        }
+        assert_eq!(
+            (c.reanchors, c.repeated, c.unaired),
+            (0, 0, 0),
+            "{tag}: the live window's re-anchors, repeats, unaired"
+        );
+        assert_eq!(
+            (c.audio_late_bytes, c.audio_pad_bytes),
+            (0, 0),
+            "{tag}: the live window's late and filler audio"
+        );
+        let (slack, period) = (i128::from(PLAYOUT_AUDIO_SLACK_MS * MS), i128::from(NS / fps));
+        let av: Vec<_> = av_by_content(r, arrivals, live)
+            .into_iter()
+            .filter(|(i, _)| *i < until)
+            .collect();
+        assert!(
+            av.len() as u64 >= (until - live) as u64 * 3 / 4,
+            "{tag}: {} of {} ticks with sound",
+            av.len(),
+            until - live
+        );
+        let off: Vec<_> = av
+            .iter()
+            .filter(|(_, d)| !(-period - slack..2 * period + slack).contains(d))
+            .collect();
+        assert!(
+            off.is_empty(),
+            "{tag}: out of step: {:?}",
+            &off[..off.len().min(8)]
+        );
+        r.assert_conserved(tag);
+        av.len()
+    }
+
+    /// Two clamped runs in one stream, as every camera-flap return brings one: the first run's end
+    /// is a partial increment (the frame's own stamp just past the repeated one, 5 ms here), not a
+    /// period, so the second run's frames are still placed a period apart. Each run is checked frame
+    /// by frame, and the stream between them keeps its own stamps on the moved offset.
+    #[test]
+    fn a_clamped_runs_end_is_no_period_for_the_next_run() {
+        let period = i128::from(NS / 30);
+        let mut t = VideoStamps::default();
+        let mut raw = Vec::new();
+        raw.extend((0..30).map(|k| k * period));
+        let outlier = 29 * period + 4_900 * NS_PER_MS;
+        raw.extend(std::iter::repeat_n(outlier, 20));
+        let end = outlier + 5 * NS_PER_MS;
+        raw.extend((0..30).map(|k| end + k * period));
+        raw.extend(std::iter::repeat_n(end + 29 * period, 20));
+        let (mut placed, mut runs, mut checked) = (Vec::new(), 0, 0);
+        for &r in &raw {
+            let (p, c) = t.place(r);
+            runs += u32::from(c == Clamp::Starts);
+            placed.push(p);
+        }
+        assert_eq!(runs, 2, "two clamped runs");
+        for (i, w) in placed.windows(2).enumerate() {
+            // The outlier's own jump (frame 30) is the stamps', not a placement.
+            if i + 1 == 30 {
+                continue;
+            }
+            assert_eq!(w[1] - w[0], period, "frame {}: placed a period on", i + 1);
+            checked += 1;
+        }
+        eprintln!("placements checked: {checked}");
+        assert_eq!(checked, raw.len() - 2);
+    }
+
+    /// The fake camera stamps each frame off its own clock, a few ms either side of its slot
+    /// (camera-flap's ticks on PR #113, CI run 45595996718: increments of 30.1 to 34.0 ms at 30 fps).
+    /// A clamped run places its frames one step apart for a pause (147 frames at 30 fps), so a step
+    /// read off one increment carries that increment's error 147 times over, and the picture runs off
+    /// its sound by the sum (that run's first return: the clamp's end put the video 37.8 ms past
+    /// where its start had it). The step is the camera's mean frame period: single-frame increments
+    /// only (a dropped frame's double one is not a period), and a first reading that a later
+    /// increment shows was no period (a stall half again too long) is started over. Here each frame
+    /// `k` is stamped `((3k mod 7) - 3)` ms off its slot (a single increment 3 ms long or 4 short,
+    /// zero on average), alone, with a frame dropped every second before the pause, and with the
+    /// camera's first two frames a stall (300 ms) apart.
+    #[test]
+    fn a_clamped_run_is_placed_at_the_cameras_mean_frame_period() {
+        let (mut checked, mut ticks) = (0, 0);
+        let jitter = |k: u64| (((k * 3) % 7) as i64 - 3) * MS as i64;
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let before_s = 5;
+            for (shape, drops, stall) in [
+                ("jittered", false, false),
+                ("jittered, a frame dropped every second", true, false),
+                ("jittered, a stall between the first two frames", false, true),
+            ] {
+                for (name, outlier, audio_outlier) in [
+                    ("outlier on the first new frame, audio outlier", 0, Some(2)),
+                    ("outlier on the second new frame", 1, None),
+                ] {
+                    let tag = format!("{fps} fps, {shape}, {name}");
+                    let (arrivals, kr) = chain_return_with(
+                        fps,
+                        4_900,
+                        2,
+                        Some(outlier),
+                        audio_outlier,
+                        (before_s, 8),
+                        |all| {
+                            for a in all.iter_mut() {
+                                a.pts = a.pts.checked_add_signed(jitter(a.k)).expect("a stamp after 0");
+                                if drops && a.k < (before_s - 1) * fps && a.k % fps == fps / 2 {
+                                    a.at = NO_AUDIO;
+                                }
+                                if stall && a.k == 0 {
+                                    a.pts -= 300 * MS;
+                                }
+                            }
+                        },
+                    );
+                    let r = run(fps, &arrivals, before_s * fps + 147 + 8 * fps);
+                    ticks += assert_live_in_step(&tag, fps, &arrivals, &r, kr);
+                    checked += 1;
+                }
+            }
+        }
+        eprintln!("jittered chain returns checked: {checked}, ticks with sound: {ticks}");
+        assert_eq!(checked, 6 * PROFILES.len());
+    }
+
+    /// Camera-flap returns again and again in one generation (twelve on PR #113's leg), so each
+    /// return starts from what the last left: the video's offset a clamp's end moved, a provisional
+    /// re-base standing, the interleave as averaged since. Four returns here on bursty video (a burst
+    /// of four frames, as `a_return_on_bursty_video_runs_steady_and_in_step`), at each place in the
+    /// burst: every live window, from its switch to live to the next pause, runs steady and in step.
+    #[test]
+    fn every_return_of_a_flapping_camera_runs_steady_and_in_step() {
+        const BURST: u64 = 4;
+        let (mut checked, mut ticks) = (0, 0);
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            for phase in 0..BURST {
+                let pause_ms = ((147 + phase) * 1_000).div_ceil(fps);
+                let (arrivals, krs) = chain_returns(fps, pause_ms, 4, 8, 0, Some(2));
+                let grid = BURST * NS / fps;
+                let arrivals: Vec<Arrival> = arrivals
+                    .into_iter()
+                    .map(|a| Arrival {
+                        at: a.at.div_ceil(grid) * grid,
+                        ..a
+                    })
+                    .collect();
+                let end = krs.last().expect("returns") + 8 * fps;
+                let r = run(fps, &arrivals, end + BURST);
+                for (n, &kr) in krs.iter().enumerate() {
+                    let until = krs
+                        .get(n + 1)
+                        .map_or(end as usize, |&next| (next - (147 + phase) - 1) as usize);
+                    let tag = format!("{fps} fps, place {phase} in the burst, return {}", n + 1);
+                    ticks += assert_window_in_step(&tag, fps, &arrivals, &r, kr, until);
+                    checked += 1;
+                }
+            }
+        }
+        eprintln!("returns checked: {checked}, ticks with sound: {ticks}");
+        assert_eq!(checked, 4 * BURST as usize * PROFILES.len());
+    }
+
+    /// The chain's decoders hand the frames out in bursts (camera-flap's ticks on PR #113, CI run
+    /// 45595996718: three frames in one tick, then none for two), so the newest frame's stamp at an
+    /// audio push trails by anything up to a burst, and a re-base reads the interleave off one push.
+    /// Each frame here reaches the queue at the next boundary of a burst of four frames (in order,
+    /// the held frames still before the return's first), with its audio on time, and the return falls
+    /// at each place in the burst: the live window runs steady and the sound stays within a frame.
+    #[test]
+    fn a_return_on_bursty_video_runs_steady_and_in_step() {
+        const BURST: u64 = 4;
+        let (mut checked, mut ticks) = (0, 0);
+        let mut places = std::collections::BTreeSet::new();
+        for (pi, profile) in PROFILES.into_iter().enumerate() {
+            let fps = programme_fps(profile);
+            for (name, outlier, audio_outlier) in [
+                ("outlier on the first new frame, audio outlier", 0, Some(2)),
+                ("outlier on the second new frame", 1, None),
+            ] {
+                for phase in 0..BURST {
+                    // `paused` is `147 + phase` frames, so the return lands at each place in a burst.
+                    let pause_ms = ((147 + phase) * 1_000).div_ceil(fps);
+                    let tag = format!("{fps} fps, {name}, return at {phase} in the burst");
+                    let (arrivals, kr) = chain_return(fps, pause_ms, 2, Some(outlier), audio_outlier, 5, 8);
+                    let back = arrivals.iter().find(|a| a.k == kr).expect("the return").at;
+                    places.insert((pi, outlier, back % (BURST * NS / fps)));
+                    // Held to the next burst boundary on the programme's clock: in order, as the
+                    // decoder hands them out (the held frames still before the return's first).
+                    let grid = BURST * NS / fps;
+                    let arrivals: Vec<Arrival> = arrivals
+                        .into_iter()
+                        .map(|a| Arrival {
+                            at: a.at.div_ceil(grid) * grid,
+                            ..a
+                        })
+                        .collect();
+                    let r = run(fps, &arrivals, 5 * fps + 147 + BURST + 8 * fps);
+                    ticks += assert_live_in_step(&tag, fps, &arrivals, &r, kr);
+                    checked += 1;
+                }
+            }
+        }
+        eprintln!("bursty chain returns checked: {checked}, ticks with sound: {ticks}");
+        assert_eq!(checked, 2 * BURST as usize * PROFILES.len());
+        // Every return fell at its own place in its burst (the sweep is not one place four times).
+        assert_eq!(places.len(), checked, "the returns' places in the burst");
     }
 
     /// The coordinator's fix-round-2 ruling on the re-review's n2: audio skewed past the re-base
