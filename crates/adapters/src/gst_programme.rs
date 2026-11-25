@@ -575,7 +575,10 @@ impl GstProgramme {
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
         let encoder = make("x264enc")?;
-        encoder.set_property_from_str("tune", X264_TUNE);
+        // C5 MEASUREMENT-ONLY spike (never merged): no tune, frame threads, lookahead 15, bframes 0, High
+        let _ = X264_TUNE;
+        encoder.set_property("sliced-threads", false);
+        encoder.set_property("rc-lookahead", 15i32);
         encoder.set_property_from_str("speed-preset", X264_SPEED_PRESET);
         encoder.set_property("bitrate", profile.video_kbps);
         encoder.set_property("key-int-max", profile.gop_frames());
@@ -598,7 +601,7 @@ impl GstProgramme {
         );
         let profile_caps = capsfilter(
             gst::Caps::builder("video/x-h264")
-                .field("profile", "main")
+                .field("profile", "high")
                 .build(),
         )?;
         let parser = make("h264parse")?;
