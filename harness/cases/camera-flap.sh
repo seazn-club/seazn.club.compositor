@@ -40,8 +40,8 @@
 #   skip, 12 times a window);
 # - late audio at most one re-anchor's skip, (playout_cap_ms - playout_target_ms) of audio
 #   (`audio_bytes_per_ms`).
-# And the run's A/V within budget_av_offset_ms on the tone-to-flash pairs from `av_settle_cut_ms` after each
-# start, the earlier pairs within `budget_av_offset_excluded_ms` (lib.jq's `av_gate`; at least one pair a flap).
+# And the run's A/V within budget_av_offset_ms on the tone-to-flash pairs from `av_return_cut_ms` after each
+# anchor (the playout's return, the run's first pair), the earlier pairs within `budget_av_offset_excluded_ms` (lib.jq's `av_gate`; at least one pair a flap).
 
 CASE_LIVE_S=125
 CASE_KEY=flap_hysteresis
@@ -80,10 +80,10 @@ FLAP_WINDOWS='def flap_windows:
      | . + {reanchors: ([.beats[].reanchors] | add // 0), late: ([.beats[].audio_late_bytes] | add // 0),
             beats: (.beats | length)}];'
 
-# The starts the A/V gate counts from: the run's (the first beat with the camera on air) and each
-# return's first frame shown.
-FLAP_AV_STARTS='def av_starts: [.log.camera_playout[0].at_ms // empty]
-  + [.camera.resumes[] | select(.first_shown_wall_ms != null) | .first_shown_wall_ms];'
+# The anchors the A/V gate counts from: the run's first pair, and each return of the PLAYOUT from the
+# camera (the wall time of its `reanchor(gap` note; the strip's first frame shown waits out the
+# hold-off beside it, `resume_after_ms`, which the cut spans instead).
+FLAP_AV_STARTS='def av_starts: [.audio.av_offset_ms.list[0].at_ms // empty] + [.log.playout_returns[].at_ms];'
 
 CASE_CHECKS=16
 case_verdict() {
@@ -112,12 +112,14 @@ case_verdict() {
     "$FLAP_WINDOWS flap_windows | {freezes: map(.freezes), skips: map(.skips)}"
   require window_late_audio "$FLAP_WINDOWS ((\$t.playout_cap_ms - \$t.playout_target_ms) * \$t.audio_bytes_per_ms)
     as \$most | flap_windows | all(.late <= \$most)" "$FLAP_WINDOWS flap_windows | map(.late)"
-  # C4's gate (owner ruling, 2026-11-25): the budget is judged on the pairs from `av_settle_cut_ms` after
-  # each start (the run's, each return's first frame shown), the earlier ones against their own bound
-  # (`budget_av_offset_excluded_ms`, lib.jq's `av_gate`), at least a pair a flap, at least one kept
-  # pair in every window, and the kept and excluded counts in the measure.
-  require av_in_step "$FLAP_AV_STARTS av_gate_ok(av_starts; $FLAPS)" \
-    "$FLAP_AV_STARTS av_gate(av_starts) + {p50: .audio.av_offset_ms.p50}"
+  # C4's gate (owner ruling, 2026-11-25, option 1): the budget is judged on the pairs from `av_return_cut_ms`
+  # (the return hold-off, the playout's settle skip and its settle) after each anchor, the earlier ones
+  # against their own bound (`budget_av_offset_excluded_ms`, lib.jq's `av_gate`), at least a pair a
+  # flap, at least one kept pair in every window, and the kept and excluded counts in the measure. Every
+  # resume the strip showed has a playout return line (a dropped note would silently merge two windows).
+  require av_in_step "$FLAP_AV_STARTS ([.log.playout_returns[]] | length) >= ([.camera.resumes[]
+    | select(.first_shown_wall_ms != null)] | length) and av_gate_ok(av_starts; $FLAPS)" \
+    "$FLAP_AV_STARTS av_gate(av_starts) + {p50: .audio.av_offset_ms.p50, returns: (.log.playout_returns | length)}"
   require no_output_outages '.output_outages == []' '.output_outages | length'
   require counter_regressions '.camera.counter_regressions == 0'
   require_no_false_restart

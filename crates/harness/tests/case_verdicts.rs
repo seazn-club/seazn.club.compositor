@@ -770,6 +770,12 @@ fn camera_flap_paused(pause_ms: i64) -> World {
         w.mark("pause", p, json!({"pause_ms": pause_ms}));
         w.mark("resume", r, Value::Null);
         w.camera_gaps.push((p + 30, r + 30));
+        // The playout's own return (C4's A/V gate, owner ruling 2026-11-25): its note a moment after the
+        // camera's first frame, a second before the strip shows that frame.
+        w.line(
+            r + 30 + RETURN_LINE_AFTER_EMIT_MS,
+            "playout reanchor(gap+video_behind(lead_ms=-4713.0)) gen=2 at_ms=15800.0 due_ms=1->2",
+        );
         let closing = p + 30 + w.ms("frozen_after_ms");
         flap_beat(&mut w, closing, pause_repeats as u64, 0, 0);
         let slate = p + 30 + w.ms("slate_after_ms");
@@ -795,16 +801,20 @@ fn flap_beat(w: &mut World, at: i64, repeat_ticks: u64, reanchors: u64, late: u6
     );
 }
 
-/// C4's A/V gate (owner ruling, 2026-11-25): how a fixture's pair list is spoiled.
+/// C4's A/V gate (owner ruling, 2026-11-25, option 1): how a fixture's pair list is spoiled.
 #[derive(Clone, Copy)]
 enum Spoil {
     /// The list as a good run reads it.
     None,
-    /// One kept pair (the last) at this many ms.
+    /// The kept pair 1 ms past the cut after the LAST return (the playout's, not the first frame
+    /// shown: those are over a second apart in these worlds) at this many ms.
     OneKept(i64),
-    /// One excluded pair (the first) at this many ms.
+    /// The kept pair 1 ms past the cut after the run's first pair, at this many ms.
+    RunStartKept(i64),
+    /// The excluded pair 1 ms short of the cut after the first return (the run's first pair when
+    /// there is no return), at this many ms.
     OneExcluded(i64),
-    /// Every pair inside a settle: no kept pair at all.
+    /// Every pair inside a cut: no kept pair at all.
     NoKept,
     /// No kept pair in window `n` (0 is the run's own start): its kept pairs are dropped.
     EmptyWindow(usize),
@@ -814,15 +824,24 @@ enum Spoil {
     Empty,
 }
 
-/// The checker's A/V pairs for a camera case's report, one a second from the first start (the first
-/// beat, the run's start) to the last beat, each `excluded_ms` inside `av_settle_cut_ms` of the latest
-/// start (the run's, or a return's first frame shown) and `kept_ms` after it. The cut and the starts
-/// are read from the report and thresholds.json, never typed.
+/// How long after the camera's first frame of a return the fixture's playout logs its own return
+/// (`reanchor(gap`). Sim physics, typed beside the fact it stands for (CI read 1.2 s on the real chain).
+const RETURN_LINE_AFTER_EMIT_MS: i64 = 250;
+
+/// The checker's A/V pairs for a camera case's report, one a second from the run's first pair to the
+/// last beat, each `excluded_ms` inside `av_return_cut_ms` of the latest anchor and `kept_ms` after it,
+/// and, at every anchor, a pair 1 ms short of the cut (excluded) and one 1 ms past it (kept). The
+/// anchors are the run's first pair (4.9 s before the first beat, as CI read it) and each return of
+/// the playout, read from the report's `log.playout_returns`. Those returns are pinned here against
+/// the fixture's own physics (the camera's first emit of each return, which the checker read from the
+/// emit log, plus [`RETURN_LINE_AFTER_EMIT_MS`]), and pinned away from the strip's first frame shown,
+/// so a verdict that anchors on that frame sorts the boundary pairs wrongly and reds. The cut is read
+/// from thresholds.json, never typed.
 fn gate_av(r: &mut Value, excluded_ms: i64, kept_ms: i64, spoil: Spoil) {
     let t: Value =
         serde_json::from_str(&std::fs::read_to_string(repo().join("harness/thresholds.json")).unwrap())
             .unwrap();
-    let cut = t["av_settle_cut_ms"].as_i64().unwrap();
+    let cut = t["av_return_cut_ms"].as_i64().unwrap();
     let beats: Vec<i64> = r["log"]["camera_playout"]
         .as_array()
         .unwrap()
@@ -830,38 +849,100 @@ fn gate_av(r: &mut Value, excluded_ms: i64, kept_ms: i64, spoil: Spoil) {
         .map(|b| b["at_ms"].as_i64().unwrap())
         .collect();
     // A run with no beat has no start, so no pair to place (the case reds its own window checks).
-    let Some(first) = beats.iter().min().copied() else {
+    let Some(first_beat) = beats.iter().min().copied() else {
         r["audio"]["av_offset_ms"] =
             json!({"p50": 0, "max_abs": 0, "pairs": 0, "camera_codec_delay_ms": 33.3, "list": []});
         return;
     };
-    let mut starts = vec![first];
-    starts.extend(
-        r["camera"]["resumes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|x| x["first_shown_wall_ms"].as_i64()),
+    let resumes: Vec<Value> = r["camera"]["resumes"].as_array().unwrap().clone();
+    let returns: Vec<i64> = r["log"]["playout_returns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["at_ms"].as_i64().unwrap())
+        .collect();
+    // The returns the product's producer read are the ones the fixture's physics put there, and none
+    // is the frame-shown time of its resume.
+    let judged: Vec<&Value> = resumes
+        .iter()
+        .filter(|x| !x["first_shown_wall_ms"].is_null())
+        .collect();
+    // (camera-burst has no return, and its slate red has resumes but no playout line: nothing to pin.)
+    if !returns.is_empty() {
+        // (A pause too short to slate returns without a judged resume: more returns than judged ones.)
+        assert!(
+            returns.len() >= judged.len(),
+            "a playout return a judged resume: {returns:?}"
+        );
+        for res in &judged {
+            let emitted = res["first_emitted_wall_ms"].as_i64().unwrap();
+            let shown = res["first_shown_wall_ms"].as_i64().unwrap();
+            let ret = returns
+                .iter()
+                .find(|x| **x >= emitted && **x <= shown)
+                .unwrap_or_else(|| panic!("no playout return in {emitted}..{shown}: {returns:?}"));
+            assert!(
+                (ret - emitted - RETURN_LINE_AFTER_EMIT_MS).abs() <= PERIOD_MS as i64,
+                "the return line's wall: {ret} after emit {emitted}"
+            );
+            assert!(
+                shown - ret >= 1_000,
+                "the anchors must differ from the first frame shown ({shown} against {ret})"
+            );
+        }
+    }
+    let first_pair = first_beat - 4_900;
+    let mut anchors = vec![first_pair];
+    anchors.extend(returns.iter().copied());
+    assert!(
+        anchors.windows(2).all(|w| w[1] - w[0] > cut + 2),
+        "the anchors sit further apart than a cut: {anchors:?}"
     );
     let last = *beats.iter().max().unwrap();
-    let mut list: Vec<(i64, i64, usize, bool)> = Vec::new();
-    let mut at = starts[0] + 700;
-    while at <= last {
-        let (w, from) = starts
+    let window_of = |at: i64| {
+        anchors
             .iter()
             .enumerate()
-            .filter(|(_, s)| **s <= at)
-            .max_by_key(|(_, s)| **s)
-            .map(|(i, s)| (i, *s))
-            .unwrap();
+            .filter(|(_, a)| **a <= at)
+            .max_by_key(|(_, a)| **a)
+            .map(|(i, a)| (i, *a))
+            .unwrap()
+    };
+    let mut list: Vec<(i64, i64, usize, bool)> = Vec::new();
+    let mut put = |at: i64, ms_kept: i64, ms_excluded: i64| {
+        let (w, from) = window_of(at);
         let kept = at - from >= cut;
-        list.push((at, if kept { kept_ms } else { excluded_ms }, w, kept));
+        list.push((at, if kept { ms_kept } else { ms_excluded }, w, kept));
+    };
+    let mut at = first_pair;
+    while at <= last {
+        put(at, kept_ms, excluded_ms);
         at += 1_000;
     }
+    for a in &anchors {
+        put(a + cut - 1, kept_ms, excluded_ms);
+        put(a + cut + 1, kept_ms, excluded_ms);
+    }
+    list.sort_by_key(|p| p.0);
+    list.dedup_by_key(|p| p.0);
+    let at_of = |a: i64, d: i64| list.iter().position(|p| p.0 == a + d).unwrap();
     match spoil {
         Spoil::None => {}
-        Spoil::OneKept(ms) => list.iter_mut().rev().find(|p| p.3).unwrap().1 = ms,
-        Spoil::OneExcluded(ms) => list.iter_mut().find(|p| !p.3).unwrap().1 = ms,
+        Spoil::OneKept(ms) => {
+            let i = at_of(*anchors.last().unwrap(), cut + 1);
+            assert!(list[i].3, "the pair 1 ms past the cut is kept");
+            list[i].1 = ms;
+        }
+        Spoil::RunStartKept(ms) => {
+            let i = at_of(anchors[0], cut + 1);
+            assert!(list[i].3, "the pair 1 ms past the cut is kept");
+            list[i].1 = ms;
+        }
+        Spoil::OneExcluded(ms) => {
+            let i = at_of(anchors[anchors.len().min(2) - 1], cut - 1);
+            assert!(!list[i].3, "the pair 1 ms short of the cut is excluded");
+            list[i].1 = ms;
+        }
         Spoil::NoKept => list.retain(|p| !p.3),
         Spoil::EmptyWindow(n) => list.retain(|p| !(p.3 && p.2 == n)),
         Spoil::Few(n) => list.truncate(n),
@@ -878,8 +959,8 @@ fn gate_av(r: &mut Value, excluded_ms: i64, kept_ms: i64, spoil: Spoil) {
     });
 }
 
-/// The first second of a start rides the input chain's transient (Owed 121): over the budget (40) and
-/// inside the excluded bound (72, main's pre-C4 max).
+/// A pair inside a cut of its anchor rides the return's excursion (Owed 121): over the budget (40) and
+/// inside the excluded bound (72, main's pre-C4 camera-flap max).
 const GATE_EXCLUDED_MS: i64 = 60;
 /// A settled pair as CI read camera-flap's (p50 27 ms).
 const GATE_KEPT_MS: i64 = 27;
@@ -946,7 +1027,7 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         edit(&mut w);
         w
     };
-    let reds: [(&str, World, &str); 12] = [
+    let reds: [(&str, World, &str); 13] = [
         (
             "flap-nobeats",
             storm(|w| w.log.retain(|(_, l)| !l.starts_with("input received"))),
@@ -1004,6 +1085,13 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
             "av_in_step",
         ),
         (
+            "flap-av-runstart41",
+            storm(|w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::RunStartKept(41)))
+            }),
+            "av_in_step",
+        ),
+        (
             "flap-av-excluded73",
             storm(|w| {
                 w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::OneExcluded(73)))
@@ -1034,7 +1122,7 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         checked += 1;
     }
     eprintln!("camera-flap window reds checked: {checked}");
-    assert_eq!(checked, 12);
+    assert_eq!(checked, 13);
 }
 
 /// C3's case 20: netem loss 20 s to 60 s (`dropped` packets), then a `pause_ms` pause at 70 s. As CI
@@ -7058,7 +7146,7 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
              audio_late_bytes=0 reanchors=0",
         );
     };
-    let reds: [(&str, World, &str); 15] = [
+    let reds: [(&str, World, &str); 16] = [
         (
             "burst-newest",
             camera_burst(300, |_| {}),
@@ -7131,6 +7219,13 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
             "burst-av-kept41",
             camera_burst(freeze, |w| {
                 w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::OneKept(41)))
+            }),
+            "av_in_step",
+        ),
+        (
+            "burst-av-runstart41",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::RunStartKept(41)))
             }),
             "av_in_step",
         ),

@@ -295,6 +295,16 @@ pub struct PlayoutLine {
     pub reanchors: u64,
 }
 
+/// `playout reanchor(gap…) gen=<g> …` (C4): the playout's own return from the camera, the first
+/// arrival after a gap longer than the playout's cap, re-anchoring its clock. Its wall time is the
+/// anchor the A/V gate counts a return's settle from (owner ruling 2026-11-25, option 1), not the
+/// strip's first frame shown, which waits out the hold-off beside it.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PlayoutReturn {
+    pub at_ms: i64,
+    pub gen: u64,
+}
+
 /// The log's facts, in log order. (`PartialEq` only: the honest beat's rates are `f64`.)
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct LogFacts {
@@ -365,6 +375,8 @@ pub struct LogFacts {
     /// C4's camera lines, each beat's (camera-burst).
     pub camera_repeats: Vec<CameraRepeatLine>,
     pub camera_playout: Vec<PlayoutLine>,
+    /// The playout's returns from the camera (one `reanchor(gap` note each; C4's A/V gate).
+    pub playout_returns: Vec<PlayoutReturn>,
     /// Chromium's abort line (`GPU process isn't usable`).
     pub gpu_unusable: Vec<i64>,
     pub exits: Vec<Exit>,
@@ -551,6 +563,20 @@ fn playout_tail(msg: &str, at_ms: i64) -> Option<PlayoutLine> {
         audio_late_bytes: v[2],
         reanchors: v[3],
     })
+}
+
+/// A playout note whose re-anchor reason starts `gap` (`playout reanchor(gap) gen=2 …` or
+/// `playout reanchor(gap+video_behind(…)) gen=2 …`): the first arrival after a gap past the cap.
+/// The generation is the note's own `gen=`; a note without a numeric one is not read.
+fn playout_return(msg: &str, at_ms: i64) -> Option<PlayoutReturn> {
+    let rest = msg.strip_prefix("playout reanchor(gap")?;
+    // The reason ends at the note's first `) gen=`: `gap)` or `gap+<more>)`.
+    let (why, tail) = rest.split_once(") gen=")?;
+    if !why.is_empty() && !why.starts_with('+') {
+        return None;
+    }
+    let gen = tail.split(' ').next()?.parse().ok()?;
+    Some(PlayoutReturn { at_ms, gen })
 }
 
 /// `[a, b]` as Rust's `{:?}` prints a `Vec<i32>` of pids; `[]` is empty.
@@ -754,6 +780,8 @@ pub fn log_facts(text: &str) -> LogFacts {
             f.camera_repeats.push(c);
         } else if let Some(p) = playout_tail(m, at_ms) {
             f.camera_playout.push(p);
+        } else if let Some(r) = playout_return(m, at_ms) {
+            f.playout_returns.push(r);
         } else if let Some(b) = fps_line(m, "output fps beat=", " floor=", at_ms) {
             f.output_fps.push(b);
         } else if let Some(r) = fps_line(m, "output starvation alarm raised fps=", " floor=", at_ms) {
@@ -1737,6 +1765,63 @@ mod tests {
             f.camera_repeats.len() + f.camera_playout.len()
         );
         assert_eq!(pinned, 4);
+    }
+
+    /// C4's gate (owner ruling, 2026-11-25): the playout's return is the `reanchor(gap` note, with the
+    /// reason alone or with its clauses, and nothing else is one. The note's producer is pinned.
+    #[test]
+    fn the_playouts_returns_are_its_gap_reanchors() {
+        let mut log = String::new();
+        let lines = [
+            (1_000, "playout anchor gen=2 at_ms=2233.3 due_ms=-->989.8"),
+            (3_000, "playout reanchor(gap) gen=2 at_ms=55800.0 due_ms=1->2"),
+            (
+                4_000,
+                "playout reanchor(gap+video_behind(lead_ms=-4713.0)+audio_behind(lead_ms=-4709.0)) gen=3 at_ms=1.0",
+            ),
+            // Near misses: another reason, a join, a gap-prefixed word, no generation, the page's echo.
+            (5_000, "playout reanchor(ahead(lead_ms=5031.6)) gen=2 at_ms=15866.7"),
+            (5_100, "playout join(gap) gen=2 at_ms=1.0"),
+            (5_200, "playout reanchor(gapped) gen=2 at_ms=1.0"),
+            (5_300, "playout reanchor(gap) gen=- at_ms=1.0"),
+            (5_400, "playout reanchor(gap) at_ms=1.0"),
+            (5_500, "gen=1: page console: playout reanchor(gap) gen=2 at_ms=1.0"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        assert_eq!(
+            f.playout_returns
+                .iter()
+                .map(|r| (r.at_ms - NOON_MS, r.gen))
+                .collect::<Vec<_>>(),
+            vec![(3_000, 2), (4_000, 3)]
+        );
+        let playout = std::fs::read_to_string(format!(
+            "{}/../adapters/src/playout.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("playout.rs");
+        let mut pinned = 0;
+        for producer in [
+            "\"playout {} gen={} at_ms={} due_ms={}->{} video_ms={} audio_ms={} since_video_ms={} \\",
+            "why.push(\"gap\".into());",
+            "format!(\"reanchor({why})\")",
+        ] {
+            assert_eq!(
+                playout.matches(producer).count(),
+                1,
+                "the note changed: {producer}"
+            );
+            pinned += 1;
+        }
+        eprintln!(
+            "playout return lines checked: {}, facts read: {}, producers pinned: {pinned}",
+            lines.len(),
+            f.playout_returns.len()
+        );
+        assert_eq!(pinned, 3);
     }
 
     #[test]

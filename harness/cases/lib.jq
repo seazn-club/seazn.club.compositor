@@ -276,19 +276,20 @@ def clear_phase:
 # after it.
 def outage_across($clear): [.output_outages[] | select(.to_wall_ms > $clear)] | first;
 
-# C4's A/V gate (owner ruling, 2026-11-25). The checker's tone-to-flash pairs (`.audio.av_offset_ms.list`,
-# each {at_ms, ms}) are split by where they fall against the starts the case names (`$starts`, wall
-# ms: a return's first frame shown, or the run's start): a pair at least `$t.av_settle_cut_ms` after
-# the latest start at or before it is KEPT, judged against `$t.budget_av_offset_ms`; every other pair is
-# EXCLUDED (the input chain's start-up and return transient rides it, Owed 121) and judged against
-# `$t.budget_av_offset_excluded_ms`. A start with no kept pair after it is an empty window. A report
-# with no pair list has no kept pair, which the verdicts fail.
+# C4's A/V gate (owner ruling, 2026-11-25, option 1). The checker's tone-to-flash pairs
+# (`.audio.av_offset_ms.list`, each {at_ms, ms}) are split by where they fall against the ANCHORS the case
+# names (`$starts`, wall ms: the playout's own return from the camera, `.log.playout_returns[].at_ms`,
+# and the run's first pair): a pair at least `$t.av_return_cut_ms` after the latest anchor at or before
+# it is KEPT, judged against `$t.budget_av_offset_ms`; every other pair is EXCLUDED and judged against
+# `$t.budget_av_offset_excluded_ms`. The cut spans, openly, the return's hold-off (`resume_after_ms`),
+# the playout's settle skip and its settle (about 2.7 s, thresholds.rs). An anchor with no kept pair
+# after it is an empty window. A report with no pair list has no kept pair, which the verdicts fail.
 def av_gate($starts):
   ([$starts[] | select(. != null)]) as $s
   | [(.audio.av_offset_ms.list // [])[] | . as $x
      | ([$s[] | select(. <= $x.at_ms)] | max) as $from
      | {at_ms: $x.at_ms, ms: ($x.ms | abs), from: $from,
-        kept: ($from != null and ($x.at_ms - $from) >= $t.av_settle_cut_ms)}] as $a
+        kept: ($from != null and ($x.at_ms - $from) >= $t.av_return_cut_ms)}] as $a
   | {pairs: ($a | length), windows: ($s | length),
      kept: ([$a[] | select(.kept)] | length),
      excluded: ([$a[] | select(.kept | not)] | length),

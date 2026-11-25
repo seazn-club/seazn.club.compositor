@@ -1,6 +1,6 @@
 {
   "audio_bytes_per_ms": 192,
-  "av_settle_cut_ms": 1650,
+  "av_return_cut_ms": 2650,
   "bootstrap_backoff_base_ms": 1000,
   "bootstrap_backoff_cap_ms": 10000,
   "budget_av_offset_excluded_ms": 72,

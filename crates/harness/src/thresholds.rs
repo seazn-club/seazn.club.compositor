@@ -52,14 +52,18 @@ pub const BUDGET_FRAME_TO_ENCODER_MS: u64 = 150;
 /// failure table, timing budgets and resource bounds are adopted as written"); §6's own text names
 /// no A/V number.
 pub const BUDGET_AV_OFFSET_MS: u64 = 40;
-/// C4's gate ruling (owner, 2026-11-25): the budget above is judged on the pairs taken from
-/// `av_settle_cut_ms` after each start (a return, or the run's start), and the pairs before it have
-/// their own bound, the worst pre-C4 main read. The input chain's start-up and return transient
-/// (decoded stamps +40 to +64 ms, decaying over ~1.5 s, in tsdemux; `docs/_INDEX.md` Owed 121) rides
-/// those first seconds whatever the playout does, so they are bounded, not budgeted: a storm in them
-/// still fails. Source: the checker's A/V max on main's pre-C4 code, 72 ms (camera-flap chaos legs
-/// 45508994483, max 72, and 45498019823, max 65; camera-stop 45508994483, max 72; smoke on ten pre-C4
-/// PR runs of 2026-11-24, max 72 in nine of ten).
+/// C4's gate ruling (owner, 2026-11-25, option 1): the budget above is judged on the pairs taken from
+/// `av_return_cut_ms` after each ANCHOR (the playout's own return from the camera, the wall time of
+/// its `reanchor(gap` line; the run's first pair at the start), and the pairs before it have their
+/// own bound, `BUDGET_AV_OFFSET_EXCLUDED_MS`. The cut spans, openly: the return's hold-off
+/// (`resume_after_ms`, the strip's wait before it shows a returning camera), the playout's settle
+/// skip (`PLAYOUT_SETTLE_SKIP_MS`) and its settle (`PLAYOUT_SETTLE_MS`), about 2.7 s. The first pair
+/// after a return lands ~2.0 s after it, over the budget on three CI runs (44 to 58 ms); the cut
+/// excludes it. The carrier of that excursion is unproven (`docs/_INDEX.md` Owed 121), so the pairs
+/// are bounded, not budgeted: a storm in them still fails. Source of the bound: the checker's A/V
+/// max on main's pre-C4 code, 72 ms (camera-flap chaos legs 45508994483, max 72, and 45498019823,
+/// max 65; camera-stop 45508994483, max 72; smoke on ten pre-C4 PR runs of 2026-11-24, 72 to 88).
+/// It is main's camera-flap and camera-stop maximum, not the worst smoke read.
 pub const BUDGET_AV_OFFSET_EXCLUDED_MS: u64 = 72;
 /// Spec §6, the failure table's score feed row: the page "signals `scoreStale` after 10 s" (the
 /// page's `SCORE_STALE_AFTER_MS`, R2005). The harness page's own stale rule reads this value from
@@ -270,11 +274,11 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         "budget_av_offset_excluded_ms",
         json!(BUDGET_AV_OFFSET_EXCLUDED_MS),
     );
-    // The settle's own span: the cut after a start the budget is judged from (`PLAYOUT_SETTLE_SKIP_MS`
-    // and `PLAYOUT_SETTLE_MS`, never a typed number).
+    // The cut after an anchor the budget is judged from: the return's hold-off, the settle's skip and
+    // the settle (`resume_after_ms`, `PLAYOUT_SETTLE_SKIP_MS`, `PLAYOUT_SETTLE_MS`; never a typed number).
     put(
-        "av_settle_cut_ms",
-        json!(PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS),
+        "av_return_cut_ms",
+        json!(resume_after_ms + PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS),
     );
     put("budget_score_stale_after_ms", json!(BUDGET_SCORE_STALE_AFTER_MS));
     put("budget_fps_mean_min", json!(BUDGET_FPS_MEAN_MIN));
@@ -366,7 +370,10 @@ mod tests {
             ("heartbeat_interval_ms", t.heartbeat_interval_ms),
             ("cef_gpu_deaths_to_restart", t.cef_gpu_deaths_to_restart as u64),
             ("playout_target_ms", PLAYOUT_TARGET_MS),
-            ("av_settle_cut_ms", PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS),
+            (
+                "av_return_cut_ms",
+                t.resume_after_ms + PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS,
+            ),
             ("budget_av_offset_excluded_ms", BUDGET_AV_OFFSET_EXCLUDED_MS),
         ];
         for (k, want) in pairs {
@@ -428,11 +435,14 @@ mod tests {
         assert!(checked > 0);
     }
 
-    /// The A/V gate's two numbers (owner, 2026-11-25): the cut is the settle's own span from config
-    /// (650 + 1 000 ms) and the bound before it is above the budget, below a storm's.
+    /// The A/V gate's two numbers (owner, 2026-11-25): the cut is the return hold-off plus the settle's
+    /// own span from config (1 000 + 650 + 1 000 ms) and the bound before it is above the budget.
     #[test]
     fn the_av_gate_cut_is_the_settle_and_its_bound_sits_above_the_budget() {
-        assert_eq!(PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS, 1_650);
+        assert_eq!(
+            Thresholds::default().resume_after_ms + PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS,
+            2_650
+        );
         const _: () = assert!(BUDGET_AV_OFFSET_EXCLUDED_MS > BUDGET_AV_OFFSET_MS);
         assert_eq!(BUDGET_AV_OFFSET_EXCLUDED_MS, 72, "main's pre-C4 max");
     }
