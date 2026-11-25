@@ -17,8 +17,9 @@
 # the camera off for resume_after_ms, less what the programme's pipeline holds between the input and
 # the frame on air (at most BUDGET_FRAME_TO_ENCODER_MS: the hold-off starts at the first frame's
 # arrival, and the frame shown at the switch is that much older than the newest; CI's 900 ms flaps),
-# and returns within BUDGET_RETURN_TO_LIVE_MS. Mutant 1 (resume_after_ms 0 in a scratch build) reds
-# `flap_hysteresis`.
+# and less C4's playout (`playout_target_ms`: the camera's picture airs that long behind its arrival,
+# so the frame shown at the switch is older again; 900 ms flaps read about 750), and returns within
+# BUDGET_RETURN_TO_LIVE_MS. Mutant 1 (resume_after_ms 0 in a scratch build) reds `flap_hysteresis`.
 
 CASE_LIVE_S=125
 CASE_KEY=flap_hysteresis
@@ -49,8 +50,10 @@ case_verdict() {
     '{pauses: (mark("pause") | length), pause_ms: mark_value("pause").pause_ms, resumes: (.camera.resumes | length),
       judged: ([.camera.resumes[] | select(.suppressed_ms != null)] | length)}'
   require flap_hysteresis '(.camera.resumes | length) >= 1 and ([.camera.resumes[] | .suppressed_ms]
-    | all(. != null and . >= ($t.resume_after_ms - $t.budget_frame_to_encoder_ms) and . <= $t.budget_return_to_live_ms))' \
-    '[.camera.resumes[] | .suppressed_ms] | {min: min, max: max, floor: ($t.resume_after_ms - $t.budget_frame_to_encoder_ms), budget: $t.budget_return_to_live_ms}'
+    | all(. != null and . >= ($t.resume_after_ms - $t.budget_frame_to_encoder_ms - $t.playout_target_ms)
+      and . <= $t.budget_return_to_live_ms))' \
+    '[.camera.resumes[] | .suppressed_ms] | {min: min, max: max,
+      floor: ($t.resume_after_ms - $t.budget_frame_to_encoder_ms - $t.playout_target_ms), budget: $t.budget_return_to_live_ms}'
   require no_output_outages '.output_outages == []' '.output_outages | length'
   require counter_regressions '.camera.counter_regressions == 0'
   require_no_false_restart

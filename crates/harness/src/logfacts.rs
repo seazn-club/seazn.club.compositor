@@ -21,6 +21,10 @@
 //! - `adapters::gst_output`: `output gen=<g> error: <text>` (a sink's bus error);
 //! - `app::driver` (C2 S4, C3 S2): `input give up gen=<g> reason=<r>` (each camera generation given
 //!   up) and `input take back gen=<g>` (a given-up generation taken back, C3's camera-gop-loss case);
+//! - `app::driver` (C4, Owed 89): the camera playout's beat, `camera frames replaced beat=<n>
+//!   total=<n> repeat_ticks=<n> repeat_ticks_total=<n>` and the `input received …` line's tail
+//!   ` audio_pad_bytes=<n> audio_overflow_bytes=<n> audio_late_bytes=<n> reanchors=<n>` (each a
+//!   beat's rise; C4's camera-burst case);
 //! - `app::driver` (Owed 86, the honest beat): `output fps beat=<fps> floor=<floor>` each beat, and
 //!   the starvation alarm's `output starvation alarm raised fps=<fps> floor=<floor>` and
 //!   `output starvation alarm cleared fps=<fps> recovered=<level>` (C14 case 6);
@@ -268,6 +272,29 @@ pub struct Killed {
     pub status: i64,
 }
 
+/// `camera frames replaced beat=<n> total=<n> repeat_ticks=<n> repeat_ticks_total=<n>` (C4): a
+/// beat's camera frames that left the playout unaired and its ticks that repeated a frame on air,
+/// each with its session total. A line without the repeat tail (no playout totals yet) is not one.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct CameraRepeatLine {
+    pub at_ms: i64,
+    pub replaced: u64,
+    pub replaced_total: u64,
+    pub repeat_ticks: u64,
+    pub repeat_ticks_total: u64,
+}
+
+/// The `input received …` line's playout tail (C4): a beat's rise of the camera audio's filler,
+/// overflowed and late bytes, and of the playout clock's re-anchors.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PlayoutLine {
+    pub at_ms: i64,
+    pub audio_pad_bytes: u64,
+    pub audio_overflow_bytes: u64,
+    pub audio_late_bytes: u64,
+    pub reanchors: u64,
+}
+
 /// The log's facts, in log order. (`PartialEq` only: the honest beat's rates are `f64`.)
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct LogFacts {
@@ -335,6 +362,9 @@ pub struct LogFacts {
     pub sink_stall_armed: Vec<SinkStallArmed>,
     /// Owed 94's plant (case 18's fault).
     pub sink_stall_planted: Vec<SinkStallPlanted>,
+    /// C4's camera lines, each beat's (camera-burst).
+    pub camera_repeats: Vec<CameraRepeatLine>,
+    pub camera_playout: Vec<PlayoutLine>,
     /// Chromium's abort line (`GPU process isn't usable`).
     pub gpu_unusable: Vec<i64>,
     pub exits: Vec<Exit>,
@@ -471,6 +501,55 @@ fn fps_line(msg: &str, prefix: &str, sep: &str, at_ms: i64) -> Option<FpsLine> {
         at_ms,
         fps: decimal(fps)?,
         level: decimal(level)?,
+    })
+}
+
+/// `k1=<n> k2=<n> …`, exactly these keys in this order, each a number.
+fn keyed(s: &str, keys: &[&str]) -> Option<Vec<u64>> {
+    let tokens: Vec<&str> = s.split(' ').collect();
+    if tokens.len() != keys.len() {
+        return None;
+    }
+    tokens
+        .iter()
+        .zip(keys)
+        .map(|(t, k)| num(t.strip_prefix(*k)?.strip_prefix('=')?))
+        .collect()
+}
+
+/// `camera frames replaced beat=<n> total=<n> repeat_ticks=<n> repeat_ticks_total=<n>`, the whole
+/// message (C4).
+fn camera_repeat(msg: &str, at_ms: i64) -> Option<CameraRepeatLine> {
+    let rest = msg.strip_prefix("camera frames replaced ")?;
+    let v = keyed(rest, &["beat", "total", "repeat_ticks", "repeat_ticks_total"])?;
+    Some(CameraRepeatLine {
+        at_ms,
+        replaced: v[0],
+        replaced_total: v[1],
+        repeat_ticks: v[2],
+        repeat_ticks_total: v[3],
+    })
+}
+
+/// The `input received …` line's playout tail (C4), its last four tokens.
+fn playout_tail(msg: &str, at_ms: i64) -> Option<PlayoutLine> {
+    let rest = msg.strip_prefix("input received fps=")?;
+    let (_, tail) = rest.split_once(" audio_pad_bytes=")?;
+    let v = keyed(
+        &format!("audio_pad_bytes={tail}"),
+        &[
+            "audio_pad_bytes",
+            "audio_overflow_bytes",
+            "audio_late_bytes",
+            "reanchors",
+        ],
+    )?;
+    Some(PlayoutLine {
+        at_ms,
+        audio_pad_bytes: v[0],
+        audio_overflow_bytes: v[1],
+        audio_late_bytes: v[2],
+        reanchors: v[3],
     })
 }
 
@@ -671,6 +750,10 @@ pub fn log_facts(text: &str) -> LogFacts {
             f.output_errors.push(ga(g));
         } else if let Some(g) = sink_publish(m) {
             f.sink_publishes.push(ga(g));
+        } else if let Some(c) = camera_repeat(m, at_ms) {
+            f.camera_repeats.push(c);
+        } else if let Some(p) = playout_tail(m, at_ms) {
+            f.camera_playout.push(p);
         } else if let Some(b) = fps_line(m, "output fps beat=", " floor=", at_ms) {
             f.output_fps.push(b);
         } else if let Some(r) = fps_line(m, "output starvation alarm raised fps=", " floor=", at_ms) {
@@ -1571,6 +1654,89 @@ mod tests {
             f.input_give_ups.len() + f.input_take_backs.len()
         );
         assert_eq!(pinned, 2);
+    }
+
+    /// C4 (Owed 89): the camera playout's beat lines, with near misses that are not one, and their
+    /// producers in the driver pinned, so a reworded line reds here, not on CI.
+    #[test]
+    fn the_camera_playout_lines_are_read_with_their_counts() {
+        let mut log = String::new();
+        let lines = [
+            (2_000, "camera frames replaced beat=3 total=3 repeat_ticks=4 repeat_ticks_total=4"),
+            (
+                2_000,
+                "input received fps=29.9 kbps=3500 withheld_spans=0 queue_overruns=0 audio_pad_bytes=25600 audio_overflow_bytes=0 audio_late_bytes=12800 reanchors=0",
+            ),
+            (7_000, "camera frames replaced beat=0 total=3 repeat_ticks=0 repeat_ticks_total=4"),
+            (
+                7_000,
+                "input received fps=- kbps=- audio_pad_bytes=0 audio_overflow_bytes=96 audio_late_bytes=0 reanchors=1",
+            ),
+            // Near misses: none is one of these facts.
+            (8_000, "camera frames replaced beat=3 total=3"),
+            (8_100, "camera frames replaced beat=3 total=3 repeat_ticks=x repeat_ticks_total=4"),
+            (8_200, "camera frames replaced beat=3 total=3 repeat_ticks=4"),
+            (8_300, "camera frames replaced beat=3 total=3 repeat_ticks=4 repeat_ticks_total=4 extra=1"),
+            (8_400, "camera frames replaced beat=+3 total=3 repeat_ticks=4 repeat_ticks_total=4"),
+            (8_500, "input received fps=29.9 kbps=3500"),
+            (8_600, "input received fps=29.9 kbps=3500 withheld_spans=0 queue_overruns=0"),
+            (8_700, "input received fps=- kbps=- audio_pad_bytes=0 audio_overflow_bytes=-1 audio_late_bytes=0 reanchors=0"),
+            (8_800, "input received fps=- kbps=- audio_pad_bytes=0 audio_overflow_bytes=0 audio_late_bytes=0"),
+            (8_900, "input received fps=- kbps=- audio_overflow_bytes=0 audio_pad_bytes=0 audio_late_bytes=0 reanchors=0"),
+            (9_000, "gen=1: page console: camera frames replaced beat=3 total=3 repeat_ticks=4 repeat_ticks_total=4"),
+        ];
+        for (at, m) in lines {
+            log.push_str(&line(at, m));
+        }
+        let f = log_facts(&log);
+        assert_eq!(
+            f.camera_repeats
+                .iter()
+                .map(|l| (
+                    l.at_ms - NOON_MS,
+                    l.replaced,
+                    l.replaced_total,
+                    l.repeat_ticks,
+                    l.repeat_ticks_total
+                ))
+                .collect::<Vec<_>>(),
+            vec![(2_000, 3, 3, 4, 4), (7_000, 0, 3, 0, 4)]
+        );
+        assert_eq!(
+            f.camera_playout
+                .iter()
+                .map(|l| (
+                    l.at_ms - NOON_MS,
+                    l.audio_pad_bytes,
+                    l.audio_overflow_bytes,
+                    l.audio_late_bytes,
+                    l.reanchors
+                ))
+                .collect::<Vec<_>>(),
+            vec![(2_000, 25_600, 0, 12_800, 0), (7_000, 0, 96, 0, 1)]
+        );
+        let driver = std::fs::read_to_string(format!("{}/../app/src/driver.rs", env!("CARGO_MANIFEST_DIR")))
+            .expect("driver.rs");
+        let mut pinned = 0;
+        for producer in [
+            "format!(\"camera frames replaced beat={beat} total={total}\")",
+            "\" repeat_ticks={} repeat_ticks_total={}\",",
+            "\"input received fps={} kbps={}\",",
+            "\" audio_pad_bytes={} audio_overflow_bytes={} audio_late_bytes={} reanchors={}\",",
+        ] {
+            assert_eq!(
+                driver.matches(producer).count(),
+                1,
+                "the line changed: {producer}"
+            );
+            pinned += 1;
+        }
+        eprintln!(
+            "camera playout lines checked: {}, facts read: {}, producers pinned: {pinned}",
+            lines.len(),
+            f.camera_repeats.len() + f.camera_playout.len()
+        );
+        assert_eq!(pinned, 4);
     }
 
     #[test]

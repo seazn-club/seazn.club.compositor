@@ -12,7 +12,7 @@
 use domain::config::{
     OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN,
     FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
-    TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
+    PLAYOUT_TARGET_MS, TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
 };
 use serde_json::{json, Map, Value};
 
@@ -219,6 +219,9 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("tick_widest_ms", json!(TICK_WIDEST_MS));
     put("chromium_gpu_deaths_abort", json!(CHROMIUM_GPU_DEATHS_ABORT));
     put("frame_period_ms", json!(OutputProfile::P720.frame_period_ms()));
+    // C4's playout: the camera's picture airs this long behind its arrival, so a hold-off read in
+    // camera time (camera-flap's `suppressed_ms`) is this much shorter than the wall's.
+    put("playout_target_ms", json!(PLAYOUT_TARGET_MS));
     // Owed 86's starvation alarm, for the same profile: raised by a beat below the floor, cleared by
     // one at or above the recovered level (case 6, the honest beat).
     put("output_fps_floor", json!(OutputProfile::P720.fps_floor()));
@@ -319,7 +322,7 @@ mod tests {
             reaper_kill_after_ms: 4,
             teardown_leak_after_ms: 5,
         });
-        let pairs: [(&str, u64); 10] = [
+        let pairs: [(&str, u64); 11] = [
             ("slate_after_ms", t.slate_after_ms),
             ("resume_after_ms", t.resume_after_ms),
             ("output_connect_timeout_ms", t.output_connect_timeout_ms),
@@ -330,6 +333,7 @@ mod tests {
             ("cef_hang_after_ms", t.cef_hang_after_ms),
             ("heartbeat_interval_ms", t.heartbeat_interval_ms),
             ("cef_gpu_deaths_to_restart", t.cef_gpu_deaths_to_restart as u64),
+            ("playout_target_ms", PLAYOUT_TARGET_MS),
         ];
         for (k, want) in pairs {
             assert_eq!(v[k].as_u64(), Some(want), "{k}");

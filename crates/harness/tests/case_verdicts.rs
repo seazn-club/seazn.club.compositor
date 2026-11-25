@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use domain::config::PLAYOUT_TARGET_MS;
 use harness::audio::AudioFacts;
 use harness::checker::{analyze, FrameRec, Inputs, SegmentScan, Settings};
 use harness::inputs::{crash_times, Beat, Emit, Timeline};
@@ -83,6 +84,10 @@ struct World {
     end: i64,
     slate_after_ms: f64,
     resume_after_ms: f64,
+    /// C4's playout: the picture shown is the newest frame this long before the tick, while the
+    /// slate and its return read arrivals at the tick (the domain's `InputFrame`s at decode time).
+    /// 0 is the newest-frame slot before C4.
+    playout_ms: f64,
     /// The camera emits nothing (fake-camera's /pause).
     camera_gaps: Vec<(i64, i64)>,
     /// The camera emits, but the compositor receives nothing (a kicked reader).
@@ -147,6 +152,7 @@ impl World {
         let mut w = Self {
             slate_after_ms: t["slate_after_ms"].as_f64().unwrap(),
             resume_after_ms: t["resume_after_ms"].as_f64().unwrap(),
+            playout_ms: 0.0,
             t,
             live,
             drive,
@@ -383,6 +389,7 @@ impl World {
             c += 1;
         }
         let newest = |p: f64| received.iter().rev().find(|(w, _)| *w <= p).copied();
+        let shown = |p: f64| newest(p - self.playout_ms).map(|n| n.1);
         let mut segments: Vec<SegmentScan> = Vec::new();
         let mut open: Option<SegmentScan> = None;
         let mut first_wall = 0.0;
@@ -408,17 +415,17 @@ impl World {
                     match back {
                         Some((bw, _)) if bw + self.resume_after_ms <= p => {
                             slated = None;
-                            newest(p).map(|n| n.1)
+                            shown(p)
                         }
                         _ => None,
                     }
                 }
-                (None, Some((nw, nc))) => {
+                (None, Some((nw, _))) => {
                     if p - nw > self.slate_after_ms {
                         slated = Some(nw);
                         None
                     } else {
-                        Some(nc)
+                        shown(p)
                     }
                 }
                 (None, None) => None,
@@ -767,6 +774,17 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
     assert_pass(
         &judge(&camera_flap(), "camera-flap", "", "flap-good"),
         "flap-good",
+    );
+    // C4: with the playout, the frame shown at each return is `playout_target_ms` older, so each
+    // hold-off reads that much shorter in camera time; still a pass, and still red without the hold.
+    let mut w = camera_flap();
+    w.playout_ms = w.ms("playout_target_ms") as f64;
+    assert_pass(&judge(&w, "camera-flap", "", "flap-playout"), "flap-playout");
+    w.resume_after_ms = 0.0;
+    assert_fails(
+        &judge(&w, "camera-flap", "", "flap-playout-nohold"),
+        "flap_hysteresis",
+        "flap-playout-nohold",
     );
     // Mutant 1: resume_after_ms 0.
     let mut w = camera_flap();
@@ -6732,13 +6750,100 @@ fn the_blank_page_sweep_reds_a_false_reload_and_an_unpainted_page_on_both_paths(
 }
 
 /// The case files that are not chaos cases, each run from harness.yml: C13's smoke case (the
-/// harness's own end-to-end run), Owed 81's two probe controls (F-029), and R4 SC1's sponsor-airings
-/// case. The same list is in chaos_table.rs.
-const NOT_CHAOS: [&str; 4] = ["smoke", "owed81-noaudio", "owed81-align1", "sponsor-airings"];
+/// harness's own end-to-end run), Owed 81's two probe controls (F-029), R4 SC1's sponsor-airings
+/// case and C4's camera-burst case. The same list is in chaos_table.rs.
+const NOT_CHAOS: [&str; 5] = [
+    "smoke",
+    "owed81-noaudio",
+    "owed81-align1",
+    "sponsor-airings",
+    "camera-burst",
+];
 
-/// The NOT_CHAOS cases that are runs of their own, not one of smoke's controls (harness.yml runs both
-/// on every pull request).
-const NOT_CHAOS_RUNS: [&str; 2] = ["smoke", "sponsor-airings"];
+/// The NOT_CHAOS cases that are runs of their own, not one of smoke's controls (harness.yml runs
+/// each on every pull request).
+const NOT_CHAOS_RUNS: [&str; 3] = ["smoke", "sponsor-airings", "camera-burst"];
+
+/// C4 (S1, Owed 89): camera-burst's run. The fake camera, 30 fps, holds its frames 300 ms every
+/// 10 s from 10 s (the drive's marks). The playout absorbs its target of each hold, so the programme
+/// freezes for the rest, `freeze_ms` (the hold less `PLAYOUT_TARGET_MS` when the product works,
+/// the whole hold for the newest-frame slot C4 replaced), simulated as the camera sending nothing for
+/// that long at the hold's end. Each beat logs the camera's lines, no audio overflow. `edit` changes
+/// the world before it is judged.
+fn camera_burst(freeze_ms: i64, edit: impl Fn(&mut World)) -> World {
+    let hold = 300;
+    let mut w = World::new(60);
+    for s in [10.0, 20.0, 30.0, 40.0, 50.0] {
+        let h = w.at(s);
+        w.mark("burst", h, json!({"ms": hold}));
+        w.camera_gaps.push((h + hold - freeze_ms, h + hold));
+    }
+    let hb = w.ms("heartbeat_interval_ms");
+    let mut at = w.live + hb;
+    while at <= w.end {
+        w.line(
+            at,
+            "camera frames replaced beat=0 total=0 repeat_ticks=0 repeat_ticks_total=0",
+        );
+        w.line(
+            at,
+            "input received fps=30.0 kbps=3500 withheld_spans=0 queue_overruns=0 audio_pad_bytes=0 \
+             audio_overflow_bytes=0 audio_late_bytes=0 reanchors=0",
+        );
+        at += hb;
+    }
+    edit(&mut w);
+    w
+}
+
+/// camera-burst passes with the playout's freeze (the hold less the target), and each judged check
+/// reds on a world that breaks it: the newest-frame slot's freeze (the whole hold: C4's mutant, over
+/// 2 % of the pairs), an overflowed audio ring, no playout lines, and no hold asked.
+#[test]
+fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
+    let freeze = 300 - PLAYOUT_TARGET_MS as i64;
+    let good = judge(&camera_burst(freeze, |_| {}), "camera-burst", "", "burst-good");
+    assert_pass(&good, "burst-good");
+    let mut checked = 0;
+    let overflow = |w: &mut World| {
+        let at = w.at(31.0);
+        w.line(
+            at,
+            "input received fps=30.0 kbps=3500 audio_pad_bytes=0 audio_overflow_bytes=6400 \
+             audio_late_bytes=0 reanchors=0",
+        );
+    };
+    let reds: [(&str, World, &str); 4] = [
+        (
+            "burst-newest",
+            camera_burst(300, |_| {}),
+            "repeat_ticks_under_2pct",
+        ),
+        (
+            "burst-overflow",
+            camera_burst(freeze, overflow),
+            "no_audio_overflow",
+        ),
+        (
+            "burst-nolines",
+            camera_burst(freeze, |w| {
+                w.log.retain(|(_, l)| !l.starts_with("input received"))
+            }),
+            "playout_lines",
+        ),
+        (
+            "burst-nomarks",
+            camera_burst(freeze, |w| w.marks.retain(|(n, _, _)| n != "burst")),
+            "bursts_applied",
+        ),
+    ];
+    for (tag, w, check) in &reds {
+        assert_fails(&judge(w, "camera-burst", "", tag), check, tag);
+        checked += 1;
+    }
+    eprintln!("camera-burst reds checked: {checked}");
+    assert_eq!(checked, reds.len());
+}
 
 /// Every case file in harness/cases has a test here: a new case cannot ship unjudged.
 #[test]
