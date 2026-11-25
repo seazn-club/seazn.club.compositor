@@ -370,6 +370,25 @@ pub const PLAYOUT_MAX_FRAMES: usize = (PLAYOUT_CAP_MS * CAMERA_MAX_FPS / 1_000 +
 /// picture. The same slack joins two audio chunks whose stamps differ by rounding.
 pub const PLAYOUT_AUDIO_SLACK_MS: Ms = 1;
 
+/// C4 fix round 1 (the review's C1 and I1): the most the camera's audio stamps may sit from its
+/// video's before the audio is re-based onto the video's (its stamps shifted by the difference,
+/// counted as a re-anchor). The clock anchors on the later-arriving of the two streams,
+/// `PLAYOUT_TARGET_MS` behind it, so the other waits the target plus the skew: past `PLAYOUT_CAP_MS`
+/// less the target it would wait past the cap its queue holds. PR #113's camera-flap leg (CI run
+/// 45575918709) showed the two disagreeing by about 5 s after a camera pause in one generation (one
+/// stream's stamps carried on across the pause while the other's jumped), which a shared stamp space
+/// turned into a queue restart on every other push.
+pub const PLAYOUT_STREAM_SKEW_MAX_MS: Ms = PLAYOUT_CAP_MS - PLAYOUT_TARGET_MS;
+
+/// C4 fix round 1 (the review's C2): a stream whose every arrival is past due for this long
+/// re-anchors the clock (counted). A camera that falls behind the clock by less than the cap (a
+/// delivery-delay step with no catch-up, a camera clock slower than the tick grid, audio reaching the
+/// store after its video) otherwise has every audio chunk dropped late for as long as it stays there,
+/// with nothing to recover it. The target: lateness that outlasts the margin the queue keeps is not
+/// jitter the margin absorbs. A hold is not lateness: no arrival is judged until the release, whose
+/// newest frame is on time.
+pub const PLAYOUT_LATE_REANCHOR_MS: Ms = PLAYOUT_TARGET_MS;
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -1264,6 +1283,10 @@ mod tests {
         assert_eq!(CAMERA_MAX_FPS, 60);
         assert_eq!(PLAYOUT_MAX_FRAMES, 31, "500 ms of 60 fps, both ends");
         assert_eq!(PLAYOUT_AUDIO_SLACK_MS, 1);
+        // Fix round 1: the skew past which the audio is re-based (the cap less the target: 350 ms) and
+        // the lateness that re-anchors (the target).
+        assert_eq!(PLAYOUT_STREAM_SKEW_MAX_MS, 350);
+        assert_eq!(PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_TARGET_MS);
         // Constant against constant: the compiler checks it. The target sits inside the cap with room
         // for a burst, and the slack is far under the target.
         const _: () =
@@ -1271,15 +1294,36 @@ mod tests {
     }
 
     // C4 (S1): the phase machine still reads decode time (the brief: `InputFrame` drives it), so the
-    // queue must be able to air a frame by the time the domain says Live: Live waits for
-    // `resume_after_ms` of continuous frames, and the first of them is due a target (and one tick)
-    // after the clock anchors on it. The queue drains in a target, inside the freeze, and its cap is
-    // under the slate, so a held camera is frozen by the domain before the queue could hold it back.
+    // queue must be able to air a frame by the time the domain says Live from Waiting or
+    // Reconnecting: those wait for `resume_after_ms` of continuous frames, and the first of them is
+    // due a target (and one tick) after the clock anchors on it. From Frozen it does not wait (the
+    // C4 review's m4): the first fresh frame after a freeze puts the domain Live, while the playout
+    // re-anchors after the gap and holds the new frame a target, so the frozen frame stays on air
+    // under Emit for those ticks, counted as repeats (never a missing camera: it is the frame on
+    // air). The queue drains in a target, inside the freeze, and its cap is under the slate, so a
+    // held camera is frozen by the domain before the queue could hold it back.
     #[test]
     fn the_playout_airs_a_frame_before_the_domain_goes_live() {
+        use crate::programme::{Feed, ProgrammePhase, PROGRAMME_TABLE};
         let t = Thresholds::default();
         assert!(PLAYOUT_TARGET_MS + TICK_WIDEST_MS < t.resume_after_ms);
         assert!(PLAYOUT_TARGET_MS < t.frozen_after_ms);
         assert!(PLAYOUT_CAP_MS < t.slate_after_ms);
+        // The paths into Live this rests on: Waiting and Reconnecting need the continuous run;
+        // Frozen takes a fresh frame (the repeats above, not a missing camera).
+        let into_live: Vec<_> = PROGRAMME_TABLE
+            .iter()
+            .filter(|r| r.2 == ProgrammePhase::Live)
+            .map(|r| (r.0, r.1))
+            .collect();
+        assert_eq!(
+            into_live,
+            [
+                (ProgrammePhase::Waiting, Feed::Continuous),
+                (ProgrammePhase::Frozen, Feed::Fresh),
+                (ProgrammePhase::Frozen, Feed::Continuous),
+                (ProgrammePhase::Reconnecting, Feed::Continuous),
+            ]
+        );
     }
 }

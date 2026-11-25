@@ -16,12 +16,27 @@
 //! period, the noise filler where none arrived, and audio that arrives after its period has played is
 //! dropped (late).
 //!
-//! **Re-anchoring** (the numbers are `domain::config`'s): a new camera generation starts a fresh clock
-//! and drops what the old one queued (never carried across); the first arrival after a gap longer than
-//! `PLAYOUT_REANCHOR_GAP_MS` re-anchors, and so does an arrival more than `PLAYOUT_CAP_MS` ahead of the
-//! clock or behind it (the camera's clock drifting against the tick grid, or a jump in its PTS). A
-//! tick whose time is earlier than the anchor's (a second programme on the same store) starts a fresh
-//! clock too.
+//! **Two streams.** The video and the audio are judged apart: their stamps can disagree (PR #113's
+//! camera-flap leg showed one stream's stamps carry on across a camera pause while the other's
+//! jumped, by the pause). Each keeps its own newest stamp. The audio is placed on the video's stamps:
+//! while the video is fresh (it arrived since the last tick, or at it), a chunk more than
+//! `PLAYOUT_STREAM_SKEW_MAX_MS` from the newest frame's stamp re-bases the audio onto it (the queued
+//! audio and every later chunk move by the difference; counted as a re-anchor). Within that skew the
+//! stamps are kept, so the audio stays in step with the picture.
+//!
+//! **Re-anchoring** (the numbers are `domain::config`'s): the clock anchors the target behind the
+//! newest stamp of the later-arriving live stream (the lower of the two), so each keeps the whole
+//! target. A new camera generation starts a fresh clock and drops what the old one queued (never
+//! carried across). Counted re-anchors: the first arrival after a gap longer than
+//! `PLAYOUT_REANCHOR_GAP_MS`; every live stream more than `PLAYOUT_CAP_MS` ahead of the clock (the
+//! camera's clock drifting against the tick grid, or a jump forward in its stamps); an arrival more
+//! than the cap behind it; a stream whose arrivals have all been past due for
+//! `PLAYOUT_LATE_REANCHOR_MS` (a delivery-delay step with no catch-up, a slow camera clock: without
+//! it every audio chunk would drop late for as long as the camera stayed behind). A stream the clock
+//! had not taken into account that arrives short of the target anchors it again, uncounted (it
+//! completes the first anchor). A jump back past the cap within one stream drops that stream's
+//! queue. A tick whose time is earlier than the anchor's (a second programme on the same store)
+//! starts a fresh clock too.
 //!
 //! **Bounds.** The queue's stamped frames span at most `PLAYOUT_CAP_MS` and number at most
 //! `PLAYOUT_MAX_FRAMES`, and the audio ring holds at most `AUDIO_RING_BYTES`: past either, the oldest
@@ -37,12 +52,14 @@
 //! a ring whose oldest chunk is unstamped is played first in, first out.
 //!
 //! **Counts** ([`Counts`]) are raw: the programme hands each tick's to `Stats::on_camera_tick`, which
-//! keeps them only while the camera is on air (PR #60's slate rule).
+//! keeps them only while the camera is on air (PR #60's slate rule). The filler is counted only once
+//! audio has arrived in the generation: a camera with no audio track has none to pad.
 use std::collections::VecDeque;
 use std::fmt;
 
 use domain::config::{
-    PLAYOUT_AUDIO_SLACK_MS, PLAYOUT_CAP_MS, PLAYOUT_MAX_FRAMES, PLAYOUT_REANCHOR_GAP_MS, PLAYOUT_TARGET_MS,
+    PLAYOUT_AUDIO_SLACK_MS, PLAYOUT_CAP_MS, PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_MAX_FRAMES,
+    PLAYOUT_REANCHOR_GAP_MS, PLAYOUT_STREAM_SKEW_MAX_MS, PLAYOUT_TARGET_MS,
 };
 
 use crate::frame_store::{AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
@@ -94,7 +111,7 @@ struct Frame<V> {
 
 /// Audio as pushed: whole S16LE stereo frames, `off` bytes of it already played or dropped.
 struct Chunk {
-    /// The sample index of `data[0]`; `None`: unstamped.
+    /// The sample index of `data[0]`, re-based onto the video's stamps; `None`: unstamped.
     start: Option<i128>,
     data: Vec<u8>,
     off: usize,
@@ -124,8 +141,9 @@ pub struct Counts {
     pub unaired: u64,
     /// 1 when the tick aired no new frame and kept the last one on air.
     pub repeated: u64,
-    /// The clock re-anchored after a gap or on drift past the cap (a first anchor and a new
-    /// generation's are not counted).
+    /// The clock re-anchored (after a gap, past the cap either way, after a stream ran late for
+    /// `PLAYOUT_LATE_REANCHOR_MS`), or the audio was re-based onto the video's stamps. A first anchor,
+    /// a stream joining it, and a new generation's are not counted.
     pub reanchors: u64,
     /// Noise in place of audio the clock had due and the ring did not hold.
     pub audio_pad_bytes: u64,
@@ -168,6 +186,52 @@ pub struct AudioTake {
     pub counts: Counts,
 }
 
+/// What a tick's arrivals do to the clock (`Playout::judge`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Judged {
+    Keep,
+    /// A stream the clock had not taken into account arrived short of the target: anchor again,
+    /// uncounted (it completes the first anchor).
+    Join,
+    /// A rule fired: anchor again, counted.
+    Reanchor,
+}
+
+/// One stream's arrivals (the video's or the audio's), for the clock's rules.
+#[derive(Debug, Clone, Copy, Default)]
+struct Stream {
+    /// The newest media time pushed since the stream's last jump back (the audio's re-based).
+    newest: Option<i128>,
+    /// The newest pushed since the last tick.
+    since: Option<i128>,
+    /// The programme time of the last tick that saw an arrival of it.
+    last_at: Option<i128>,
+    /// The tick its current run of past-due arrivals started at.
+    late_since: Option<i128>,
+    /// The clock has taken it into account: it was live at the anchor, or has arrived since.
+    anchored: bool,
+}
+
+impl Stream {
+    fn arrive(&mut self, t: i128) {
+        self.newest = Some(self.newest.map_or(t, |n| n.max(t)));
+        self.since = Some(self.since.map_or(t, |n| n.max(t)));
+    }
+
+    /// It arrived within the gap before `at`.
+    fn live(&self, at: i128) -> bool {
+        self.last_at
+            .is_some_and(|l| at - l <= ms_ns(PLAYOUT_REANCHOR_GAP_MS))
+    }
+
+    /// Its stamps start again (a jump back past the cap, or a re-base).
+    fn rebased(&mut self) {
+        self.newest = None;
+        self.since = None;
+        self.late_since = None;
+    }
+}
+
 /// The camera's playout queue and clock; `V` is a decoded frame (`gst::Sample` live).
 pub struct Playout<V> {
     /// The camera generation whose media is queued; `None` before the first stamped push.
@@ -184,12 +248,18 @@ pub struct Playout<V> {
     clock: Option<Clock>,
     /// The next audio sample to play, once the paced audio has played.
     cursor: Option<i128>,
-    /// The newest media time pushed since the last tick (video PTS or audio chunk start).
-    newest_since: Option<i128>,
-    /// The programme time of the last tick that saw an arrival.
+    /// The video's arrivals and the audio's, apart: their stamps can disagree (a pause one stream's
+    /// stamps carry on across), and each is judged against the clock on its own.
+    video_s: Stream,
+    audio_s: Stream,
+    /// The programme time of the last tick that saw an arrival of either stream.
     last_arrival_at: Option<i128>,
-    /// The newest media time pushed in this generation (a jump back past the cap restarts the queue).
-    newest_pts: Option<i128>,
+    /// The programme time of the last tick.
+    last_tick: Option<i128>,
+    /// Samples added to the audio's stamps to put them on the video's (a re-base moves it).
+    audio_offset: i128,
+    /// Stamped audio has arrived in this generation (before it, the filler is not counted).
+    audio_seen: bool,
     /// What the pushes since the last tick dropped (handed on with the next tick's counts).
     pending: Counts,
 }
@@ -206,9 +276,12 @@ impl<V> Default for Playout<V> {
             audio_bytes: 0,
             clock: None,
             cursor: None,
-            newest_since: None,
+            video_s: Stream::default(),
+            audio_s: Stream::default(),
             last_arrival_at: None,
-            newest_pts: None,
+            last_tick: None,
+            audio_offset: 0,
+            audio_seen: false,
             pending: Counts::default(),
         }
     }
@@ -243,7 +316,14 @@ impl<V: Clone> Playout<V> {
             self.video.push_back(Frame { pts: None, v });
             return;
         };
-        self.discontinuity(t);
+        // A jump back past the cap within the video: the queue would hold the new frames behind the
+        // old ones (and the span bound would drop the new), so the old go, counted. The clock's own
+        // rules re-anchor at the next tick (the frame is more than the cap behind it).
+        if self.video_s.newest.is_some_and(|n| t < n - ms_ns(PLAYOUT_CAP_MS)) {
+            self.pending.unaired += self.video.len() as u64;
+            self.video.clear();
+            self.video_s.rebased();
+        }
         // PTS order (a decoder hands frames out in it; an out-of-order one is placed, not appended).
         // Unstamped frames stay in front: they are due at once.
         let at = self
@@ -252,7 +332,7 @@ impl<V: Clone> Playout<V> {
             .rposition(|f| f.pts.is_none_or(|p| p <= t))
             .map_or(0, |i| i + 1);
         self.video.insert(at, Frame { pts: Some(t), v });
-        self.arrival(t);
+        self.video_s.arrive(t);
         while self.video.len() > PLAYOUT_MAX_FRAMES || self.stamped_span() > ms_ns(PLAYOUT_CAP_MS) {
             self.video.pop_front();
             self.pending.unaired += 1;
@@ -266,19 +346,17 @@ impl<V: Clone> Playout<V> {
         if bytes.is_empty() {
             return;
         }
-        if let Some(t) = pts {
-            self.discontinuity(i128::from(t));
-        }
-        let start = pts.map(|t| sample_at(i128::from(t)));
+        let start = pts.map(|t| self.place_audio(sample_at(i128::from(t))));
         // Two chunks whose stamps differ by rounding are one stream: the later starts where the
         // earlier ends.
         let start = match (start, self.audio.back().and_then(Chunk::end)) {
             (Some(s), Some(e)) if (s - e).abs() <= sample_at(ms_ns(PLAYOUT_AUDIO_SLACK_MS)) => Some(e),
             (s, _) => s,
         };
-        if let Some(t) = pts {
-            self.arrival(i128::from(t));
+        if let Some(s) = start {
+            self.audio_s.arrive(sample_ns(s));
         }
+        self.audio_seen = true;
         self.audio.push_back(Chunk {
             start,
             data: bytes.to_vec(),
@@ -300,22 +378,34 @@ impl<V: Clone> Playout<V> {
             self.clock = None;
             self.cursor = None;
             self.last_arrival_at = None;
+            for s in [&mut self.video_s, &mut self.audio_s] {
+                s.last_at = None;
+                s.late_since = None;
+                s.anchored = false;
+            }
         }
-        if let Some(newest) = self.newest_since.take() {
+        self.last_tick = Some(at);
+        let arrived = [self.video_s.since.take(), self.audio_s.since.take()];
+        if arrived.iter().any(Option::is_some) {
             let gap = self
                 .last_arrival_at
                 .is_some_and(|t| at - t > ms_ns(PLAYOUT_REANCHOR_GAP_MS));
             self.last_arrival_at = Some(at);
+            for (s, a) in [&mut self.video_s, &mut self.audio_s].into_iter().zip(arrived) {
+                if a.is_some() {
+                    s.last_at = Some(at);
+                }
+            }
             match self.clock {
-                None => self.anchor(at, newest),
-                Some(c) => {
-                    let lead = newest - c.due(at);
-                    let cap = ms_ns(PLAYOUT_CAP_MS);
-                    if gap || lead > cap || lead < -cap {
-                        self.anchor(at, newest);
+                None => self.anchor(at),
+                Some(c) => match self.judge(c.due(at), at, arrived, gap) {
+                    Judged::Keep => {}
+                    Judged::Join => self.anchor(at),
+                    Judged::Reanchor => {
+                        self.anchor(at);
                         counts.reanchors += 1;
                     }
-                }
+                },
             }
         }
         let due = self.clock.map(|c| c.due(at));
@@ -350,6 +440,16 @@ impl<V: Clone> Playout<V> {
     /// due then, with `pad` writing the filler wherever the ring has none. Unstamped audio (or none
     /// with no clock) is played first in, first out, the filler first.
     pub fn take_audio_due(&mut self, at_ns: u64, n: usize, pad: impl FnMut(&mut [u8])) -> AudioTake {
+        let mut take = self.take_audio_due_counted(at_ns, n, pad);
+        // A camera with no audio yet in this generation has none to pad: its filler is not counted
+        // (else a video-only camera reads as all filler, the review's m9).
+        if !self.audio_seen {
+            take.counts.audio_pad_bytes = 0;
+        }
+        take
+    }
+
+    fn take_audio_due_counted(&mut self, at_ns: u64, n: usize, pad: impl FnMut(&mut [u8])) -> AudioTake {
         let stamped = self.audio.front().map(|c| c.start.is_some());
         match (self.clock, stamped) {
             (_, Some(false)) => self.take_audio_fifo(n, pad),
@@ -399,6 +499,14 @@ impl<V: Clone> Playout<V> {
                 ..Counts::default()
             },
         }
+    }
+
+    /// Drops the queued frames, counted unaired (the frame on air stays); how many it dropped.
+    pub fn clear_video(&mut self) -> usize {
+        let n = self.video.len();
+        self.pending.unaired += n as u64;
+        self.video.clear();
+        n
     }
 
     /// Empties the ring; the bytes it dropped.
@@ -549,15 +657,82 @@ impl<V: Clone> Playout<V> {
         self.gen = Some(g);
     }
 
-    /// A stamp more than the cap behind the newest of its generation: the camera's PTS jumped back
-    /// (the queue would hold the new frames behind the old ones, and the span bound would drop the
-    /// new). The queue restarts as for a new generation, counted as a re-anchor.
-    fn discontinuity(&mut self, t: i128) {
-        if self.newest_pts.is_some_and(|n| t < n - ms_ns(PLAYOUT_CAP_MS)) {
-            self.restart();
-            self.pending.reanchors += 1;
+    /// A stamped audio chunk's start (sample `raw` as stamped) on the video's stamps. A jump back
+    /// past the cap drops the ring (it plays in push order, and the old chunks would sit ahead of
+    /// the new). While the video is fresh (it arrived since the last tick, or at it), audio more than
+    /// `PLAYOUT_STREAM_SKEW_MAX_MS` from the newest frame's stamp is re-based onto it, counted as a
+    /// re-anchor: the audio's stamps, queued and to come, move by the difference.
+    fn place_audio(&mut self, raw: i128) -> i128 {
+        let mut start = raw + self.audio_offset;
+        if self
+            .audio_s
+            .newest
+            .is_some_and(|nw| sample_ns(start) < nw - ms_ns(PLAYOUT_CAP_MS))
+        {
+            self.clear_audio();
+            self.audio_s.rebased();
         }
-        self.newest_pts = Some(self.newest_pts.map_or(t, |n| n.max(t)));
+        let fresh =
+            self.video_s.since.is_some() || self.video_s.last_at.is_some_and(|l| Some(l) == self.last_tick);
+        if let Some(v) = self.video_s.newest.filter(|_| fresh) {
+            if (sample_ns(start) - v).abs() > ms_ns(PLAYOUT_STREAM_SKEW_MAX_MS) {
+                let delta = sample_at(v) - start;
+                self.rebase(delta);
+                start += delta;
+                self.pending.reanchors += 1;
+            }
+        }
+        start
+    }
+
+    /// Moves the audio's stamps, the queued chunks' and every later one's, by `delta` samples.
+    fn rebase(&mut self, delta: i128) {
+        self.audio_offset += delta;
+        self.audio_s.rebased();
+        for c in &mut self.audio {
+            c.start = c.start.map(|s| s + delta);
+        }
+    }
+
+    /// The clock's rules at a tick that saw `arrived` (the video's newest since the last tick, the
+    /// audio's), with `due` the media time it has due. Re-anchor (counted): after a gap; when every
+    /// live stream is more than the cap ahead; when an arrival is more than the cap behind; when a
+    /// stream's arrivals have all been past due for `PLAYOUT_LATE_REANCHOR_MS`. Join (not counted:
+    /// it completes the anchor): a stream the clock had not taken into account arrives with less
+    /// than the target before it is due.
+    fn judge(&mut self, due: i128, at: i128, arrived: [Option<i128>; 2], gap: bool) -> Judged {
+        let (cap, slack) = (ms_ns(PLAYOUT_CAP_MS), ms_ns(PLAYOUT_AUDIO_SLACK_MS));
+        let mut redo = gap;
+        let mut join = false;
+        for (s, a) in [&mut self.video_s, &mut self.audio_s].into_iter().zip(arrived) {
+            let Some(n) = a else { continue };
+            let lead = n - due;
+            if lead < -slack {
+                let from = *s.late_since.get_or_insert(at);
+                redo |= at - from >= ms_ns(PLAYOUT_LATE_REANCHOR_MS);
+            } else {
+                s.late_since = None;
+            }
+            redo |= lead < -cap;
+            if !s.anchored {
+                s.anchored = true;
+                join |= lead < ms_ns(PLAYOUT_TARGET_MS) - slack;
+            }
+        }
+        let ahead = [self.video_s, self.audio_s]
+            .iter()
+            .filter(|s| s.live(at))
+            .filter_map(|s| s.newest)
+            .map(|n| n - due)
+            .min();
+        redo |= ahead.is_some_and(|l| l > cap);
+        if redo {
+            Judged::Reanchor
+        } else if join {
+            Judged::Join
+        } else {
+            Judged::Keep
+        }
     }
 
     /// Drops the queue (counted) and the audio, and starts a fresh clock.
@@ -571,20 +746,32 @@ impl<V: Clone> Playout<V> {
     fn unanchor(&mut self) {
         self.clock = None;
         self.cursor = None;
-        self.newest_since = None;
+        self.video_s = Stream::default();
+        self.audio_s = Stream::default();
         self.last_arrival_at = None;
-        self.newest_pts = None;
+        self.audio_offset = 0;
+        self.audio_seen = false;
     }
 
-    fn arrival(&mut self, t: i128) {
-        self.newest_since = Some(self.newest_since.map_or(t, |n| n.max(t)));
-    }
-
-    fn anchor(&mut self, at: i128, newest: i128) {
-        self.clock = Some(Clock {
-            at,
-            media: newest - ms_ns(PLAYOUT_TARGET_MS),
-        });
+    /// The clock at `at`: the target behind the newest stamp of the later-arriving live stream (the
+    /// lower of the two newest), so each keeps the whole target. Called at a tick that saw an
+    /// arrival, so the stream that arrived is live.
+    fn anchor(&mut self, at: i128) {
+        let newest = [self.video_s, self.audio_s]
+            .iter()
+            .filter(|s| s.live(at))
+            .filter_map(|s| s.newest)
+            .min();
+        if let Some(n) = newest {
+            self.clock = Some(Clock {
+                at,
+                media: n - ms_ns(PLAYOUT_TARGET_MS),
+            });
+        }
+        for s in [&mut self.video_s, &mut self.audio_s] {
+            s.anchored = s.live(at);
+            s.late_since = None;
+        }
     }
 
     /// The media span of the stamped frames queued.
@@ -607,8 +794,12 @@ mod tests {
     //! repeats. It runs on the schedule alone, never on the queue. Every number is from config, the
     //! schedule, or the programme's tick grid.
     use super::*;
-    use domain::config::{OutputProfile, CAMERA_MAX_FPS};
+    use domain::config::{
+        OutputProfile, CAMERA_MAX_FPS, PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_STREAM_SKEW_MAX_MS,
+    };
 
+    /// Both profiles are 30 fps (`config.rs`), so a loop over them is one 30 fps grid run twice, not a
+    /// sweep of grids: the source rates (25, 30, 60) are what these tests sweep.
     const PROFILES: [OutputProfile; 2] = [OutputProfile::P720, OutputProfile::P1080];
     const NS: u64 = 1_000_000_000;
     const MS: u64 = 1_000_000;
@@ -637,7 +828,14 @@ mod tests {
         k: u64,
         pts: u64,
         src_fps: u64,
+        /// Programme time its audio reaches the queue (`NO_AUDIO`: never), and the audio's stamp: the
+        /// frame's own unless a schedule moves them.
+        audio_at: u64,
+        audio_pts: u64,
     }
+
+    /// An `audio_at` past every run: the frame's audio never arrives (a camera with no audio track).
+    const NO_AUDIO: u64 = u64::MAX;
 
     impl Arrival {
         fn id(&self) -> u64 {
@@ -646,7 +844,7 @@ mod tests {
 
         /// The 48 kHz sample its audio starts at (the source's rate divides 48 kHz: exact).
         fn first_sample(&self) -> u64 {
-            (self.pts * u64::from(AUDIO_RATE) + NS / 2) / NS
+            (self.audio_pts * u64::from(AUDIO_RATE) + NS / 2) / NS
         }
 
         /// Its audio: the source's samples for the frame, each labelled with its own sample index.
@@ -680,6 +878,8 @@ mod tests {
                 k,
                 pts: media_base + slot,
                 src_fps,
+                audio_at: arrive_base + slot + DELIVERY_NS,
+                audio_pts: media_base + slot,
             }
         })
         .collect()
@@ -693,9 +893,70 @@ mod tests {
             if (from..until).contains(&a.at) {
                 a.at = until;
             }
+            if (from..until).contains(&a.audio_at) {
+                a.audio_at = until;
+            }
         }
         arrivals.sort_by_key(|a| a.at);
         arrivals
+    }
+
+    /// A hold of the video alone (its audio arrives on time): what would arrive in
+    /// `[from, from + ms)` arrives at its end.
+    fn hold_video(mut arrivals: Vec<Arrival>, from: u64, ms: u64) -> Vec<Arrival> {
+        let until = from + ms * MS;
+        for a in &mut arrivals {
+            if (from..until).contains(&a.at) {
+                a.at = until;
+            }
+        }
+        arrivals
+    }
+
+    /// Each frame's audio reaches the queue `after_ms` after the frame (negative: before it), its
+    /// stamp unchanged.
+    fn audio_after(mut arrivals: Vec<Arrival>, after_ms: i64) -> Vec<Arrival> {
+        for a in &mut arrivals {
+            a.audio_at =
+                a.at.checked_add_signed(after_ms * MS as i64)
+                    .expect("a schedule that starts after the skew");
+        }
+        arrivals
+    }
+
+    /// From programme time `from` every arrival (both streams) is `extra` later and stays so: a
+    /// delivery-delay step with no catch-up.
+    fn delay_from(mut arrivals: Vec<Arrival>, from: u64, extra: u64) -> Vec<Arrival> {
+        for a in &mut arrivals {
+            if a.at >= from {
+                a.at += extra;
+                a.audio_at += extra;
+            }
+        }
+        arrivals
+    }
+
+    /// The fake camera's `POST /pause` then `POST /resume`, `pauses` times inside one generation,
+    /// `run_s` seconds of frames before, between and after them: a paused frame is never sent, the
+    /// video's stamps go on with the slots (they jump by the pause), and the audio's carry on from the
+    /// last chunk before the pause (the chain's AAC side on PR #113's camera-flap leg, CI run
+    /// 45575918709: the two disagreed by the pause after each return). The audio of the frame at
+    /// index `j` of the schedule is the `j`th chunk. Returns the schedule and each return's first k.
+    fn paused(fps: u64, pauses: u64, pause_ms: u64, run_s: u64) -> (Vec<Arrival>, Vec<u64>) {
+        let skipped = pause_ms * fps / 1_000;
+        let (mut out, mut returns, mut k) = (Vec::new(), Vec::new(), 0);
+        for seg in 0..=pauses {
+            if seg > 0 {
+                k += skipped;
+                returns.push(k);
+            }
+            out.extend(source(1, fps, k..k + run_s * fps, MEDIA_BASE_NS, 0));
+            k += run_s * fps;
+        }
+        for (j, a) in out.iter_mut().enumerate() {
+            a.audio_pts = MEDIA_BASE_NS + j as u64 * NS / fps;
+        }
+        (out, returns)
     }
 
     /// PR #59/#60's bursts: frames leave in bursts of `sizes`, each burst when its newest frame is
@@ -708,6 +969,7 @@ mod tests {
             let last = out[(k + size - 1) as usize].at;
             for a in &mut out[k as usize..(k + size) as usize] {
                 a.at = last;
+                a.audio_at = last;
             }
             k += size;
         }
@@ -778,19 +1040,32 @@ mod tests {
         }
     }
 
-    /// The programme's ticks over `arrivals`: each tick pushes what has arrived by its time, ticks,
-    /// then takes its audio period.
+    /// The programme's ticks over `arrivals`: each tick pushes what has arrived by its time (a
+    /// frame and its audio in the schedule's order, a frame before its audio at the same instant),
+    /// ticks, then takes its audio period.
     fn run(fps: u64, arrivals: &[Arrival], ticks: u64) -> Run {
         let mut p = Playout::default();
         let period_bytes = (u64::from(AUDIO_RATE) / fps) as usize * AUDIO_FRAME_BYTES;
-        let (mut next, mut recs) = (0, Vec::new());
+        let mut events: Vec<(u64, usize, bool)> = arrivals
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| [(a.at, i, false), (a.audio_at, i, true)])
+            .filter(|&(t, _, _)| t != NO_AUDIO)
+            .collect();
+        events.sort_by_key(|&(t, i, audio)| (t, i, audio));
+        let (mut next, mut pushed, mut recs) = (0, 0u64, Vec::new());
         for i in 0..ticks {
             let mut pushed_gens = Vec::new();
-            while next < arrivals.len() && arrivals[next].at <= at(fps, i) {
-                let a = arrivals[next];
-                p.push_video(Some(a.gen), Some(a.pts), a.id());
-                p.push_audio(Some(a.gen), Some(a.pts), &a.audio());
-                pushed_gens.push(a.gen);
+            while next < events.len() && events[next].0 <= at(fps, i) {
+                let (_, j, audio) = events[next];
+                let a = arrivals[j];
+                if audio {
+                    p.push_audio(Some(a.gen), Some(a.audio_pts), &a.audio());
+                } else {
+                    p.push_video(Some(a.gen), Some(a.pts), a.id());
+                    pushed_gens.push(a.gen);
+                    pushed += 1;
+                }
                 next += 1;
             }
             let t = p.tick(at(fps, i));
@@ -823,11 +1098,7 @@ mod tests {
                 labels,
             });
         }
-        Run {
-            p,
-            recs,
-            pushed: next as u64,
-        }
+        Run { p, recs, pushed }
     }
 
     /// The rule on the schedule alone (one generation, no re-anchor): (repeats, unaired) from the
@@ -872,10 +1143,16 @@ mod tests {
     /// audio within one video period of the picture (the audio at the clock's due time, the picture
     /// the newest frame due), allowing the audio's slack either side. Returns the ticks checked.
     fn assert_av_in_step(name: &str, r: &Run, src_fps: u64) -> u64 {
+        assert_av_in_step_from(name, r, src_fps, 0)
+    }
+
+    /// `assert_av_in_step` from tick `from` on (after a warm-up whose join moved the clock back
+    /// under frames already aired).
+    fn assert_av_in_step_from(name: &str, r: &Run, src_fps: u64, from: usize) -> u64 {
         let slack = i128::from(PLAYOUT_AUDIO_SLACK_MS * MS);
         let period = i128::from(NS / src_fps);
         let mut checked = 0;
-        for (i, rec) in r.recs.iter().enumerate() {
+        for (i, rec) in r.recs.iter().enumerate().skip(from) {
             if let Some(av) = rec.av {
                 assert!(
                     (-slack..period + slack).contains(&av),
@@ -1196,12 +1473,438 @@ mod tests {
                     .map(|x| x.counts.repeated)
                     .sum();
                 assert_eq!(steady, 0, "{name}: steady after the jump");
+                // The audio jumps with the picture: from the first frame after the jump, every period
+                // to the last frame's tick (not into it: its period runs past the source's last audio)
+                // plays its own audio, in step (a jump back drops the old audio queued ahead of it).
+                let period_bytes = (u64::from(AUDIO_RATE) / fps) as usize * AUDIO_FRAME_BYTES;
+                for (i, x) in r.recs[first_post..r.last_air()].iter().enumerate() {
+                    assert_eq!(
+                        x.labels.len() * 4,
+                        period_bytes,
+                        "{name}: tick {} plays its own audio",
+                        first_post + i
+                    );
+                }
+                assert!(
+                    assert_av_in_step_from(name, &r, fps, first_post) as usize >= r.last_air() - first_post
+                );
                 r.assert_conserved(name);
                 checked += 1;
             }
         }
         eprintln!("jumps checked: {checked}");
         assert_eq!(checked, 2 * PROFILES.len());
+    }
+
+    // ---- two streams (fix round 1: the review's C1, C2, I1) ----
+
+    /// The first tick at or after programme time `t`.
+    fn tick_at(fps: u64, t: u64) -> u64 {
+        (0..).find(|&i| at(fps, i) >= t).unwrap()
+    }
+
+    /// The tick the frame `id` airs, fresh.
+    fn air_tick(r: &Run, id: u64) -> usize {
+        r.recs
+            .iter()
+            .position(|x| x.fresh && x.aired == Some(id))
+            .unwrap_or_else(|| panic!("frame {id} never aired"))
+    }
+
+    /// Review C1: a camera paused twice inside one generation whose audio stamps carry on across
+    /// each pause while its video's jump (PR #113's camera-flap leg, red on CI with 80 re-anchors a
+    /// beat and the pre-pause frame frozen on air). Each return is a gap (a re-anchor) and a re-base
+    /// of the audio onto the video's stamps (a re-anchor): the audio's chunk lands on the newest
+    /// frame's stamp. With the audio arriving after its frame or with it, the re-base happens before
+    /// the return's first tick sees both, so the return costs 2; with it arriving first, that tick
+    /// anchors on the audio's old stamps and the next re-anchors past the cap: 3. After that the
+    /// return is steady: the first frame back airs a target (and the re-anchor's tick) after the tick
+    /// that saw it, every frame back airs once, in order, with no repeat and no re-anchor, and every
+    /// period plays its own audio (none padded, none late), within a frame of the picture.
+    #[test]
+    fn a_pause_whose_audio_stamps_carry_on_returns_on_the_new_frames_with_their_audio() {
+        let mut checked = 0;
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let period_bytes = (u64::from(AUDIO_RATE) / fps) as usize * AUDIO_FRAME_BYTES;
+            let spf = u64::from(AUDIO_RATE) / fps;
+            for (after_ms, per_return) in [(-10i64, 3u64), (0, 2), (10, 2)] {
+                let (schedule, returns) = paused(fps, 2, 4_750, 3);
+                assert_eq!(returns.len(), 2, "a pause and a second pause");
+                // Start the schedule late enough that audio arriving early stays after programme 0.
+                let schedule: Vec<Arrival> = schedule
+                    .into_iter()
+                    .map(|mut a| {
+                        a.at += 20 * MS;
+                        a.audio_at += 20 * MS;
+                        a
+                    })
+                    .collect();
+                let arrivals = audio_after(schedule, after_ms);
+                let ticks = arrivals.last().unwrap().at * fps / NS + fps;
+                let r = run(fps, &arrivals, ticks);
+                let base_sample = arrivals[0].first_sample();
+                for (n, &k0) in returns.iter().enumerate() {
+                    let tag = format!("{fps} fps, audio {after_ms} ms, return {n}");
+                    let first = arrivals.iter().position(|a| a.k == k0).unwrap();
+                    let last = returns.get(n + 1).map_or(arrivals.len(), |&k| {
+                        arrivals.iter().position(|a| a.k == k).unwrap()
+                    }) - 1;
+                    let ret = arrivals[first];
+                    let seen = tick_at(fps, ret.at.min(ret.audio_at)) as usize;
+                    let first_post = air_tick(&r, ret.id());
+                    let last_post = air_tick(&r, arrivals[last].id());
+                    // The target again (one more tick when the audio came first).
+                    assert!(
+                        first_post as u64 <= tick_at(fps, at(fps, seen as u64 + 1) + TARGET_NS),
+                        "{tag}: the first frame back airs at tick {first_post}, seen at {seen}"
+                    );
+                    let aired: Vec<u64> = r.recs[first_post..=last_post]
+                        .iter()
+                        .filter(|x| x.fresh)
+                        .filter_map(|x| x.aired)
+                        .collect();
+                    let ids: Vec<u64> = arrivals[first..=last].iter().map(Arrival::id).collect();
+                    assert_eq!(aired, ids, "{tag}: every frame back once, in order");
+                    let window = &r.recs[seen..=last_post];
+                    let reanchors: u64 = window.iter().map(|x| x.counts.reanchors).sum();
+                    assert_eq!(reanchors, per_return, "{tag}: the return's re-anchors");
+                    // The re-base moves the audio already queued with the rest: none of the return's
+                    // audio is dropped late, from the tick that first saw it.
+                    let late: u64 = r.recs[seen..last_post]
+                        .iter()
+                        .map(|x| x.counts.audio_late_bytes)
+                        .sum();
+                    assert_eq!(late, 0, "{tag}: no audio of the return dropped");
+                    let repeats: u64 = r.recs[first_post..=last_post]
+                        .iter()
+                        .map(|x| x.counts.repeated)
+                        .sum();
+                    assert_eq!(repeats, 0, "{tag}: steady back");
+                    // The audio to two ticks before the segment's last frame airs: the re-base aligns
+                    // by arrival, to within a frame, so the last chunk before the next pause can end a
+                    // period before the last frame's, and the period after it runs past the chunk.
+                    for (i, x) in r.recs[first_post..last_post - 1].iter().enumerate() {
+                        let i = first_post + i;
+                        assert_eq!(
+                            (
+                                x.labels.len() * 4,
+                                x.counts.audio_pad_bytes,
+                                x.counts.audio_late_bytes
+                            ),
+                            (period_bytes, 0, 0),
+                            "{tag}: tick {i} plays its own audio"
+                        );
+                        // The chunk its first sample is in, and that chunk's frame, against the frame on air.
+                        let j = ((u64::from(x.labels[0]) - base_sample) / spf) as usize;
+                        let k_audio = arrivals[j].k as i64;
+                        let k_video = (x.aired.unwrap() % 1_000_000) as i64;
+                        assert!(
+                            (k_audio - k_video).abs() <= 1,
+                            "{tag}: tick {i}: audio of frame {k_audio} under frame {k_video}"
+                        );
+                        checked += 1;
+                    }
+                }
+                r.assert_conserved("pause");
+            }
+        }
+        eprintln!("ticks checked after a return: {checked}");
+        assert!(checked > 0);
+    }
+
+    /// Review I1: audio reaching the queue before or after its frame (stamps equal), by 100 and
+    /// 250 ms, both under `PLAYOUT_STREAM_SKEW_MAX_MS`. The clock anchors on the later stream, so
+    /// both keep the whole target: steady, nothing repeats, no audio pads or drops after the
+    /// warm-up, and the audio stays in step; with the harness's three 300 ms holds and the audio
+    /// first, the video (the later stream) repeats exactly the rule's count for the video alone (3 a
+    /// hold; the review read 7 at 100 ms and 10 at 250 with the clock on the earlier stream).
+    #[test]
+    fn audio_skewed_from_its_video_keeps_the_whole_target_for_both() {
+        let mut checked = 0;
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let secs = 32;
+            for after_ms in [100i64, 250, -100, -250] {
+                let skew_ns = after_ms.unsigned_abs() * MS;
+                assert!(skew_ns < PLAYOUT_STREAM_SKEW_MAX_MS * MS, "under the re-base");
+                // Steady.
+                let arrivals = audio_after(source(1, fps, 0..10 * fps, MEDIA_BASE_NS, 300 * MS), after_ms);
+                let ticks = 11 * fps;
+                let r = run(fps, &arrivals, ticks);
+                let both = tick_at(fps, arrivals[0].at.max(arrivals[0].audio_at)) as usize;
+                let warm = tick_at(fps, at(fps, both as u64) + TARGET_NS + skew_ns) as usize + 1;
+                let last = r.last_air();
+                let mut c = Counts::default();
+                // To the last frame's tick, not into it: its period runs past the source's last audio.
+                for x in &r.recs[warm..last] {
+                    c.add(&x.counts);
+                }
+                assert_eq!(
+                    (
+                        c.repeated,
+                        c.unaired,
+                        c.audio_pad_bytes,
+                        c.audio_late_bytes,
+                        c.reanchors
+                    ),
+                    (0, 0, 0, 0, 0),
+                    "{fps} fps, audio {after_ms} ms: steady after the warm-up"
+                );
+                assert!(assert_av_in_step_from("skew", &r, fps, warm) >= (last - warm) as u64);
+                // Three 300 ms holds.
+                if after_ms < 0 {
+                    let mut held =
+                        audio_after(source(1, fps, 0..secs * fps, MEDIA_BASE_NS, 300 * MS), after_ms);
+                    let holds: Vec<u64> = (1..=3).map(|n| n * 10 * NS + 10 * MS).collect();
+                    for &h in &holds {
+                        held = hold(held, h, 300);
+                    }
+                    let ticks = (secs + 1) * fps;
+                    let r = run(fps, &held, ticks);
+                    let video_only: Vec<Arrival> = held
+                        .iter()
+                        .map(|&a| Arrival {
+                            audio_at: NO_AUDIO,
+                            ..a
+                        })
+                        .collect();
+                    let (rep, _, _) = expected(fps, &video_only, ticks);
+                    assert_eq!(rep, 9, "the rule for the video alone: 3 a hold");
+                    assert_eq!(
+                        r.total().repeated,
+                        rep,
+                        "{fps} fps, audio {after_ms} ms: the later stream's target"
+                    );
+                    assert_eq!(r.total().reanchors, 0);
+                }
+                checked += 1;
+            }
+        }
+        eprintln!("skews checked: {checked}");
+        assert_eq!(checked, 4 * PROFILES.len());
+    }
+
+    /// Review C2: a delivery-delay step with no catch-up puts every arrival past due (the target
+    /// plus two ticks, and 300 ms; both under the cap, so no other rule re-anchors). The stream late
+    /// for `PLAYOUT_LATE_REANCHOR_MS` re-anchors once, at the first tick that long after the first
+    /// late one, and from a target after it the camera is steady with every period's audio real
+    /// (the review read no real audio for the rest of the run).
+    #[test]
+    fn a_delay_step_that_leaves_the_camera_late_re_anchors_once() {
+        let mut checked = 0;
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let period = NS / fps;
+            for extra in [TARGET_NS + 2 * period, 300 * MS] {
+                // The premise: neither a drift past the cap nor a gap re-anchors this step.
+                assert!(extra < PLAYOUT_CAP_MS * MS, "the step drifts past the cap");
+                assert!(extra < PLAYOUT_REANCHOR_GAP_MS * MS, "the step is a gap");
+                let step = 10 * NS;
+                let arrivals = delay_from(source(1, fps, 0..20 * fps, MEDIA_BASE_NS, 0), step, extra);
+                let ticks = 21 * fps;
+                let r = run(fps, &arrivals, ticks);
+                let tag = format!("{fps} fps, a {} ms step", extra / MS);
+                let first_late = tick_at(fps, arrivals.iter().find(|a| a.at >= step).unwrap().at);
+                let expect = tick_at(fps, at(fps, first_late) + PLAYOUT_LATE_REANCHOR_MS * MS) as usize;
+                let anchors: Vec<usize> = (0..r.recs.len())
+                    .filter(|&i| r.recs[i].counts.reanchors > 0)
+                    .collect();
+                assert_eq!(anchors, vec![expect], "{tag}: one re-anchor, the lateness's");
+                let settled = tick_at(fps, at(fps, expect as u64) + TARGET_NS) as usize + 1;
+                let mut c = Counts::default();
+                // To the last frame's tick, not into it (its period runs past the source's last audio).
+                for (i, x) in r.recs[settled..r.last_air()].iter().enumerate() {
+                    c.add(&x.counts);
+                    assert_eq!(
+                        x.labels.len() * 4,
+                        (u64::from(AUDIO_RATE) / fps) as usize * AUDIO_FRAME_BYTES,
+                        "{tag}: tick {} all real",
+                        settled + i
+                    );
+                }
+                assert_eq!(
+                    (c.repeated, c.audio_pad_bytes, c.audio_late_bytes),
+                    (0, 0, 0),
+                    "{tag}: steady after"
+                );
+                r.assert_conserved("step");
+                checked += 1;
+            }
+        }
+        eprintln!("steps checked: {checked}");
+        assert_eq!(checked, 2 * PROFILES.len());
+    }
+
+    /// Review C2: a camera clock slower than the programme's (3 000 ppm, scaled up from a real
+    /// camera's tens so the run is two minutes): the lead falls 3 ms a second, crosses due after
+    /// (target − delivery + slack) / 3 ms seconds, and the lateness re-anchors it back to the target,
+    /// so the run re-anchors once per crossing and the audio never goes quiet for a second (the
+    /// review read the audio silent from the crossing until the lead reached the cap).
+    #[test]
+    fn a_slow_camera_clock_re_anchors_each_time_it_falls_due() {
+        let fps = 30; // One grid: the drift is the source's, and both profiles are 30 fps.
+        let ppm = 3_000;
+        let secs = 120;
+        let mut arrivals = source(1, fps, 0..secs * fps, MEDIA_BASE_NS, 0);
+        for a in &mut arrivals {
+            let slot = a.k * NS / fps;
+            a.at = slot + slot * ppm / 1_000_000 + DELIVERY_NS;
+            a.audio_at = a.at;
+        }
+        let ticks = arrivals.last().unwrap().at * fps / NS + fps;
+        let r = run(fps, &arrivals, ticks);
+        // Each crossing: the lead from the target less the delivery to the slack past due, at 3 ms a
+        // second of the camera's clock, then the lateness's own wait.
+        let cross_ns = (TARGET_NS - DELIVERY_NS + PLAYOUT_AUDIO_SLACK_MS * MS) * 1_000_000 / ppm
+            + PLAYOUT_LATE_REANCHOR_MS * MS;
+        let crossings = secs * NS / cross_ns;
+        assert_eq!(crossings, 2, "the schedule's own arithmetic");
+        let c = r.total();
+        assert_eq!(c.reanchors, crossings, "one re-anchor a crossing");
+        let first = r.first_air().unwrap();
+        let mut windows = 0;
+        for w in r.recs[first..r.last_air()].chunks(fps as usize) {
+            let real: usize = w.iter().map(|x| x.labels.len()).sum();
+            assert!(real > 0, "a second of the camera with no real audio");
+            windows += 1;
+        }
+        eprintln!("seconds with real audio: {windows}");
+        assert!(windows as u64 >= secs - 2);
+        r.assert_conserved("drift");
+    }
+
+    /// The rule past the cap reads every live stream (it fires when all are more than the cap ahead):
+    /// a jump forward in the video's stamps at the moment the audio stops leaves the audio live, and
+    /// behind, until the gap; the clock re-anchors once, when the audio has gone, and the frames after
+    /// the jump air steady. Judged on the stream ahead alone, every tick until the gap would
+    /// re-anchor onto the audio's old stamps, which the video is still past.
+    #[test]
+    fn a_video_jump_while_the_audio_stops_re_anchors_once() {
+        let mut checked = 0;
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let jump = 4 * PLAYOUT_CAP_MS * MS;
+            let (before, after) = (2 * fps, 3 * fps);
+            let mut arrivals = source(1, fps, 0..before, MEDIA_BASE_NS, 0);
+            arrivals.extend(
+                source(1, fps, before..before + after, MEDIA_BASE_NS + jump, 0)
+                    .into_iter()
+                    .map(|a| Arrival {
+                        audio_at: NO_AUDIO,
+                        ..a
+                    }),
+            );
+            let ticks = before + after + fps;
+            let r = run(fps, &arrivals, ticks);
+            assert_eq!(r.total().reanchors, 1, "{fps}: one re-anchor");
+            // The frames the video sends while the audio is still live wait past the clock (the
+            // span bound keeps the newest cap's worth); from the first one that airs it is steady.
+            let first_post = r
+                .recs
+                .iter()
+                .position(|x| x.fresh && x.aired.is_some_and(|id| id >= arrivals[before as usize].id()))
+                .expect("a frame after the jump airs");
+            let steady: u64 = r.recs[first_post..=r.last_air()]
+                .iter()
+                .map(|x| x.counts.repeated)
+                .sum();
+            assert_eq!(steady, 0, "{fps}: steady after");
+            r.assert_conserved("jump, audio stops");
+            checked += 1;
+        }
+        eprintln!("jumps with the audio stopping checked: {checked}");
+        assert_eq!(checked, PROFILES.len());
+    }
+
+    /// The re-base reads the video only while it is fresh (it arrived since the last tick or at
+    /// it): a hold of the video alone, longer than `PLAYOUT_STREAM_SKEW_MAX_MS` and under the gap,
+    /// with its audio on time, is not a skew. No re-anchor, the audio never pads or drops, and it
+    /// stays in step with the picture after the hold.
+    #[test]
+    fn a_hold_of_the_video_alone_is_not_a_skew() {
+        let mut checked = 0;
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let hold_ms = PLAYOUT_STREAM_SKEW_MAX_MS + 50;
+            assert!(hold_ms < PLAYOUT_REANCHOR_GAP_MS);
+            let arrivals = hold_video(source(1, fps, 0..10 * fps, MEDIA_BASE_NS, 0), 5 * NS, hold_ms);
+            let ticks = 11 * fps;
+            let r = run(fps, &arrivals, ticks);
+            let c = r.total();
+            assert_eq!(c.reanchors, 0, "{fps}: no re-base");
+            let first = r.first_air().unwrap();
+            let mut audio = Counts::default();
+            // To the last frame's tick, not into it (its period runs past the source's last audio).
+            for x in &r.recs[first..r.last_air()] {
+                audio.add(&x.counts);
+            }
+            assert_eq!(
+                (audio.audio_pad_bytes, audio.audio_late_bytes),
+                (0, 0),
+                "{fps}: the audio's own clock"
+            );
+            // In step at every tick that airs a new frame (while the video is held the picture
+            // repeats and the audio runs on, as it should).
+            let (slack, period) = (i128::from(PLAYOUT_AUDIO_SLACK_MS * MS), i128::from(NS / fps));
+            let mut fresh_av = 0;
+            for (i, x) in r.recs.iter().enumerate().filter(|(_, x)| x.fresh) {
+                if let Some(av) = x.av {
+                    assert!(
+                        (-slack..period + slack).contains(&av),
+                        "{fps}: tick {i}: audio {av} ns from the picture"
+                    );
+                    fresh_av += 1;
+                }
+            }
+            assert!(
+                fresh_av as u64 >= 9 * fps,
+                "{fps}: {fresh_av} fresh ticks checked"
+            );
+            r.assert_conserved("video hold");
+            checked += 1;
+        }
+        eprintln!("video holds checked: {checked}");
+        assert_eq!(checked, PROFILES.len());
+    }
+
+    /// Review m9: a camera with no audio track has no audio to pad, so its periods count no filler
+    /// (else every camera tick reads 192 KB/s of `audio_pad_bytes`); once its audio arrives, a period
+    /// the ring cannot fill counts again.
+    #[test]
+    fn a_camera_with_no_audio_counts_no_filler_until_its_audio_arrives() {
+        let fps = 30; // One grid: the rule is per period, not per rate.
+        let silent: Vec<Arrival> = source(1, fps, 0..3 * fps, MEDIA_BASE_NS, 0)
+            .into_iter()
+            .map(|a| Arrival {
+                audio_at: NO_AUDIO,
+                ..a
+            })
+            .collect();
+        let r = run(fps, &silent, 4 * fps);
+        assert!(r.fresh_ticks() > 0, "the camera aired");
+        assert_eq!(r.all().audio_pad_bytes, 0, "no audio track, no filler counted");
+        // Its audio starts at the second second; its last second stops again: the stop pads.
+        let late: Vec<Arrival> = source(1, fps, 0..3 * fps, MEDIA_BASE_NS, 0)
+            .into_iter()
+            .map(|a| {
+                if (fps..2 * fps).contains(&a.k) {
+                    a
+                } else {
+                    Arrival {
+                        audio_at: NO_AUDIO,
+                        ..a
+                    }
+                }
+            })
+            .collect();
+        let r = run(fps, &late, 4 * fps);
+        let before: u64 = r.recs[..tick_at(fps, late[fps as usize].audio_at) as usize]
+            .iter()
+            .map(|x| x.counts.audio_pad_bytes)
+            .sum();
+        assert_eq!(before, 0, "nothing counted before the audio");
+        assert!(r.all().audio_pad_bytes > 0, "the audio's stop pads, counted");
     }
 
     // ---- generations ----
@@ -1371,7 +2074,7 @@ mod tests {
     }
 
     /// Nothing pushed: a tick airs nothing and counts nothing (no frame on air is no repeat), and
-    /// the audio is all filler, counted.
+    /// the audio is all filler, not counted (no audio has arrived to pad: the review's m9).
     #[test]
     fn an_empty_queue_airs_and_counts_nothing() {
         let mut p: Playout<u64> = Playout::default();
@@ -1380,7 +2083,8 @@ mod tests {
             assert_eq!((t.frame, t.fresh, t.counts), (None, false, Counts::default()));
         }
         let a = p.take_audio_due(0, 6_400, |b| b.fill(PAD));
-        assert_eq!((a.real, a.counts.audio_pad_bytes), (0, 6_400));
+        assert_eq!((a.real, a.counts.audio_pad_bytes), (0, 0));
+        assert!(a.bytes.iter().all(|&b| b == PAD), "all filler");
         assert_eq!(p.clear_audio(), 0);
     }
 
@@ -1404,6 +2108,31 @@ mod tests {
         let t = p.tick(0);
         assert_eq!(t.counts.reanchors, 0);
         assert_eq!(p.due_ns(0), Some(i128::from(more[0].pts) - i128::from(TARGET_NS)));
+    }
+
+    /// The review's m5: a build's loss drops its queued frames (counted unaired, so conserved) and
+    /// its audio; the frame on air stays (the domain freezes on it), and the next tick airs nothing
+    /// new.
+    #[test]
+    fn a_lost_builds_queue_goes_counted_and_the_frame_on_air_stays() {
+        let fps = 30; // One grid: the flush is per queue, not per rate.
+        let arrivals = source(1, fps, 0..fps, MEDIA_BASE_NS, 0);
+        let mut r = run(fps, &arrivals, fps / 2);
+        let on_air = r.recs.last().unwrap().aired.expect("a frame on air");
+        let queued = r.p.queued();
+        assert!(queued > 0, "the premise: frames queued");
+        assert_eq!(r.p.clear_video(), queued);
+        assert!(r.p.clear_audio() > 0, "its audio too");
+        let t = r.p.tick(at(fps, fps / 2));
+        assert_eq!(
+            (t.frame, t.fresh, t.counts.unaired),
+            (Some(on_air), false, queued as u64)
+        );
+        r.recs.push(Rec {
+            counts: t.counts,
+            ..Rec::default()
+        });
+        r.assert_conserved("loss");
     }
 
     #[test]
