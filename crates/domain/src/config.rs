@@ -429,6 +429,16 @@ pub const PLAYOUT_SETTLE_SKIP_MS: Ms = PLAYOUT_CAP_MS + PLAYOUT_TARGET_MS;
 /// (the ripple left in a mean over 1.875 beats is about 1.3 ms).
 pub const PLAYOUT_SETTLE_MS: Ms = 2 * PLAYOUT_CAP_MS;
 
+/// C4 fix round 5 (the round-4 re-review's Important): the stamps the playout measures a camera's
+/// frame period over, the most recent `PLAYOUT_STEP_WINDOW_MS` of single-frame increments. The decoded
+/// stamps of a stream's start run ~45 ms high and relax over ~37 frames (about 1.2 s at 30 fps; every
+/// run measured, 44 to 48 ms), so a mean over the stream's life carried the transient's short
+/// increments for good (33.18 ms for 33.33) and a clamped window, placed that step apart for the
+/// pause's 147 frames, drifted 22 ms and skipped a frame. Two seconds: past the transient, and
+/// still a hundred increments of mean to take the camera's own jitter out of (30.1 to 34.0 ms at
+/// 30 fps).
+pub const PLAYOUT_STEP_WINDOW_MS: Ms = 2_000;
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -1338,6 +1348,7 @@ mod tests {
         assert_eq!(PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_CAP_MS + PLAYOUT_TARGET_MS);
         assert_eq!(PLAYOUT_SETTLE_SKIP_MS, 650);
         assert_eq!(PLAYOUT_SETTLE_MS, 1_000, "at least a second");
+        assert_eq!(PLAYOUT_STEP_WINDOW_MS, 2_000, "past the start-up transient");
         const _: () = assert!(PLAYOUT_TARGET_MS + PLAYOUT_EARLY_MARGIN_MS < PLAYOUT_CAP_MS);
         // Constant against constant: the compiler checks it. The target sits inside the cap with room
         // for a burst, and the slack is far under the target.

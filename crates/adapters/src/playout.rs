@@ -60,7 +60,8 @@ use std::fmt;
 use domain::config::{
     PLAYOUT_AUDIO_SLACK_MS, PLAYOUT_CAP_MS, PLAYOUT_EARLY_MARGIN_MS, PLAYOUT_EARLY_REANCHOR_MS,
     PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_MAX_FRAMES, PLAYOUT_REANCHOR_GAP_MS, PLAYOUT_SETTLE_MS,
-    PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_SKEW_REVERT_MS, PLAYOUT_STREAM_SKEW_MAX_MS, PLAYOUT_TARGET_MS,
+    PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_SKEW_REVERT_MS, PLAYOUT_STEP_WINDOW_MS, PLAYOUT_STREAM_SKEW_MAX_MS,
+    PLAYOUT_TARGET_MS,
 };
 
 use crate::frame_store::{AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
@@ -345,8 +346,8 @@ struct Settle {
 struct VideoStamps {
     raw: Option<i128>,
     placed: Option<i128>,
-    /// The single-frame increments the raw stamps have moved by: their sum and count (`step`).
-    period: (i128, i128),
+    /// The recent single-frame increments the raw stamps have moved by (`step`).
+    period: Increments,
     /// Added to the raw stamps (the clamped run's end moves it).
     offset: i128,
     /// The frames are arriving with a repeated stamp.
@@ -357,6 +358,62 @@ struct VideoStamps {
     slew: i128,
     /// The move that re-lock asked for (its note).
     relocked: i128,
+}
+
+/// The most recent `PLAYOUT_STEP_WINDOW_MS` of single-frame increments (a ring: `VideoStamps` is
+/// `Copy`). Sixty-four frames hold two seconds at 30 fps; more than that, at a faster camera, are
+/// not kept (the window is the frames, not the time, there).
+#[derive(Debug, Clone, Copy)]
+struct Increments {
+    buf: [i128; Increments::MAX],
+    /// The oldest kept increment's slot, and how many are kept.
+    head: usize,
+    len: usize,
+    sum: i128,
+}
+
+impl Default for Increments {
+    fn default() -> Self {
+        Self {
+            buf: [0; Self::MAX],
+            head: 0,
+            len: 0,
+            sum: 0,
+        }
+    }
+}
+
+impl Increments {
+    const MAX: usize = 128;
+
+    fn of(d: i128) -> Self {
+        let mut i = Self::default();
+        i.push(d);
+        i
+    }
+
+    fn push(&mut self, d: i128) {
+        if self.len == Self::MAX {
+            self.pop();
+        }
+        self.buf[(self.head + self.len) % Self::MAX] = d;
+        self.len += 1;
+        self.sum += d;
+        // Older ones go once what is kept spans more than the window (the newest always stays).
+        while self.len > 1 && self.sum > ms_ns(PLAYOUT_STEP_WINDOW_MS) {
+            self.pop();
+        }
+    }
+
+    fn pop(&mut self) {
+        self.sum -= self.buf[self.head];
+        self.head = (self.head + 1) % Self::MAX;
+        self.len -= 1;
+    }
+
+    fn mean(&self) -> Option<i128> {
+        (self.len > 0).then(|| self.sum / self.len as i128)
+    }
 }
 
 /// What `VideoStamps::place` saw.
@@ -375,10 +432,11 @@ impl VideoStamps {
     /// 34.0 ms at 30 fps, CI run 45595996718), and a run is placed a pause long (147 frames), so one
     /// increment's error would be carried 147 times over: that run's first return moved the picture
     /// 37.8 ms off its sound by the clamp's end. The mean of the increments telescopes to the span
-    /// over the count, so the jitter falls out.
+    /// over the count, so the jitter falls out. Of the RECENT ones only (`PLAYOUT_STEP_WINDOW_MS`):
+    /// the stream's start-up stamps run ~45 ms high and relax over ~37 frames, and a mean over the
+    /// stream's life carried that for good (33.18 for 33.33 ms, a skipped frame a window).
     fn step(&self) -> Option<i128> {
-        let (sum, n) = self.period;
-        (n > 0).then(|| sum / n)
+        self.period.mean()
     }
 
     /// An increment `d` of the raw stamps, within the cap. Only a single frame's is a period: one
@@ -387,12 +445,9 @@ impl VideoStamps {
     /// mean starts over from it.
     fn measure(&mut self, d: i128) {
         match self.step() {
-            Some(s) if 2 * d < s => self.period = (d, 1),
+            Some(s) if 2 * d < s => self.period = Increments::of(d),
             Some(s) if 2 * d > 3 * s => {}
-            _ => {
-                self.period.0 += d;
-                self.period.1 += 1;
-            }
+            _ => self.period.push(d),
         }
     }
 
@@ -4239,7 +4294,8 @@ mod tests {
     }
 
     /// The camera-flap storm of fad76a2 (CI run 45649360015, windows 8 and 10: 12 and 13 re-anchors,
-    /// 60 repeated ticks, 7 freezes), in the log's own order. The decoder's clamp runs across the
+    /// 60 repeated ticks, 7 freezes), in the log's own order, the end frame released 32 ms after the
+    /// audio's re-base (the round-4 re-review: the stale side is the picture's, the previous window's). The decoder's clamp runs across the
     /// pause (the last frames held at one stamp) and the camera's stamps are seamless over it, while
     /// the audio's jump by the pause. At the return the audio's first chunk arrives true and its second
     /// is the chain's outlier (a pause on again): the outlier is a re-base onto the picture's timeline,
@@ -4267,6 +4323,12 @@ mod tests {
             for a in &mut arrivals {
                 if (kp - 6..kp).contains(&a.k) || a.k == kr {
                     a.pts = repeated;
+                }
+                // The end frame (the clamp's last) is held by the demuxer over the pause and let go
+                // a little after the return's audio, the outlier chunk included (the re-review's
+                // order: the audio's re-base first, the held frame 32 ms on).
+                if a.k == kr + 1 {
+                    a.at += 32 * MS;
                 }
             }
             let mut r = run(fps, &arrivals, kr + 10 * fps + 8);
@@ -4391,5 +4453,60 @@ mod tests {
         }
         eprintln!("video-only short pauses checked: {cameras}, clamp ends: {ends}");
         assert_eq!((cameras, ends), (PROFILES.len(), PROFILES.len()));
+    }
+
+    /// The step a clamped run is placed at is not the lifetime's mean (the round-4 re-review's
+    /// Important): the decoded stamps of a stream's start run high by ~45 ms and relax over ~37 frames
+    /// (every run read: round-3 smoke 45.5, camera-burst 45.1), so those frames' increments are
+    /// shorter than a period, and a mean over the stream's life carried it for good (33.18 ms for
+    /// 33.33): a placement drifting 22 ms over one clamped window, and then a skipped frame
+    /// (camera-flap's +33 jumps in W1 to W7). Here the stamps run the transient, then a steady
+    /// second and a half, and a clamped run of the pause's length (147 frames) is placed: the last
+    /// frame lands within an eighth of a period of where the stamps put it, and the step is the
+    /// period to within a tenth of a millisecond.
+    #[test]
+    fn the_step_ignores_the_start_up_transient() {
+        let mut checked = 0;
+        for (fps, name) in [(30_i128, "30 fps"), (25, "25 fps")] {
+            let period = i128::from(NS) / fps;
+            let transient_frames = (PLAYOUT_STEP_WINDOW_MS as i128 * fps / 1_000) / 2;
+            let mut t = VideoStamps::default();
+            // The camera's stamps are the slots less a deviation: +45 ms high at the start,
+            // relaxing to 0 over the transient's frames.
+            let mut raw: Vec<i128> = (0..transient_frames + 4 * fps)
+                .map(|k| {
+                    let high = (45 * NS_PER_MS * (transient_frames - k).max(0)) / transient_frames;
+                    k * period + high
+                })
+                .collect();
+            let last = *raw.last().expect("stamps");
+            // The clamp: one repeated stamp for the pause's frames, then the stamps carry on.
+            raw.extend(std::iter::repeat_n(last + period, 147));
+            let placed_start = {
+                let mut p = Vec::new();
+                for &r in &raw {
+                    p.push(t.place(r, None).0);
+                }
+                p
+            };
+            let n = placed_start.len();
+            let clamp_first = n - 147;
+            let step = t.step().expect("a step");
+            assert!(
+                (step - period).abs() <= NS_PER_MS / 10,
+                "{name}: the step {step} against the period {period}"
+            );
+            let from_first = placed_start[n - 1] - placed_start[clamp_first];
+            let want = 146 * period;
+            assert!(
+                (from_first - want).abs() <= period / 8,
+                "{name}: the run placed {} ms against {} ms",
+                from_first / NS_PER_MS,
+                want / NS_PER_MS
+            );
+            checked += 1;
+        }
+        eprintln!("step checked on {checked} rates");
+        assert_eq!(checked, 2);
     }
 }
