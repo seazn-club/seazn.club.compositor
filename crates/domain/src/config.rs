@@ -326,6 +326,50 @@ pub const FIRST_GOP_CATCH_UP_MAX_MS: Ms = {
     }
 };
 
+/// C4 (S1, Owed 89; `_FINDINGS.md` F-039): the camera's playout target, the delay the camera's
+/// decoded frames and audio wait behind their own clock before they air. Stg showed 17 to 50 camera
+/// frames replaced per 150-tick beat through real Cloudflare (2026-11-24; the improvement scan's §1),
+/// the newest-frame slot showing Cloudflare's late-then-burst delivery 1:1; F-029 measured the
+/// harness's own mux holding frames one to two periods. The programme plays the frame whose PTS is
+/// due on a clock slaved to the camera's PTS, this long behind the newest arrival when the clock
+/// anchors, so an arrival up to this late still airs on time. The brief's starting value (the
+/// scan's 100 to 200 ms): 4.5 frames at 30 fps. Every camera picture and its audio air this much
+/// later than before, so the overlay's score delay (ADR 0006; web's default was measured in-chain by
+/// F-002 before this queue existed) owes the same (Owed 114).
+pub const PLAYOUT_TARGET_MS: Ms = 150;
+
+/// C4 (S1): the playout's hard cap, the brief's 500 ms. The queue never holds camera frames spanning
+/// more than this (the oldest go first, counted), and the audio ring holds this much
+/// (`adapters::frame_store::AUDIO_RING_BYTES`; the plan's "audio 400 ms", amended by C4). The clock
+/// re-anchors, `PLAYOUT_TARGET_MS` behind the newest arrival, at an arrival more than this ahead of
+/// the clock or behind it (drift: the camera's clock against the tick grid, or a jump in its PTS)
+/// and at the first arrival after a gap longer than `PLAYOUT_REANCHOR_GAP_MS`. A new camera
+/// generation starts a fresh clock and drops what the old one queued.
+pub const PLAYOUT_CAP_MS: Ms = 500;
+
+/// C4 (S1): a gap with no camera media longer than this (programme time between the ticks that saw
+/// an arrival) re-anchors the clock at the next arrival, so a camera that comes back on a new
+/// delivery delay gets the whole target again. The cap: a gap longer than the queue can hold is one
+/// it cannot have smoothed (the brief: "a gap longer than the cap").
+pub const PLAYOUT_REANCHOR_GAP_MS: Ms = PLAYOUT_CAP_MS;
+
+/// The fastest camera source the playout queue is sized for: 60 fps (the C4 brief's fastest source;
+/// the capture app sends 30). With `PLAYOUT_CAP_MS` it bounds the queue's frame count
+/// (`PLAYOUT_MAX_FRAMES`), the backstop for frames whose PTS do not move.
+pub const CAMERA_MAX_FPS: Ms = 60;
+
+/// C4: the most decoded camera frames the playout queue holds: the cap's span at `CAMERA_MAX_FPS`,
+/// both ends included (31). At the programme's own size (the input scales to it, C10), 31 I420 1080p
+/// frames are about 96 MB, inside the plan's 1 GB soft limit (the plan's decoded queue was 1 s).
+pub const PLAYOUT_MAX_FRAMES: usize = (PLAYOUT_CAP_MS * CAMERA_MAX_FPS / 1_000 + 1) as usize;
+
+/// C4: how far the audio's play position may sit from the clock's due time before it is moved to it.
+/// Each period's take is a whole 1 600 samples (48 kHz on the 30 fps grid divides exactly) while the
+/// due time is floored to the sample each tick, so the two differ by a sample or two; 1 ms (48
+/// samples) covers that and is a 150th of the target, so a re-anchor always moves the audio with the
+/// picture. The same slack joins two audio chunks whose stamps differ by rounding.
+pub const PLAYOUT_AUDIO_SLACK_MS: Ms = 1;
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -1207,5 +1251,35 @@ mod tests {
             + u64::from(FRAME_UPLOAD_ATTEMPTS) * FRAME_UPLOAD_TIMEOUT_MS;
         assert_eq!(run, 13_000);
         assert!(run < FRAME_GRAB_MIN_GAP_MS, "{run} ms");
+    }
+
+    // C4 (S1): the brief's numbers, written here: a 150 ms target, a 500 ms cap, the gap that
+    // re-anchors the clock is the cap ("a gap longer than the cap"), and the queue holds a 60 fps
+    // source's cap with both ends (31 frames). The audio's slack is 1 ms.
+    #[test]
+    fn the_playout_numbers_are_the_c4_briefs() {
+        assert_eq!(PLAYOUT_TARGET_MS, 150, "the brief: start at 150 ms");
+        assert_eq!(PLAYOUT_CAP_MS, 500, "the brief: hard cap 500 ms");
+        assert_eq!(PLAYOUT_REANCHOR_GAP_MS, PLAYOUT_CAP_MS);
+        assert_eq!(CAMERA_MAX_FPS, 60);
+        assert_eq!(PLAYOUT_MAX_FRAMES, 31, "500 ms of 60 fps, both ends");
+        assert_eq!(PLAYOUT_AUDIO_SLACK_MS, 1);
+        // Constant against constant: the compiler checks it. The target sits inside the cap with room
+        // for a burst, and the slack is far under the target.
+        const _: () =
+            assert!(PLAYOUT_TARGET_MS < PLAYOUT_CAP_MS && PLAYOUT_AUDIO_SLACK_MS * 100 < PLAYOUT_TARGET_MS);
+    }
+
+    // C4 (S1): the phase machine still reads decode time (the brief: `InputFrame` drives it), so the
+    // queue must be able to air a frame by the time the domain says Live: Live waits for
+    // `resume_after_ms` of continuous frames, and the first of them is due a target (and one tick)
+    // after the clock anchors on it. The queue drains in a target, inside the freeze, and its cap is
+    // under the slate, so a held camera is frozen by the domain before the queue could hold it back.
+    #[test]
+    fn the_playout_airs_a_frame_before_the_domain_goes_live() {
+        let t = Thresholds::default();
+        assert!(PLAYOUT_TARGET_MS + TICK_WIDEST_MS < t.resume_after_ms);
+        assert!(PLAYOUT_TARGET_MS < t.frozen_after_ms);
+        assert!(PLAYOUT_CAP_MS < t.slate_after_ms);
     }
 }
