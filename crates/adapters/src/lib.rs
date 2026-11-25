@@ -1,6 +1,7 @@
 //! Live adapters: GStreamer, CEF, HTTP, /proc.
 pub mod cef_graphics;
 pub mod control_http;
+pub mod decoder_trace;
 pub mod frame_store;
 pub mod frame_tap;
 pub mod gst_input;

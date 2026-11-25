@@ -106,6 +106,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+use crate::decoder_trace::DecoderTrace;
 use crate::frame_store::{media_time, FrameStore, AUDIO_CHANNELS, AUDIO_RATE};
 use crate::gst_output::LogFn;
 #[cfg(feature = "test-hooks")]
@@ -724,16 +725,46 @@ impl GstInput {
         // video appsink's next picture closes it (`wire_video`).
         let withheld = Arc::new(Mutex::new(WithheldSpans::new(self.withheld_min)));
         let units = Arc::clone(&withheld);
+        // C4 fix round 3: each frame in and out of the decoder, paired, so a clamped run's frames are
+        // logged with the stamp each was taken in with (`DecoderTrace`).
+        let trace = Arc::new(Mutex::new(DecoderTrace::default()));
+        let taken = Arc::clone(&trace);
         vdec.static_pad("sink")
             .ok_or("avdec_h264 has no sink pad")?
             .add_probe(
                 gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
-                move |_, _| {
-                    locked(&units).on_unit(Instant::now());
+                move |_, info| {
+                    let now = Instant::now();
+                    locked(&units).on_unit(now);
+                    match &info.data {
+                        Some(gst::PadProbeData::Buffer(b)) => {
+                            locked(&taken).on_input(b.pts().map(gst::ClockTime::nseconds), now);
+                        }
+                        Some(gst::PadProbeData::BufferList(l)) => {
+                            for b in l.iter() {
+                                locked(&taken).on_input(b.pts().map(gst::ClockTime::nseconds), now);
+                            }
+                        }
+                        _ => {}
+                    }
                     gst::PadProbeReturn::Ok
                 },
             )
             .ok_or("the decoder's unit probe was refused")?;
+        let given = Arc::clone(&self.shared);
+        vdec.static_pad("src")
+            .ok_or("avdec_h264 has no src pad")?
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                    let line =
+                        locked(&trace).on_output(b.pts().map(gst::ClockTime::nseconds), Instant::now());
+                    if let Some(line) = line {
+                        given.log(&format!("gen={gen}: {line}"));
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or("the decoder's output probe was refused")?;
         // The owner's ruling, 2026-10-19 (Owed 48): a frame with damaged macroblocks is dropped, so
         // after a loss the slot holds the last good picture for a moment instead of airing smears.
         vdec.set_property("output-corrupt", false);
