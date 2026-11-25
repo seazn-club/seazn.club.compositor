@@ -10,8 +10,14 @@
 //!
 //! ```text
 //! input-tap --out /out/tap.jsonl --srt-host mediamtx --srt-port 8890 --stream-id read:cam \
-//!   [--latency-ms 1000] [--size 1280x720]
+//!   [--latency-ms 1000] [--size 1280x720] [--audio-out /out/tap-audio.jsonl]
 //! ```
+//!
+//! `--audio-out` (C4 fix round 4, the W0 diagnostic) also decodes the camera's audio (`aacparse` →
+//! `avdec_aac`, as the compositor's input does) and writes one line per decoded buffer:
+//! `{"build","pts_ns","dur_ns","wall_us"}`. The stamps the decoder gives the audio, beside the
+//! camera's own on the wire (`wire.jsonl`), are what tells an input chain that moves the picture's
+//! stamps from one that moves the sound's.
 //!
 //! The SRT passphrase is `HARNESS_SRT_PASSPHRASE` (environment, never argv). A build that fails or
 //! ends (no stream on the path yet, a kicked reader) is logged and rebuilt a second later, forever:
@@ -36,7 +42,7 @@ use harness::silence::Silence;
 use harness::strip::{self, Plane};
 use serde_json::json;
 
-const FLAGS: [&str; 7] = [
+const FLAGS: [&str; 8] = [
     "--out",
     "--srt-host",
     "--srt-port",
@@ -44,6 +50,7 @@ const FLAGS: [&str; 7] = [
     "--latency-ms",
     "--size",
     "--report-every",
+    "--audio-out",
 ];
 const REQUIRED: [&str; 4] = ["--out", "--srt-host", "--srt-port", "--stream-id"];
 /// The compositor's input latency (its log: `gen=1: srt://mediamtx:8890 latency=1000`).
@@ -87,6 +94,8 @@ fn make(factory: &str) -> Result<gst::Element, String> {
 
 struct Tap {
     out: Mutex<LineWriter<std::fs::File>>,
+    /// The decoded audio's stamps (`--audio-out`), when asked for.
+    audio_out: Option<Mutex<LineWriter<std::fs::File>>>,
     frames: AtomicU64,
     report_every: u64,
 }
@@ -153,6 +162,12 @@ fn run_build(t: &Target, tap: &Arc<Tap>, build: u64) -> Result<String, String> {
     let asink = make("fakesink")?;
     asink.set_property("sync", false);
     asink.set_property("async", false);
+    // The audio, decoded only when its stamps are asked for (the tap's other readers pay nothing).
+    let aqueue = make("queue")?;
+    aqueue.set_property_from_str("leaky", "downstream");
+    aqueue.set_property("max-size-time", VIDEO_QUEUE_NS);
+    let aparse = make("aacparse")?;
+    let adec = make("avdec_aac")?;
 
     pipeline
         .add_many([
@@ -167,11 +182,34 @@ fn run_build(t: &Target, tap: &Arc<Tap>, build: u64) -> Result<String, String> {
             &asink,
         ])
         .map_err(|e| e.to_string())?;
+    if tap.audio_out.is_some() {
+        pipeline
+            .add_many([&aqueue, &aparse, &adec])
+            .map_err(|e| e.to_string())?;
+        gst::Element::link_many([&aqueue, &aparse, &adec, &asink])
+            .map_err(|e| format!("audio branch: {e}"))?;
+        let tap_a = Arc::clone(tap);
+        adec.static_pad("src")
+            .ok_or("avdec_aac has no src pad")?
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let (Some(gst::PadProbeData::Buffer(b)), Some(out)) = (&info.data, &tap_a.audio_out) {
+                    let line = json!({
+                        "build": build,
+                        "pts_ns": b.pts().map(|p| p.nseconds()),
+                        "dur_ns": b.duration().map(|d| d.nseconds()),
+                        "wall_us": now_us(),
+                    });
+                    let _ = writeln!(locked(out), "{line}");
+                }
+                gst::PadProbeReturn::Ok
+            });
+    }
     src.link(&demux).map_err(|e| format!("src to demux: {e}"))?;
     gst::Element::link_many([&vqueue, &vparse, &vdec, &scale, &vcaps, vsink.upcast_ref()])
         .map_err(|e| format!("video branch: {e}"))?;
     {
-        let (vq, asink) = (vqueue.clone(), asink.clone());
+        let (vq, asink, aq) = (vqueue.clone(), asink.clone(), aqueue.clone());
+        let decode_audio = tap.audio_out.is_some();
         demux.connect_pad_added(move |_, pad| {
             let name = pad
                 .current_caps()
@@ -181,6 +219,7 @@ fn run_build(t: &Target, tap: &Arc<Tap>, build: u64) -> Result<String, String> {
             let target = match name.as_str() {
                 "video/x-h264" => vq.static_pad("sink"),
                 // The audio is read by no one here; a linked sink keeps tsdemux's flow combined.
+                "audio/mpeg" if decode_audio => aq.static_pad("sink"),
                 "audio/mpeg" => asink.static_pad("sink"),
                 _ => None,
             };
@@ -311,8 +350,19 @@ fn run() -> Result<(), (u8, String)> {
         .append(true)
         .open(&a["--out"])
         .map_err(|e| (73, format!("{}: {e}", a["--out"])))?;
+    let audio_out = match a.get("--audio-out") {
+        Some(path) => Some(Mutex::new(LineWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| (73, format!("{path}: {e}")))?,
+        ))),
+        None => None,
+    };
     let tap = Arc::new(Tap {
         out: Mutex::new(LineWriter::new(out)),
+        audio_out,
         frames: AtomicU64::new(0),
         report_every,
     });
