@@ -751,17 +751,52 @@ fn camera_stop_slates_and_returns_and_reds_without_its_pause() {
 }
 
 /// 12 pauses, one every 10 s from 5 s, each `pause_ms` long (the case's own rule: halfway between
-/// slate_after_ms and input_stall_after_ms, from thresholds.json).
+/// slate_after_ms and input_stall_after_ms, from thresholds.json). The compositor's beats as the
+/// real chain logs them once C1 is fixed (C4 fix round 2): each pause closes its live window with the
+/// live→frozen beat `frozen_after_ms` after the camera stops, counting the pause's own repeats (the
+/// queue drains its target, then a tick each until the frozen rule) and nothing else; the
+/// frozen→reconnecting beat at the slate counts the frozen frame's repeats, outside every window; the
+/// final beat closes the last. The A/V as the run's checker reads it (CI run 45588726031: p50 2 ms;
+/// a clean run's max within budget).
 fn camera_flap_paused(pause_ms: i64) -> World {
     let mut w = World::new(125);
+    w.report_patch = Some(flap_av);
+    let pause_repeats = ((w.ms("frozen_after_ms") - w.ms("playout_target_ms")) as f64
+        / w.t["frame_period_ms"].as_f64().unwrap())
+    .ceil();
     for i in 0..12 {
         let p = w.at(5.0 + 10.0 * f64::from(i));
         let r = p + pause_ms;
         w.mark("pause", p, json!({"pause_ms": pause_ms}));
         w.mark("resume", r, Value::Null);
         w.camera_gaps.push((p + 30, r + 30));
+        let closing = p + 30 + w.ms("frozen_after_ms");
+        flap_beat(&mut w, closing, pause_repeats as u64, 0, 0);
+        let slate = p + 30 + w.ms("slate_after_ms");
+        flap_beat(&mut w, slate, 120, 0, 0);
     }
+    let end = w.end;
+    flap_beat(&mut w, end, 0, 0, 0);
     w
+}
+
+/// One compositor beat: the camera's repeat line and its playout line.
+fn flap_beat(w: &mut World, at: i64, repeat_ticks: u64, reanchors: u64, late: u64) {
+    w.line(
+        at,
+        format!("camera frames replaced beat=0 total=0 repeat_ticks={repeat_ticks} repeat_ticks_total=0"),
+    );
+    w.line(
+        at,
+        format!(
+            "input received fps=30.0 kbps=3500 withheld_spans=0 queue_overruns=0 audio_pad_bytes=0 \
+             audio_overflow_bytes=0 audio_late_bytes={late} reanchors={reanchors}"
+        ),
+    );
+}
+
+fn flap_av(r: &mut Value) {
+    r["audio"]["av_offset_ms"] = json!({"p50": 2, "max_abs": 13, "pairs": 35, "camera_codec_delay_ms": 33.3});
 }
 
 fn camera_flap() -> World {
@@ -780,15 +815,15 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
     let mut w = camera_flap();
     w.playout_ms = w.ms("playout_target_ms") as f64;
     assert_pass(&judge(&w, "camera-flap", "", "flap-playout"), "flap-playout");
-    // C4 fix round 1 (the review's m1): the playout's real delay is the target rounded up to the
-    // programme's tick grid (166.7 ms at the fixture's 30 fps, a tick more than the target), and the
-    // pipeline's own hold (`budget_frame_to_encoder_ms`) adds on. At both worst cases each hold-off
-    // reads 667 ms: under a floor that took the target alone off (700), inside one that takes a
-    // tick more off (666).
+    // C4 fix round 2 (the re-review's floor finding): the picture's worst wait is the cap, not the
+    // target (I1's rule: the target plus however far its audio trails), on the tick grid (a tick
+    // more), a frame more for the switch's phase against the camera's frames, and the pipeline's
+    // own hold (`budget_frame_to_encoder_ms`): 500 + 33.3 + 150 = 683.3 ms off the 1 000 ms hold-off,
+    // so each reads 316.7 ms, a tick clear of the floor (282.7) the case now states.
     let mut worst = camera_flap();
     let tick = 1_000.0 / f64::from(OutputProfile::P720.fps);
-    let target = worst.ms("playout_target_ms") as f64;
-    worst.playout_ms = (target / tick).ceil() * tick + worst.ms("budget_frame_to_encoder_ms") as f64;
+    let cap = worst.ms("playout_cap_ms") as f64;
+    worst.playout_ms = (cap / tick).ceil() * tick + tick + worst.ms("budget_frame_to_encoder_ms") as f64;
     assert_pass(
         &judge(&worst, "camera-flap", "", "flap-playout-worst"),
         "flap-playout-worst",
@@ -814,6 +849,80 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         "flaps_seen",
         "flap-boundary",
     );
+    // C4 fix round 2: each window check reds on f3eff28's storm in one window (the window after the
+    // third return, 33 s in: 23 counted re-anchors, 86 repeated ticks, 448 528 bytes of late audio,
+    // its strip freezing), and the A/V on its max (195 ms) or on too few pairs.
+    let storm = |edit: fn(&mut World)| {
+        let mut w = camera_flap();
+        edit(&mut w);
+        w
+    };
+    let reds: [(&str, World, &str); 7] = [
+        (
+            "flap-nobeats",
+            storm(|w| w.log.retain(|(_, l)| !l.starts_with("input received"))),
+            "live_windows",
+        ),
+        (
+            "flap-reanchors",
+            storm(|w| {
+                let at = w.at(33.0);
+                flap_beat(w, at, 0, 23, 0)
+            }),
+            "window_reanchors",
+        ),
+        (
+            "flap-repeats",
+            storm(|w| {
+                let at = w.at(33.0);
+                flap_beat(w, at, 86, 0, 0)
+            }),
+            "window_repeats",
+        ),
+        (
+            "flap-late",
+            storm(|w| {
+                let at = w.at(33.0);
+                flap_beat(w, at, 0, 0, 448_528)
+            }),
+            "window_late_audio",
+        ),
+        (
+            "flap-freeze",
+            storm(|w| {
+                let at = w.at(33.0);
+                w.camera_gaps.push((at, at + 200));
+            }),
+            "window_strip",
+        ),
+        (
+            "flap-av-out",
+            storm(|w| {
+                w.report_patch = Some(|r| {
+                    r["audio"]["av_offset_ms"] =
+                        json!({"p50": 2, "max_abs": 195, "pairs": 35, "camera_codec_delay_ms": 33.3});
+                })
+            }),
+            "av_in_step",
+        ),
+        (
+            "flap-av-unpaired",
+            storm(|w| {
+                w.report_patch = Some(|r| {
+                    r["audio"]["av_offset_ms"] =
+                        json!({"p50": 2, "max_abs": 13, "pairs": 11, "camera_codec_delay_ms": 33.3});
+                })
+            }),
+            "av_in_step",
+        ),
+    ];
+    let mut checked = 0;
+    for (tag, w, check) in &reds {
+        assert_fails(&judge(w, "camera-flap", "", tag), check, tag);
+        checked += 1;
+    }
+    eprintln!("camera-flap window reds checked: {checked}");
+    assert_eq!(checked, 7);
 }
 
 /// C3's case 20: netem loss 20 s to 60 s (`dropped` packets), then a `pause_ms` pause at 70 s. As CI

@@ -12,7 +12,7 @@
 use domain::config::{
     OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN,
     FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
-    PLAYOUT_TARGET_MS, TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
+    PLAYOUT_CAP_MS, PLAYOUT_EARLY_REANCHOR_MS, PLAYOUT_TARGET_MS, TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
 };
 use serde_json::{json, Map, Value};
 
@@ -111,6 +111,9 @@ pub struct AdapterConsts {
     /// C11's `TEARDOWN_LEAK_AFTER_MS`: still not back this long after the kill, it counts leaked
     /// (case 16: the leak count, about `reaper_kill_after_ms` + this after the retirement).
     pub teardown_leak_after_ms: u64,
+    /// The programme's audio per ms (`AUDIO_RATE` × `AUDIO_FRAME_BYTES` / 1 000): camera-flap's
+    /// late-audio budget, a span of ms, is read in the beats' bytes.
+    pub audio_bytes_per_ms: u64,
 }
 
 /// `harness/thresholds.json`, as `dump-thresholds` writes it.
@@ -160,6 +163,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         encoded_ring_span_ms,
         reaper_kill_after_ms,
         teardown_leak_after_ms,
+        audio_bytes_per_ms,
     } = adapters;
     let mut m = Map::new();
     let mut put = |k: &str, v: Value| {
@@ -222,6 +226,11 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     // C4's playout: the camera's picture airs this long behind its arrival, so a hold-off read in
     // camera time (camera-flap's `suppressed_ms`) is this much shorter than the wall's.
     put("playout_target_ms", json!(PLAYOUT_TARGET_MS));
+    // C4 fix round 2: the playout's cap (the picture's worst wait under I1's rule: the target plus
+    // the audio's trail; camera-flap's floor and its late-audio budget) and the early rule's wait
+    // (whether its one correction can land after a return's switch: camera-flap's windows).
+    put("playout_cap_ms", json!(PLAYOUT_CAP_MS));
+    put("playout_early_reanchor_ms", json!(PLAYOUT_EARLY_REANCHOR_MS));
     // Owed 86's starvation alarm, for the same profile: raised by a beat below the floor, cleared by
     // one at or above the recovered level (case 6, the honest beat).
     put("output_fps_floor", json!(OutputProfile::P720.fps_floor()));
@@ -233,6 +242,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("encoded_ring_span_ms", json!(encoded_ring_span_ms));
     put("reaper_kill_after_ms", json!(reaper_kill_after_ms));
     put("teardown_leak_after_ms", json!(teardown_leak_after_ms));
+    put("audio_bytes_per_ms", json!(audio_bytes_per_ms));
     // The budgets.
     put("budget_slate_after_loss_ms", json!(budget_slate_after_loss_ms()));
     put("budget_return_to_live_ms", json!(BUDGET_RETURN_TO_LIVE_MS));
@@ -280,6 +290,7 @@ pub fn committed_adapters(v: &Value) -> Option<AdapterConsts> {
         encoded_ring_span_ms: n("encoded_ring_span_ms")?,
         reaper_kill_after_ms: n("reaper_kill_after_ms")?,
         teardown_leak_after_ms: n("teardown_leak_after_ms")?,
+        audio_bytes_per_ms: n("audio_bytes_per_ms")?,
     })
 }
 
@@ -321,6 +332,7 @@ mod tests {
             encoded_ring_span_ms: 3,
             reaper_kill_after_ms: 4,
             teardown_leak_after_ms: 5,
+            audio_bytes_per_ms: 6,
         });
         let pairs: [(&str, u64); 11] = [
             ("slate_after_ms", t.slate_after_ms),
@@ -457,6 +469,7 @@ mod tests {
             encoded_ring_span_ms: 3,
             reaper_kill_after_ms: 4,
             teardown_leak_after_ms: 5,
+            audio_bytes_per_ms: 6,
         });
         let want = 2 + TICK_WIDEST_MS + t.cef_load_timeout_ms + BUDGET_FRAME_TO_ENCODER_MS;
         assert_eq!(v["budget_gpu_death_reload_ms"].as_u64(), Some(want));
@@ -486,6 +499,7 @@ mod tests {
             encoded_ring_span_ms: 3,
             reaper_kill_after_ms: 4,
             teardown_leak_after_ms: 5,
+            audio_bytes_per_ms: 6,
         });
         assert_eq!(v["budget_blank_page_reload_ms"].as_u64(), Some(want));
         let (_, committed) = committed();
