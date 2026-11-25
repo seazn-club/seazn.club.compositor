@@ -3681,8 +3681,8 @@ has no picture; it is in the CPU table only.)
 | L5 | ×1.01 | ×1.02 | ×1.01 | ×1.03 |
 | X1 | ×1.14 | ×1.09 | ×1.02 | ×1.28 |
 
-Frame threads are cheaper than sliced ones, which offsets most of the lookahead: L2 costs +0–14 % where the
-picture is hard. Applied to F-033/F-034's L1 cost legs (6x `medium`, C:snow p95 3.465, D:snow 3.683) as
+L2 costs +0 to +14 % where the picture is hard: the lookahead's cost is mostly offset, plausibly by frame
+threads being cheaper than sliced ones (not isolated here). Applied to F-033/F-034's L1 cost legs (6x `medium`, C:snow p95 3.465, D:snow 3.683) as
 a **projection, not a measurement**: scaling the whole Machine by the snow ratio is an upper bound
 (CEF and the mux do not scale), giving L2 3.95 / 4.20, L3 3.88 / 4.12, L4 5.09 / 5.41 of 6. L2 and L3 sit under
 4.5 even at that bound; L4 does not. Host spread is ±0.4 core (F-033), so L2's margin is real but not large.
