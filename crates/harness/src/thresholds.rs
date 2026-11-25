@@ -52,7 +52,14 @@ pub const BUDGET_FRAME_TO_ENCODER_MS: u64 = 150;
 /// failure table, timing budgets and resource bounds are adopted as written"); §6's own text names
 /// no A/V number.
 pub const BUDGET_AV_OFFSET_MS: u64 = 40;
-/// C4's gate ruling (owner, 2026-11-25, option 1): the budget above is judged on the pairs taken from
+/// The worst single tone-to-flash pair the A/V gate keeps (C4 round 6, owner 2026-11-25, "middle
+/// point"): 50 ms. The 40 above is judged on the run's MEDIAN (`av_in_step`'s p50 check, which is what
+/// catches a whole-run steady offset), and the spec's ±40 is that number. Source: owner 2026-11-25,
+/// middle point; 45 to 50 ms is the ITU-R BT.1359 audio-lead detectability edge. CI read a constant
+/// 21 to 50 ms per run on the same code (camera-burst, runs 45714249799: p50 22, 49, 45), the playout's
+/// own view of those runs identical (`docs/_INDEX.md`, C4 round 6).
+pub const BUDGET_AV_PAIR_MAX_MS: u64 = 50;
+/// C4's gate ruling (owner, 2026-11-25, option 1): the kept-pair budget (`BUDGET_AV_PAIR_MAX_MS`) is judged on the pairs taken from
 /// `av_return_cut_ms` after each ANCHOR (the playout's own return from the camera, the wall time of
 /// its `reanchor(gap` line; the run's first pair at the start), and the pairs before it have their
 /// own bound, `BUDGET_AV_OFFSET_EXCLUDED_MS`. The cut spans, openly: the return's hold-off
@@ -270,6 +277,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     );
     put("budget_frame_to_encoder_ms", json!(BUDGET_FRAME_TO_ENCODER_MS));
     put("budget_av_offset_ms", json!(BUDGET_AV_OFFSET_MS));
+    put("budget_av_pair_max_ms", json!(BUDGET_AV_PAIR_MAX_MS));
     put(
         "budget_av_offset_excluded_ms",
         json!(BUDGET_AV_OFFSET_EXCLUDED_MS),
@@ -358,7 +366,7 @@ mod tests {
             teardown_leak_after_ms: 5,
             audio_bytes_per_ms: 6,
         });
-        let pairs: [(&str, u64); 13] = [
+        let pairs: [(&str, u64); 14] = [
             ("slate_after_ms", t.slate_after_ms),
             ("resume_after_ms", t.resume_after_ms),
             ("output_connect_timeout_ms", t.output_connect_timeout_ms),
@@ -375,6 +383,7 @@ mod tests {
                 t.resume_after_ms + PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS,
             ),
             ("budget_av_offset_excluded_ms", BUDGET_AV_OFFSET_EXCLUDED_MS),
+            ("budget_av_pair_max_ms", BUDGET_AV_PAIR_MAX_MS),
         ];
         for (k, want) in pairs {
             assert_eq!(v[k].as_u64(), Some(want), "{k}");
@@ -443,7 +452,9 @@ mod tests {
             Thresholds::default().resume_after_ms + PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS,
             2_650
         );
-        const _: () = assert!(BUDGET_AV_OFFSET_EXCLUDED_MS > BUDGET_AV_OFFSET_MS);
+        const _: () = assert!(BUDGET_AV_PAIR_MAX_MS > BUDGET_AV_OFFSET_MS);
+        const _: () = assert!(BUDGET_AV_OFFSET_EXCLUDED_MS > BUDGET_AV_PAIR_MAX_MS);
+        assert_eq!(BUDGET_AV_PAIR_MAX_MS, 50, "the owner's middle point");
         assert_eq!(BUDGET_AV_OFFSET_EXCLUDED_MS, 72, "main's pre-C4 max");
     }
 

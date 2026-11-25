@@ -280,7 +280,7 @@ def outage_across($clear): [.output_outages[] | select(.to_wall_ms > $clear)] | 
 # (`.audio.av_offset_ms.list`, each {at_ms, ms}) are split by where they fall against the ANCHORS the case
 # names (`$starts`, wall ms: the playout's own return from the camera, `.log.playout_returns[].at_ms`,
 # and the run's first pair): a pair at least `$t.av_return_cut_ms` after the latest anchor at or before
-# it is KEPT, judged against `$t.budget_av_offset_ms`; every other pair is EXCLUDED and judged against
+# it is KEPT, judged against `$t.budget_av_pair_max_ms`; every other pair is EXCLUDED and judged against
 # `$t.budget_av_offset_excluded_ms`. The cut spans, openly, the return's hold-off (`resume_after_ms`),
 # the playout's settle skip and its settle (about 2.7 s, thresholds.rs). An anchor with no kept pair
 # after it is an empty window. A report with no pair list has no kept pair, which the verdicts fail.
@@ -297,9 +297,12 @@ def av_gate($starts):
      excluded_max: ([$a[] | select(.kept | not) | .ms] | max // 0),
      empty_windows: ([$s[] | . as $w | select(([$a[] | select(.kept and .from == $w)] | length) == 0)] | length)};
 
-# The gate's verdict: pairs enough (`$pairs_min`: the case's anti-vacuity), at least one kept, no
-# window without a kept pair, the kept pairs within the budget, the excluded within their own bound.
+# The gate's verdict (C4 round 6, owner 2026-11-25): pairs enough (`$pairs_min`: the case's anti-vacuity),
+# at least one kept, no window without a kept pair, the kept pairs within the pair budget
+# (`budget_av_pair_max_ms`), the excluded within their own bound, and the MEDIAN of all the pairs within
+# `budget_av_offset_ms` (a whole-run steady offset passes a per-pair budget it sits under, not the median's).
 def av_gate_ok($starts; $pairs_min):
   av_gate($starts) as $g
   | $g.pairs >= $pairs_min and $g.kept >= 1 and $g.empty_windows == 0 and $g.windows >= 1
-    and $g.kept_max <= $t.budget_av_offset_ms and $g.excluded_max <= $t.budget_av_offset_excluded_ms;
+    and $g.kept_max <= $t.budget_av_pair_max_ms and $g.excluded_max <= $t.budget_av_offset_excluded_ms
+    and ((.audio.av_offset_ms.p50 // 0) | abs) <= $t.budget_av_offset_ms;

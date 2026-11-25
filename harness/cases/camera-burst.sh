@@ -19,8 +19,9 @@
 #
 # Expected (CI-owed, never run locally): repeat ticks under 2 % of the camera's cadence pairs, 0
 # audio overflow bytes over every beat's camera line, the audio in step with the picture within
-# `budget_av_offset_ms` at every tone-to-flash pair from `av_return_cut_ms` after the run's first pair (the earlier
-# pairs within `budget_av_offset_excluded_ms`; lib.jq's `av_gate`), no slate inside the run, a clean exit. The
+# `budget_av_pair_max_ms` at every tone-to-flash pair from `av_return_cut_ms` after the run's first pair (the earlier
+# pairs within `budget_av_offset_excluded_ms`; lib.jq's `av_gate`), the median pair within `budget_av_offset_ms`, no slate
+# inside the run, a clean exit. The
 # compositor's own repeat count is measured beside the checker's, not judged.
 
 CASE_LIVE_S=60
@@ -67,7 +68,8 @@ case_verdict() {
   # Anti-vacuity: at least half the live window's bursts paired (CI read 66 over the 60 s).
   # C4's gate (owner ruling, 2026-11-25, option 1): the budget is judged on the pairs from `av_return_cut_ms`
   # after the run's first pair (the case has holds, no return), the earlier ones within
-  # `budget_av_offset_excluded_ms`, the kept and excluded counts in the measure (lib.jq).
+  # `budget_av_offset_excluded_ms`, the median of all pairs within `budget_av_offset_ms` (round 6: it catches a
+  # whole-run steady offset), the kept and excluded counts in the measure (lib.jq).
   require av_in_step "def av_starts: [.audio.av_offset_ms.list[0].at_ms // empty]; av_gate_ok(av_starts; 30)" \
     "def av_starts: [.audio.av_offset_ms.list[0].at_ms // empty]; av_gate(av_starts) + {p50: .audio.av_offset_ms.p50}"
   measure compositor_repeat_ticks '{repeat_ticks: ([.log.camera_repeats[].repeat_ticks] | add),

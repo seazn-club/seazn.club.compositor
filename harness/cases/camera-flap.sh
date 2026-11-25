@@ -40,8 +40,8 @@
 #   skip, 12 times a window);
 # - late audio at most one re-anchor's skip, (playout_cap_ms - playout_target_ms) of audio
 #   (`audio_bytes_per_ms`).
-# And the run's A/V within budget_av_offset_ms on the tone-to-flash pairs from `av_return_cut_ms` after each
-# anchor (the playout's return, the run's first pair), the earlier pairs within `budget_av_offset_excluded_ms` (lib.jq's `av_gate`; at least one pair a flap).
+# And the run's A/V within budget_av_pair_max_ms on the tone-to-flash pairs from `av_return_cut_ms` after each
+# anchor (the playout's return, the run's first pair), the earlier pairs within `budget_av_offset_excluded_ms` (lib.jq's `av_gate`; at least one pair a flap), and the median pair within budget_av_offset_ms (round 6).
 
 CASE_LIVE_S=125
 CASE_KEY=flap_hysteresis

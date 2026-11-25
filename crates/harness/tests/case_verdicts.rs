@@ -814,6 +814,8 @@ enum Spoil {
     /// The excluded pair 1 ms short of the cut after the first return (the run's first pair when
     /// there is no return), at this many ms.
     OneExcluded(i64),
+    /// Every kept pair at this many ms (the run's median with them): C4 round 6's p50 check.
+    KeptLevel(i64),
     /// Every pair inside a cut: no kept pair at all.
     NoKept,
     /// No kept pair in window `n` (0 is the run's own start): its kept pairs are dropped.
@@ -943,6 +945,7 @@ fn gate_av(r: &mut Value, excluded_ms: i64, kept_ms: i64, spoil: Spoil) {
             assert!(!list[i].3, "the pair 1 ms short of the cut is excluded");
             list[i].1 = ms;
         }
+        Spoil::KeptLevel(ms) => list.iter_mut().filter(|p| p.3).for_each(|p| p.1 = ms),
         Spoil::NoKept => list.retain(|p| !p.3),
         Spoil::EmptyWindow(n) => list.retain(|p| !(p.3 && p.2 == n)),
         Spoil::Few(n) => list.truncate(n),
@@ -959,8 +962,8 @@ fn gate_av(r: &mut Value, excluded_ms: i64, kept_ms: i64, spoil: Spoil) {
     });
 }
 
-/// A pair inside a cut of its anchor rides the return's excursion (Owed 121): over the budget (40) and
-/// inside the excluded bound (72, main's pre-C4 camera-flap max).
+/// A pair inside a cut of its anchor rides the return's excursion (Owed 121): over the pair budget (50)
+/// and inside the excluded bound (72, main's pre-C4 camera-flap max).
 const GATE_EXCLUDED_MS: i64 = 60;
 /// A settled pair as CI read camera-flap's (p50 27 ms).
 const GATE_KEPT_MS: i64 = 27;
@@ -1027,7 +1030,7 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         edit(&mut w);
         w
     };
-    let reds: [(&str, World, &str); 13] = [
+    let reds: [(&str, World, &str); 14] = [
         (
             "flap-nobeats",
             storm(|w| w.log.retain(|(_, l)| !l.starts_with("input received"))),
@@ -1078,16 +1081,23 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         // C4's gate (owner ruling, 2026-11-25): one kept pair over the budget, one excluded pair over
         // its bound, no kept pair at all, a window with none, and no list.
         (
-            "flap-av-kept41",
+            "flap-av-kept51",
             storm(|w| {
-                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::OneKept(41)))
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::OneKept(51)))
             }),
             "av_in_step",
         ),
+        // C4 round 6 (owner 2026-11-25): the median of the pairs within `budget_av_offset_ms` (40), the
+        // check that catches a run sitting steadily at 41 with no pair over the pair budget (50).
         (
-            "flap-av-runstart41",
+            "flap-av-p50-41",
+            storm(|w| w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 41, Spoil::KeptLevel(41)))),
+            "av_in_step",
+        ),
+        (
+            "flap-av-runstart51",
             storm(|w| {
-                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::RunStartKept(41)))
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::RunStartKept(51)))
             }),
             "av_in_step",
         ),
@@ -1122,7 +1132,39 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
         checked += 1;
     }
     eprintln!("camera-flap window reds checked: {checked}");
-    assert_eq!(checked, 13);
+    assert_eq!(checked, 14);
+}
+
+/// C4 round 6 (owner 2026-11-25): the A/V gate passes AT each of its numbers, camera-flap and
+/// camera-burst alike, so the reds above (51, 73, a median of 41) are a ONE ms step off a pass: a kept
+/// pair at the pair budget (50), an excluded pair at its bound (72), a median at the median's (40).
+#[test]
+fn the_av_gate_passes_at_each_of_its_budgets() {
+    type Patch = fn(&mut Value);
+    let patches: [(&str, Patch); 3] = [
+        ("at-pair-budget", |r| {
+            gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::OneKept(50))
+        }),
+        ("at-excluded-bound", |r| {
+            gate_av(r, GATE_EXCLUDED_MS, GATE_KEPT_MS, Spoil::OneExcluded(72))
+        }),
+        ("at-median-budget", |r| {
+            gate_av(r, GATE_EXCLUDED_MS, 40, Spoil::KeptLevel(40))
+        }),
+    ];
+    let mut checked = 0;
+    for (name, patch) in patches {
+        let mut flap = camera_flap();
+        flap.report_patch = Some(patch);
+        assert_pass(&judge(&flap, "camera-flap", "", &format!("flap-{name}")), name);
+        let freeze = 300 - PLAYOUT_TARGET_MS as i64;
+        let mut burst = camera_burst(freeze, |_| {});
+        burst.report_patch = Some(patch);
+        assert_pass(&judge(&burst, "camera-burst", "", &format!("burst-{name}")), name);
+        checked += 2;
+    }
+    eprintln!("a/v gate boundary worlds checked: {checked}");
+    assert_eq!(checked, 6);
 }
 
 /// C3's case 20: netem loss 20 s to 60 s (`dropped` packets), then a `pause_ms` pause at 70 s. As CI
@@ -7146,7 +7188,7 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
              audio_late_bytes=0 reanchors=0",
         );
     };
-    let reds: [(&str, World, &str); 16] = [
+    let reds: [(&str, World, &str); 17] = [
         (
             "burst-newest",
             camera_burst(300, |_| {}),
@@ -7216,16 +7258,23 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
         // C4's gate (owner ruling, 2026-11-25), as camera-flap's: a kept pair at 41, an excluded one
         // at 73, no kept pair, no list.
         (
-            "burst-av-kept41",
+            "burst-av-kept51",
             camera_burst(freeze, |w| {
-                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::OneKept(41)))
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::OneKept(51)))
             }),
             "av_in_step",
         ),
         (
-            "burst-av-runstart41",
+            "burst-av-p50-41",
             camera_burst(freeze, |w| {
-                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::RunStartKept(41)))
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 41, Spoil::KeptLevel(41)))
+            }),
+            "av_in_step",
+        ),
+        (
+            "burst-av-runstart51",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 25, Spoil::RunStartKept(51)))
             }),
             "av_in_step",
         ),
