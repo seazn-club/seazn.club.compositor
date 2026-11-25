@@ -3612,3 +3612,161 @@ against the old 850 floor; `docs/_INDEX.md`'s decision row). Witnesses: 16 hand 
     (`programme_output.rs`), and a real input's audio lands within 350 ms of its picture's stamp
     (`input.rs`); camera-burst gains `av_in_step` (every tone-to-flash pair within
     `budget_av_offset_ms`, 40 ms, at least 30 pairs), which the unstamped-audio mutant reds.
+
+---
+
+## F-040: dropping `tune=zerolatency` for lookahead and High buys +1.4 to +4.2 VMAF at 6 Mbps for +0.8 s of latency, and breaks the forced-keyframe floor; B-frames add nothing and break the stream's first timestamps; `filler=0` is a no-op (C5, Phase A, measurement only, 2026-11-25)
+
+*Numbered F-040: PR #113 (C4) holds F-039. Renumber on merge. The Fly cost legs below are NOT measured: see "Owed".*
+
+**Question** (`compositor-c5-brief.md`, scan finding 6). Whether leaving `tune=zerolatency` (lookahead,
+frame threads), High profile and B-frames buys picture quality inside the owner's rule (1080p `medium`
+on performance-6x, CPU p95 within 75 % of cores = 4.5 of 6, `docs/_INDEX.md:173`). Nothing shipped
+changed: the encoder settings are as on main `0c7d376` (`gst_programme.rs:70-84`, `:578`, `:601`).
+
+**Method** (all CI; no local container runtime, and the local ffmpeg has no libvmaf).
+- Workflow `encoder-tune.yml` (push-triggered on this branch, no secrets) runs `harness/encoder-tune/measure.py`
+  on a GitHub runner (4 vCPU; the quality job on an Intel Xeon 6975P-C, the paced job on an AMD EPYC 9V74:
+  the runner type varies per run). Final run **45687294402**; earlier runs 45682741797 (paced fed the hard
+  clip and every leg fell behind 30 fps, so that latency was queueing: discarded) and the `[smoke]` runs.
+- **Quality, F-033's method:** Xiph's `touchdown_pass_1080p` and `rush_field_cuts_1080p`, the first 220
+  frames (F-033 does not record its offset), converted to I420; encoded with the product's own element,
+  GStreamer 1.24.2 `x264enc` (libx264 164.3108, the relay image's apt version: both Ubuntu 24.04), at 1080p30,
+  6000 kbps, 90-frame GOP, `scenecut=0`, VBV 1000 ms, `medium`; scored by libvmaf **3.2.0** (F-033's version,
+  built from tag `v3.2.0` at `3f9e02af`, model `vmaf_v0.6.1`) on the decoded stream against the raw source.
+  Every leg's real x264 options are in the artifact (the stream's own SEI).
+- **Method check:** leg R0 (F-033's settings: `zerolatency`, keyint 60, scene cut on) scores **78.55 / 89.90**
+  on rush / touchdown against F-033's `medium` **78.3 / 89.8** (+0.25 / +0.10): the method reproduces. (F-033 used the x264
+  CLI 0.165.3222; its 5th percentile on touchdown, 84.4, reads 83.2 here.)
+- **CPU:** the encoder's CPU seconds for the 220 frames, as cores at 30 fps (÷ 7.33 s), same host within a
+  job. The runner is saturated on the hard clips (3 to 5 cores' worth on 4 vCPUs), so these are **ratios
+  between legs, not core counts**, and not the 4.5-core rule's number: that is the Fly cost legs, owed.
+- **Latency and forced keys:** a paced 30 fps feed into the product's chain (`x264enc` → profile caps →
+  `h264parse` → AVC), on an easy picture (`videotestsrc ball`) so real time holds (every run: push lag max
+  1.1 ms). Latency = encoded access unit out minus its frame's due time. A forced key is asked as
+  `gst_programme.rs:932` asks (an upstream force-key-unit event from the parser's src pad, running time just
+  after the newest frame, all headers) at 7 offsets after the first frame, 2 repetitions each, a fresh
+  encoder per request; `min-force-key-unit-interval` = 2 200 ms as in the product.
+- **Product path:** `harness.yml` case `smoke` (the real relay image, real `rtmp2sink` to MediaMTX, the
+  checker) on throwaway spike branches `spike/enc-tune-l2` and `-l4` (never merged).
+
+**Legs.** L1 today (`zerolatency`, Main, `nal-hrd=cbr:filler=1`). L2 no tune, `bframes=0`, `rc-lookahead=15`,
+frame threads, High. L3 = L2 with lookahead 20. L4 = L2 with `bframes=2`. L5 = L1 with filler off, which is
+`nal-hrd=vbr`, NOT `filler=0` (below). X1 (extra, not a brief leg) = L2 with `sync-lookahead=0`. Threads: 6 for
+sliced, 9 for frame threads, what x264 picks on a 6-vCPU guest (probed on the runner: sliced = cpus, frame =
+cpus × 3/2).
+
+**Quality**: VMAF mean (1st percentile, 5th percentile).
+
+| Leg | rush_field_cuts | touchdown_pass |
+|---|---|---|
+| L1 today | 78.71 (73.1, 76.2) | 90.15 (78.4, 83.2) |
+| L2 lookahead 15, High | **82.88** (73.9, 78.6) | **91.58** (81.1, 85.0) |
+| L3 lookahead 20 | 82.90 (74.3, 78.6) | 91.52 (81.1, 85.0) |
+| L4 L2 + 2 B-frames | 83.24 (73.1, **75.2**) | 90.92 (80.2, 85.2) |
+| L5 `nal-hrd=vbr` | 78.71 (73.1, 76.2) | 90.15 (78.4, 83.2) |
+| X1 L2, `sync-lookahead=0` | 82.88 (73.7, 78.4) | 91.55 (81.1, 85.0) |
+
+Against L1: L2 **+4.17 / +1.43** mean, 1 % low +0.8 / +2.7. L3 buys +0.02 / −0.06 over L2 (nothing). L4 buys +0.36 /
+−0.66 over L2, and its rush 5th percentile falls 3.4 below L2's. (`snow` scores 15 VMAF on every leg: noise
+has no picture; it is in the CPU table only.)
+
+**CPU** (the encoder's CPU seconds, ratio to L1; L1 in cpu-s: ball 2.9, rush 21.5, touchdown 24.8, snow 24.9):
+
+| | snow (the cost legs' picture) | rush | touchdown | ball (easy; mostly filler) |
+|---|---|---|---|---|
+| L2 | **×1.14** | ×1.07 | ×1.00 | ×1.38 |
+| L3 | ×1.12 | ×1.08 | ×1.02 | ×1.41 |
+| L4 | **×1.47** | ×1.22 | ×1.14 | ×1.38 |
+| L5 | ×1.01 | ×1.02 | ×1.01 | ×1.03 |
+| X1 | ×1.14 | ×1.09 | ×1.02 | ×1.28 |
+
+Frame threads are cheaper than sliced ones, which offsets most of the lookahead: L2 costs +0–14 % where the
+picture is hard. Applied to F-033/F-034's L1 cost legs (6x `medium`, C:snow p95 3.465, D:snow 3.683) as
+a **projection, not a measurement**: scaling the whole Machine by the snow ratio is an upper bound
+(CEF and the mux do not scale), giving L2 3.95 / 4.20, L3 3.88 / 4.12, L4 5.09 / 5.41 of 6. L2 and L3 sit under
+4.5 even at that bound; L4 does not. Host spread is ±0.4 core (F-033), so L2's margin is real but not large.
+
+**Latency and forced keys** (paced, ball; ms; 2 rounds agree within 1 ms for latency):
+
+| Leg | added latency p50 / p95 | key asked clear of the floor (+2.6 s): delay | key asked +0.1 s / +0.5 s after the last: GOP made | GOPs under 2 000 ms |
+|---|---|---|---|---|
+| L1 | 6 / 7 | **39** | held to **2 200** / 2 200 | **0 of 14** |
+| L2 | **801** / 801 | **834** | **100** / **500** | **4 of 14** |
+| L3 | 968 / 968 | 1 001 | 100 / 500 | 4 of 14 |
+| L4 | 868 / 901 | 901 | 100 / 500 | 4 of 14 |
+| L5 | 6 / 7 | 39 | 2 200 / 2 200 | 0 of 14 |
+| X1 | 770 / 772 | 804 | 100 / 500 | 4 of 14 |
+
+- **The latency is `rc-lookahead` + the frame-thread depth**: L2 = 24 frames = 15 + 9, L3 = 29 = 20 + 9;
+  `sync-lookahead=0` removes one frame (X1, 770 ms). The lever is `threads`, not `sync-lookahead`. It is
+  0.8 to 1.0 s, not the scan's "0.5-1 s", and the encoder's own latency query reads 0 ms on every leg.
+- **A forced key asked clear of the floor arrives that much later** (834 / 1 001 / 901 vs 39 ms). A key asked
+  inside the floor on L1 is held to 2 200 ms after the last key; on L2 to L4 it is held ONLY if asked more than
+  about the latency after it: asked at +0.1 s or +0.5 s it is made at once, a **100 ms or 500 ms GOP**, under
+  Cloudflare's 2 s floor (`ERR_GOP_OUT_OF_RANGE`, F-036). This is the failure `gst_programme.rs:590-599`
+  predicts (GstVideoEncoder notes the last key when x264 hands it out, and checks a request when a frame
+  goes in; with lookahead the two disagree by the latency). 4 of 14 requests, the offsets inside about 0.8 to 1.0 s of a key
+  (a quarter to a third of each 3 s GOP); at +1.0 s and later the floor holds.
+- Owed 84's output swap asks for a key right after a reconnect, at a phase of the GOP nobody controls: on L2 to
+  L4 roughly one reconnect in four to three cuts a GOP under Cloudflare's floor, and every reconnect's
+  key wait grows by 0.8 to 1.0 s on top of finding 8's path (the scan's 16.8 s worst case against the 15 s
+  at which YouTube split the broadcast, F-004).
+
+**Product path** (`harness.yml` smoke, the real relay, `rtmp2sink` to MediaMTX):
+- **L2 (run 45681521215): 17 of 17 checks pass.** High profile, `has_b_frames=0`, 0 pts gaps, 2 357 frames, A/V
+  offset p50 39 ms, max 72.
+- **L4 (run 45681526242): 16 of 17; `pts_gaps` fails** (one gap of 99 ms), 2 357 frames, 0 decode errors.
+  The first segment's first packets read pts/dts `0.000/0.000, 0.100/0.001, 0.100/0.100, 0.100/0.100,
+  0.200/0.125`: DTS repeats and one DTS is not above its predecessor (1 in segment 1, 0 in the other six).
+  By reading, the cause: the output rebases PTS and DTS by the first keyframe's PTS
+  (`gst_output.rs:946`, `:1014-1015`, `saturating_sub`), and with B-frames the keyframe's DTS is below its
+  PTS, so the first DTS clamp to 0. It repeats at every sink start (each output generation's base is its
+  first keyframe). So **B-frames do not pass through today's output**; the fix is the base (use the DTS), a
+  Phase B item, not tried here.
+- Cloudflare's ingest: **not tested** (stg only). Its live-input page (read 2026-11-25) says B-frames "are
+  not supported in LL-HLS and will cause jitter", requires closed GOPs of 2 to 10 s, and names no H.264
+  profile: the scan's "Cloudflare documents High" is not on that page. Whether the programme's playback is
+  LL-HLS is not verified here.
+
+**Filler** (leg 5, scan D2, the encoder's side). `option-string="nal-hrd=cbr:filler=0"` does NOT turn filler
+off: the stream's SEI reads `nal_hrd=cbr filler=1` (x264 documents `nal-hrd cbr` as implying filler), so the
+brief's literal leg 5 is leg 1 (L5a: identical scores, bytes and SEI). What does is `nal-hrd=vbr` (SEI
+`filler=0`). On an easy picture (`ball`) L1 sends **5 920 kbps, 97.5 % filler** (148 kbps of picture); L5
+sends **148 kbps**. On the hard clips and snow it makes no difference (no filler to send). Whether Cloudflare's
+advertised 1080p peak follows the padded ingest, and whether it takes a `nal-hrd=vbr` ingest, needs a stg
+run: **owed**. The spike branch `spike/enc-tune-l5` is `nal-hrd=vbr`.
+
+**Findings.**
+1. **L2 is the only leg worth carrying.** +4.2 VMAF on the hard clip, +1.4 on the easy one, a better 1 %
+   low on both, for +0 to +14 % encoder CPU (projected inside the 4.5-core rule). L3 and X1 add nothing to
+   quality; L4's B-frames lose on the easy clip, on the 5th percentile, and cost +14 to +47 % CPU.
+2. **L2 cannot ship as a settings change.** It needs (a) the forced-key floor made to hold with a frame delay
+   (4 of 14 requests under 2 s today on this chain) and (b) the first-GOP and recovery budgets re-derived with +0.8 s
+   (`FIRST_GOP_CATCH_UP_MAX_MS` is 1 000, the encoder's first frame now comes 0.8 s late; finding 8's path;
+   the 2 s ring). Both are Phase B work.
+3. **The scan's premises:** lookahead latency is 0.8 to 1.0 s, not 0.5 to 1 s (a); "forced key arrives later by
+   the lookahead depth" is right, and understated (the floor itself fails); "a few VMAF points is typical" held
+   on the hard clip (+4.2), and not on the easy one (+1.4); `filler=0` is not a way to unpad; B-frames do not
+   survive the output's rebase.
+
+**Recommendation (this measurement's, not a ruling), under the 4.5-core p95 rule: L2** (no tune, `bframes=0`,
+`rc-lookahead=15`, frame threads, High; not L3, L4 or X1), **conditional**: ship it only after (i) the Fly cost
+legs (C:snow, D:snow, performance-6x) read p95 ≤ 4.5 on it (projected 3.95 / 4.20; unmeasured), and (ii) the
+forced-key floor and the recovery budgets are fixed for a 0.8 s frame delay. **Until both, keep today's.**
+
+**Owed.** (1) The Fly cost legs for L1 to L5: **blocked, `soak.yml` run 45681479635 failed at "Push to
+Fly's registry" with `401 Unauthorized`**: `FLY_API_TOKEN_SOAK` (set 2026-10-24) is refused by
+`registry.fly.io`; the owner mints a new one (`fly tokens create deploy -a seazn-relay-soak`, into that secret).
+Spike branches `spike/enc-tune-l2`, `-l3`, `-l4`, `-l5` are pushed and ready; leg 1 runs from this branch.
+(2) The latency and key-delay legs are paced on the runner, not on Fly. (3) Cloudflare's side of L5 and of
+High / lookahead ingest: a stg run. (4) Whether a 0.8 s video delay moves the camera A/V offset on air
+(`av_offset_ms` read p50 39 ms, max 72 on both smoke runs; no main smoke run in this dispatch to compare).
+(5) `docs/_INDEX.md` rows (not written here, to keep C4's merge clean).
+
+**Not measured here.** A phone's real picture through Cloudflare; CPU on Fly; the overlay's cost beside the
+encoder; 60 fps; a 3 h soak of any leg.
+
+**Teardown.** No Machines, no secrets, no Cloudflare or Bunny settings touched. Cancelled `soak.yml` run
+45681503668 (L2, it would have failed the same push). Runs and artifacts: `encoder-tune` 45687294402;
+`harness` 45681521215 (L2), 45681526242 (L4).
