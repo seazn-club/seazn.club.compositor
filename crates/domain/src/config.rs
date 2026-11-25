@@ -411,6 +411,24 @@ pub const PLAYOUT_EARLY_MARGIN_MS: Ms = PLAYOUT_TARGET_MS;
 /// time or faster, is over by then, so a catch-up in progress is not cut into several jumps.
 pub const PLAYOUT_EARLY_REANCHOR_MS: Ms = 2 * PLAYOUT_CAP_MS;
 
+/// C4 fix round 4 (the round-3 re-review, CI run 45627090221): how much of the audio after a re-base
+/// the settle skips before it reads the steady interleave. A return's first frames come out of an
+/// empty decoder close behind their audio and then fall back to the steady interleave, and on
+/// camera-flap's clamped returns the placed audio-minus-video gap read 10 to 40 ms high over the
+/// first 20 frames (about 0.6 s at 30 fps) against the rest of the run; the old settle read eight
+/// chunks 170 to 340 ms after the re-base, inside that, and put the whole window's A/V there (max
+/// 57 ms against the 40 ms budget). The cap plus the target (650 ms): what the queue can hold of
+/// the return's backlog, and the clock's own lead.
+pub const PLAYOUT_SETTLE_SKIP_MS: Ms = PLAYOUT_CAP_MS + PLAYOUT_TARGET_MS;
+
+/// C4 fix round 4: how much audio the settle then averages, past `PLAYOUT_SETTLE_SKIP_MS`. The
+/// readings are one a chunk, and a chunk's reading against the newest frame moves with their phase:
+/// the camera's AAC chunks (1 024 samples, 21.3 ms) and its frames (33.3 ms) coincide every 533 ms,
+/// so a mean over less than whole beats carries the beat's ripple (about +-20 ms in a single
+/// reading) into the level. Twice the cap, 1 s: nearly two beats and the re-review's "at least 1 s"
+/// (the ripple left in a mean over 1.875 beats is about 1.3 ms).
+pub const PLAYOUT_SETTLE_MS: Ms = 2 * PLAYOUT_CAP_MS;
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -1315,6 +1333,11 @@ mod tests {
         assert_eq!(PLAYOUT_EARLY_MARGIN_MS, PLAYOUT_TARGET_MS);
         assert_eq!(PLAYOUT_SKEW_REVERT_MS, 175);
         assert_eq!(PLAYOUT_EARLY_REANCHOR_MS, 1_000);
+        // Fix round 4: the settle skips the return's transient (the cap and the target, 650 ms) and
+        // averages at least a second of audio after it.
+        assert_eq!(PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_CAP_MS + PLAYOUT_TARGET_MS);
+        assert_eq!(PLAYOUT_SETTLE_SKIP_MS, 650);
+        assert_eq!(PLAYOUT_SETTLE_MS, 1_000, "at least a second");
         const _: () = assert!(PLAYOUT_TARGET_MS + PLAYOUT_EARLY_MARGIN_MS < PLAYOUT_CAP_MS);
         // Constant against constant: the compiler checks it. The target sits inside the cap with room
         // for a burst, and the slack is far under the target.

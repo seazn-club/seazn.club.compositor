@@ -59,8 +59,8 @@ use std::fmt;
 
 use domain::config::{
     PLAYOUT_AUDIO_SLACK_MS, PLAYOUT_CAP_MS, PLAYOUT_EARLY_MARGIN_MS, PLAYOUT_EARLY_REANCHOR_MS,
-    PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_MAX_FRAMES, PLAYOUT_REANCHOR_GAP_MS, PLAYOUT_SKEW_REVERT_MS,
-    PLAYOUT_STREAM_SKEW_MAX_MS, PLAYOUT_TARGET_MS,
+    PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_MAX_FRAMES, PLAYOUT_REANCHOR_GAP_MS, PLAYOUT_SETTLE_MS,
+    PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_SKEW_REVERT_MS, PLAYOUT_STREAM_SKEW_MAX_MS, PLAYOUT_TARGET_MS,
 };
 
 use crate::frame_store::{AUDIO_FRAME_BYTES, AUDIO_RATE, AUDIO_RING_BYTES};
@@ -313,12 +313,22 @@ impl Stream {
 /// a few frames' chunks, enough to smooth a 30 fps camera's ±20 ms frame-vs-chunk phase.
 const INTERLEAVE_WEIGHT: i128 = 8;
 
-/// The readings a re-base settles on (`Playout::settle`): as many as the interleave weighs one by.
-/// A return's first frames come close behind their audio (the decoder starts empty: 13 ms against
-/// the steady ~55 on camera-flap's first return, CI run 45595996718), and a re-base reads the
-/// interleave there; so this many readings after it are the transient's and skipped, and the mean
-/// of the next this many puts it right.
-const SETTLE_SAMPLES: i128 = INTERLEAVE_WEIGHT;
+/// A re-base settling (`Playout::settle`): the audio's stamps are read against the video's for
+/// `PLAYOUT_SETTLE_SKIP_MS` and `PLAYOUT_SETTLE_MS` of audio after it, and the mean of what the skip
+/// leaves goes back on the steady interleave. A return's first frames come out of an empty decoder
+/// close behind their audio and fall back to the steady interleave over the next ~20 frames (a
+/// re-base reads the interleave there, so its error would stand for the whole window), so the skip
+/// is the transient's; the window is whole chunk-and-frame beats (`PLAYOUT_SETTLE_MS`). Counted in
+/// the audio's own time, not in readings: a chunk is 21.3 ms on the chain's AAC grid, 33.3 on a
+/// 30 fps test source.
+#[derive(Debug, Clone, Copy)]
+struct Settle {
+    /// The re-based audio's start (ns on the placed stamps) when it began.
+    from: i128,
+    /// The sum (ns) and count of the readings past the skip.
+    sum: i128,
+    n: i128,
+}
 
 /// The video's stamps as pushed (raw) and as queued (placed). GstVideoDecoder never lets a stamp go
 /// back: a frame whose PTS is below the last it put out leaves with that last PTS instead
@@ -487,10 +497,10 @@ pub struct Playout<V> {
     /// the video's newest: the chain's decoders hand the two out apart (the video ~55 ms behind its
     /// audio on camera-flap's log, CI run 45588726031), and a re-base on the newest made that its A/V.
     interleave: Option<i128>,
-    /// A re-base settling: the readings since it, counted, and the sum (ns) of those past the first
-    /// `SETTLE_SAMPLES`; at twice that, their mean is put back on the interleave. The interleave takes no
-    /// reading meanwhile (they are on the re-base's offset, not the camera's).
-    settle: Option<(i128, i128)>,
+    /// A re-base settling (`Settle`): after `PLAYOUT_SETTLE_SKIP_MS` and `PLAYOUT_SETTLE_MS` more of
+    /// audio, the mean of the readings past the skip is put back on the interleave. The interleave
+    /// takes no reading meanwhile (they are on the re-base's offset, not the camera's).
+    settle: Option<Settle>,
     /// Stamped audio has arrived in this generation (before it, the filler is not counted).
     audio_seen: bool,
     /// What the pushes since the last tick dropped (handed on with the next tick's counts).
@@ -572,12 +582,10 @@ impl<V: Clone> Playout<V> {
             self.video.push_back(Frame { pts: None, v });
             return;
         };
-        // A camera with no stamped audio has no audio offset: its run's end keeps its own.
-        let audio = self
-            .audio_s
-            .newest
-            .is_some()
-            .then(|| sample_ns(self.audio_offset));
+        // A camera with no audio, or audio that has stopped, has no audio offset: its run's end keeps
+        // its own (I-r3-1: a stopped audio's offset is its last re-base's, stale by however long it
+        // has been quiet, and the picture re-locked onto it slews a pause).
+        let audio = self.audio_live().then(|| sample_ns(self.audio_offset));
         let (t, clamp) = self.video_t.place(raw, audio);
         match clamp {
             Clamp::None => {}
@@ -1066,18 +1074,32 @@ impl<V: Clone> Playout<V> {
                 self.skew_prior.get_or_insert(self.audio_offset);
                 self.rebase(delta);
                 start += delta;
-                self.settle = Some((0, 0));
+                self.settle = Some(Settle {
+                    from: sample_ns(start),
+                    sum: 0,
+                    n: 0,
+                });
                 self.pending.reanchors += 1;
-            } else if let Some((sum, n)) = self.settle {
-                // The first `SETTLE_SAMPLES` readings are the transient's (skipped); the next are
-                // averaged.
-                let n = n + 1;
-                let sum = if n > SETTLE_SAMPLES { sum + d } else { sum };
-                self.settle = Some((sum, n));
-                if n == 2 * SETTLE_SAMPLES {
+            } else if let Some(mut st) = self.settle {
+                // The audio since the re-base: the first `PLAYOUT_SETTLE_SKIP_MS` of it is the
+                // transient's (skipped), the next `PLAYOUT_SETTLE_MS` is averaged. Readings that
+                // come long after the last (a stream that stopped, a jump in its stamps) are no
+                // part of it: the settle is given up.
+                let (skip, window) = (ms_ns(PLAYOUT_SETTLE_SKIP_MS), ms_ns(PLAYOUT_SETTLE_MS));
+                let since = sample_ns(start) - st.from;
+                if !(0..=skip + window + ms_ns(PLAYOUT_CAP_MS)).contains(&since) {
+                    self.settle = None;
+                    return start;
+                }
+                if since >= skip {
+                    st.sum += d;
+                    st.n += 1;
+                }
+                self.settle = Some(st);
+                if since >= skip + window {
                     self.settle = None;
                     // Within the slack it is one stream already (as two chunks' stamps are).
-                    let by = iota - sum / SETTLE_SAMPLES;
+                    let by = iota - st.sum / st.n;
                     let delta = sample_at(sample_ns(start) + by) - start;
                     if by.abs() > ms_ns(PLAYOUT_AUDIO_SLACK_MS) {
                         self.note(
@@ -1319,6 +1341,12 @@ impl<V: Clone> Playout<V> {
         }
     }
 
+    /// The audio is arriving: the last tick that saw a chunk is within `PLAYOUT_REANCHOR_GAP_MS` of
+    /// the last tick (`Stream::live`), the gap whose end makes a stream's return a new clock.
+    fn audio_live(&self) -> bool {
+        self.last_tick.is_some_and(|t| self.audio_s.live(t))
+    }
+
     /// The media span of the stamped frames queued.
     fn stamped_span(&self) -> i128 {
         let first = self.video.iter().find_map(|f| f.pts);
@@ -1340,7 +1368,8 @@ mod tests {
     //! schedule, or the programme's tick grid.
     use super::*;
     use domain::config::{
-        OutputProfile, CAMERA_MAX_FPS, PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_STREAM_SKEW_MAX_MS,
+        OutputProfile, CAMERA_MAX_FPS, PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_SETTLE_MS, PLAYOUT_SETTLE_SKIP_MS,
+        PLAYOUT_STREAM_SKEW_MAX_MS,
     };
 
     /// Both profiles are 30 fps (`config.rs`), so a loop over them is one 30 fps grid run twice, not a
@@ -1731,6 +1760,14 @@ mod tests {
                 Some((i, sample_ns(i128::from(label)) - shown))
             })
             .collect()
+    }
+
+    /// The ticks after a return's first frame a re-base takes to settle: the transient it skips and
+    /// the window it averages (config), and six ticks for what comes before and after them: the
+    /// audio outlier is the third chunk (a second re-base, `a.k == kr + 2`), the settle fires on the
+    /// chunk that closes its window, and its move shows in that tick's take.
+    fn settle_ticks(fps: u64) -> u64 {
+        (PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS) * fps / 1_000 + 6
     }
 
     /// The fake camera's `POST /pause` then `POST /resume`, `pauses` times inside one generation,
@@ -2788,7 +2825,31 @@ mod tests {
         kr: u64,
         until: usize,
     ) -> usize {
-        let live = (kr + fps) as usize;
+        assert_window_in_step_from(
+            tag,
+            fps,
+            arrivals,
+            r,
+            (kr + fps) as usize,
+            (kr + settle_ticks(fps)) as usize,
+            until,
+        )
+    }
+
+    /// `assert_window_in_step` with the window's own start (`live`: its re-anchors, repeats and
+    /// dropped frames are counted from there) and the tick its re-base has settled by (`settled`:
+    /// `settle_ticks`). The settle's move is the audio shifting onto the steady interleave, counted
+    /// as late or filler audio once, so the audio's late and filler bytes and its A/V are judged from
+    /// the settled tick.
+    fn assert_window_in_step_from(
+        tag: &str,
+        fps: u64,
+        arrivals: &[Arrival],
+        r: &Run,
+        live: usize,
+        settled: usize,
+        until: usize,
+    ) -> usize {
         let mut c = Counts::default();
         for x in &r.recs[live..until] {
             c.add(&x.counts);
@@ -2798,21 +2859,25 @@ mod tests {
             (0, 0, 0),
             "{tag}: the live window's re-anchors, repeats, unaired"
         );
+        let mut c = Counts::default();
+        for x in &r.recs[settled..until] {
+            c.add(&x.counts);
+        }
         assert_eq!(
             (c.audio_late_bytes, c.audio_pad_bytes),
             (0, 0),
-            "{tag}: the live window's late and filler audio"
+            "{tag}: the settled window's late and filler audio"
         );
         let (slack, period) = (i128::from(PLAYOUT_AUDIO_SLACK_MS * MS), i128::from(NS / fps));
-        let av: Vec<_> = av_by_content(r, arrivals, live)
+        let av: Vec<_> = av_by_content(r, arrivals, settled)
             .into_iter()
             .filter(|(i, _)| *i < until)
             .collect();
         assert!(
-            av.len() as u64 >= (until - live) as u64 * 3 / 4,
+            av.len() as u64 >= (until - settled) as u64 * 3 / 4,
             "{tag}: {} of {} ticks with sound",
             av.len(),
-            until - live
+            until - settled
         );
         let off: Vec<_> = av
             .iter()
@@ -2924,7 +2989,7 @@ mod tests {
     /// steady ~55 ms). A re-base reads the interleave at the return, inside that transient, and its
     /// error stood for the whole window: on CI run 45603961130 the returns' audio sat -18 to +28 ms
     /// off its video's offset, most of them +18 to +28 (A/V p50 23, max 60 against 40). So a re-base
-    /// settles: past the transient (the next `SETTLE_SAMPLES` readings), the mean of as many more is
+    /// settles: past the transient (`PLAYOUT_SETTLE_SKIP_MS` of audio), the mean of the next `PLAYOUT_SETTLE_MS` is
     /// put back on the steady interleave (a move, not a re-anchor; the interleave takes no reading
     /// meanwhile). Here the video reaches the queue `lag` ms after its audio, except the return's
     /// first `fast` frames, which come at once; the clean return's audio, stamped late from it, is a
@@ -2950,7 +3015,10 @@ mod tests {
                     600,
                 ),
             ] {
-                for (lag, fast) in [(60, 3), (90, 4)] {
+                // The return's first frames come at once for as long as the settle skips (less the
+                // two chunks before the re-base): the transient the settle must not read.
+                let transient = PLAYOUT_SETTLE_SKIP_MS * fps / 1_000 - 2;
+                for (lag, fast) in [(60, 3), (90, 4), (60, transient), (90, transient)] {
                     let tag = format!("{fps} fps, {name}, video {lag} ms behind, {fast} fast");
                     let (arrivals, kr) = chain_return(fps, 4_900, 2, outlier, audio_outlier, 5, 8);
                     let late = |a: &Arrival| if a.k >= kr { late_ms * MS } else { 0 };
@@ -2968,12 +3036,21 @@ mod tests {
                         })
                         .collect();
                     let r = run(fps, &arrivals, 5 * fps + 147 + 8 * fps);
-                    ticks += assert_live_in_step(&tag, fps, &arrivals, &r, kr);
+                    let settled = (kr + settle_ticks(fps)) as usize;
+                    ticks += assert_window_in_step_from(
+                        &tag,
+                        fps,
+                        &arrivals,
+                        &r,
+                        (kr + fps) as usize,
+                        settled,
+                        r.recs.len(),
+                    );
                     // Settled, the sound is in step, not just within a frame: the readings' mean is
                     // the steady interleave's own measure, so nothing is left over.
                     // The frame nearest due airs: within half a frame either way.
                     let (slack, half) = (i128::from(PLAYOUT_AUDIO_SLACK_MS * MS), i128::from(NS / fps / 2));
-                    let off: Vec<_> = av_by_content(&r, &arrivals, (kr + fps) as usize)
+                    let off: Vec<_> = av_by_content(&r, &arrivals, settled)
                         .into_iter()
                         .filter(|(_, d)| !(-half - slack..=half + slack).contains(d))
                         .collect();
@@ -2987,7 +3064,7 @@ mod tests {
             }
         }
         eprintln!("settling returns checked: {checked}, ticks with sound: {ticks}");
-        assert_eq!(checked, 6 * PROFILES.len());
+        assert_eq!(checked, 12 * PROFILES.len());
     }
 
     /// Camera-flap returns again and again in one generation (twelve on PR #113's leg), so each
@@ -3841,5 +3918,316 @@ mod tests {
         }
         eprintln!("placements checked after a re-lock: {checked}");
         assert_eq!(checked, 2 * 30);
+    }
+
+    /// I-r3-1 (the round-3 re-review): a clamped run's end re-locks the picture onto the audio's offset,
+    /// which is only the audio's while the audio is arriving. Audio that stopped mid-generation (a
+    /// stream pausing is a designed case) keeps the offset of its last re-base for good, and the next
+    /// video return's clamp end slewed the picture onto it: a move the size of a pause, half a step a
+    /// frame, which the clock saw as a camera that stopped and started (the reviewer's probe on
+    /// 1ec7098: 18 counted re-anchors, 90 repeated ticks and 90 skipped frames over 10 s, growing by
+    /// a pause with every later flap). Here the audio stops at 3 s and the video flaps once, with the
+    /// decoder's clamp on the first or second new frame; from a second after the return to the run's
+    /// last frame, nothing is re-anchored, repeated or dropped.
+    #[test]
+    fn audio_that_has_stopped_is_no_clock_for_a_clamps_end() {
+        let (mut windows, mut ticks) = (0, 0);
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let pause_ms = (147 * 1_000_u64).div_ceil(fps);
+            for (name, outlier) in [("first new frame", 0), ("second new frame", 1)] {
+                let tag = format!("{fps} fps, outlier on the {name}");
+                let (mut arrivals, kr) = chain_return(fps, pause_ms, 2, Some(outlier), None, 5, 10);
+                let stop = 3 * NS;
+                for a in &mut arrivals {
+                    if a.k * NS / a.src_fps >= stop {
+                        a.audio_at = NO_AUDIO;
+                    }
+                }
+                let mut r = run(fps, &arrivals, kr + 10 * fps + 8);
+                // The premise: the audio really stopped (no real sample in the last 5 s), and the
+                // clamp's end happened inside the run, exactly once.
+                let last = r.recs.len() - 1;
+                assert!(
+                    r.recs[last - 5 * fps as usize..]
+                        .iter()
+                        .all(|x| x.labels.is_empty()),
+                    "{tag}: audio still playing at the end"
+                );
+                let notes = r.p.take_notes().0;
+                let ends = notes
+                    .iter()
+                    .filter(|n| n.what.starts_with("video_unclamped"))
+                    .count();
+                let (live, until) = ((kr + fps) as usize, r.last_air());
+                let mut c = Counts::default();
+                for x in &r.recs[live..=until] {
+                    c.add(&x.counts);
+                }
+                assert_eq!(
+                    (c.reanchors, c.repeated, c.unaired),
+                    (0, 0, 0),
+                    "{tag}: re-anchors, repeats, unaired after the return"
+                );
+                assert_eq!(ends, 1, "{tag}: the clamp's end");
+                let aired: Vec<u64> = r.recs[live..=until]
+                    .iter()
+                    .filter(|x| x.fresh)
+                    .filter_map(|x| x.aired.map(|id| id % 1_000_000))
+                    .collect();
+                for w in aired.windows(2) {
+                    assert_eq!(w[1], w[0] + 1, "{tag}: frame by frame");
+                }
+                assert!(
+                    aired.len() as u64 >= 8 * fps,
+                    "{tag}: {} frames aired",
+                    aired.len()
+                );
+                windows += 1;
+                ticks += aired.len();
+            }
+        }
+        eprintln!("returns with stopped audio checked: {windows}, frames aired: {ticks}");
+        assert_eq!(windows, 2 * PROFILES.len());
+    }
+
+    /// M6's witness (fix round 3's Owed 119): the steady interleave is read off the RAW stamps, never
+    /// the placed ones. A return with no clamp (camera-flap's R2 and R5) leaves its settle's residue in
+    /// the audio's offset; read off the placed stamps the interleave would take that residue for the
+    /// camera's own and put it into the next return's re-base, which then settled onto it. Here the
+    /// first return's settle reads the video two periods late (a lag that ends with its readings), so
+    /// the audio is left that much off its picture: the premise, checked on the first window. Then the
+    /// interleave runs on unclamped stamps for 5 s, and the second return (a clamped one) re-bases and
+    /// settles: from its settle's end to its clamp's end, the sound is in step.
+    #[test]
+    fn a_settle_residue_is_not_carried_into_the_next_return() {
+        let (mut windows, mut ticks) = (0, 0);
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let pause_ms = (147 * 1_000_u64).div_ceil(fps);
+            let paused = pause_ms * fps / 1_000;
+            let shapes = [
+                ReturnShape {
+                    video_outlier: None,
+                    audio_outlier: Some(2),
+                    extra: None,
+                },
+                ReturnShape {
+                    video_outlier: Some(0),
+                    audio_outlier: Some(2),
+                    extra: None,
+                },
+            ];
+            let (arrivals, krs) = chain_replay(fps, pause_ms, 7, &shapes);
+            let back = arrivals
+                .iter()
+                .find(|a| a.k == krs[0])
+                .expect("the first return")
+                .at;
+            let until = back + (PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS) * MS;
+            let late_ms = 2 * 1_000 / fps;
+            let arrivals = lag_between(arrivals, back, until, late_ms, true);
+            let end = krs[1] + 7 * fps;
+            let r = run(fps, &arrivals, end + 8);
+            let (half, slack) = (i128::from(NS / fps / 2), ms_ns(PLAYOUT_AUDIO_SLACK_MS));
+            let tag = format!("{fps} fps");
+            // The premise: the first window's sound is off its picture by more than a frame's half.
+            let (a_from, a_until) = ((krs[0] + settle_ticks(fps)) as usize, (krs[1] - paused) as usize);
+            let first = av_by_content(&r, &arrivals, a_from);
+            let first: Vec<_> = first.into_iter().filter(|&(i, _)| i < a_until).collect();
+            assert!(
+                first.len() as u64 >= 3 * fps,
+                "{tag}: {} ticks with sound in the first window",
+                first.len()
+            );
+            let off = first.iter().filter(|(_, d)| d.abs() > half + slack).count();
+            assert!(
+                off * 2 > first.len(),
+                "{tag}: the first return left no residue ({off} of {} ticks off)",
+                first.len()
+            );
+            // The second window, from its settle's end to its clamp's end.
+            let (b_from, b_until) = ((krs[1] + settle_ticks(fps)) as usize, (krs[1] + 147 - 4) as usize);
+            let second: Vec<_> = av_by_content(&r, &arrivals, b_from)
+                .into_iter()
+                .filter(|&(i, _)| i < b_until)
+                .collect();
+            assert!(
+                second.len() >= (b_until - b_from) * 3 / 4,
+                "{tag}: {} of {} ticks with sound in the second window",
+                second.len(),
+                b_until - b_from
+            );
+            let off: Vec<_> = second.iter().filter(|(_, d)| d.abs() > half + slack).collect();
+            assert!(
+                off.is_empty(),
+                "{tag}: the second return carries the residue: {:?}",
+                &off[..off.len().min(6)]
+            );
+            windows += 1;
+            ticks += second.len();
+        }
+        eprintln!("residue windows checked: {windows}, ticks with sound: {ticks}");
+        assert_eq!(windows, PROFILES.len());
+    }
+
+    /// A settle the camera's pause cuts short is given up, not finished on the first reading after
+    /// the return: that reading is the return's transient (the decoder starts empty), and as the
+    /// whole mean it would put the audio off by the transient's size for the rest of the window. Here
+    /// the audio's stamps are 600 ms before its capture from the start (a re-base at the first
+    /// chunk, so a settle opens), the camera pauses inside its skip, and the return's first chunks
+    /// reach the queue three frames after their video (a first reading of -3 frames against the
+    /// steady 0). From a second after the return, no settle move was made and the sound is in step.
+    #[test]
+    fn a_settle_cut_short_by_a_pause_is_given_up() {
+        let (mut windows, mut ticks) = (0, 0);
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let kp = PLAYOUT_SETTLE_SKIP_MS * fps / 1_000;
+            let pause_ms = (147 * 1_000_u64).div_ceil(fps);
+            let kr = kp + pause_ms * fps / 1_000;
+            let mut arrivals = source(1, fps, 0..kr + 8 * fps, MEDIA_BASE_NS, 0);
+            arrivals.retain(|a| !(kp..kr).contains(&a.k));
+            for a in &mut arrivals {
+                a.audio_pts -= 600 * MS;
+                a.label_shift = -600 * MS as i64;
+                if (kr..kr + 3).contains(&a.k) {
+                    a.audio_at += 3 * NS / fps;
+                }
+            }
+            let tag = format!("{fps} fps");
+            let mut r = run(fps, &arrivals, kr + 8 * fps + 8);
+            let notes = r.p.take_notes().0;
+            let rebases = notes.iter().filter(|n| n.what.starts_with("rebase(")).count();
+            let settles = notes.iter().filter(|n| n.what.starts_with("settle(")).count();
+            assert_eq!(rebases, 1, "{tag}: the stamps' re-base at the start only");
+            assert_eq!(settles, 0, "{tag}: no settle move at the return");
+            let (half, slack) = (i128::from(NS / fps / 2), ms_ns(PLAYOUT_AUDIO_SLACK_MS));
+            let av = av_by_content(&r, &arrivals, (kr + fps) as usize);
+            assert!(av.len() as u64 >= 6 * fps, "{tag}: {} ticks with sound", av.len());
+            let off: Vec<_> = av.iter().filter(|(_, d)| d.abs() > half + slack).collect();
+            assert!(
+                off.is_empty(),
+                "{tag}: out of step: {:?}",
+                &off[..off.len().min(6)]
+            );
+            windows += 1;
+            ticks += av.len();
+        }
+        eprintln!("cut-short settles checked: {windows}, ticks with sound: {ticks}");
+        assert_eq!(windows, PROFILES.len());
+    }
+
+    /// The settle averages its whole `PLAYOUT_SETTLE_MS` window: readings late in it count. The same
+    /// clean return twice, the second with the video `extra` ms further behind for the window's
+    /// middle 40% (past its first 30%, ending 30% before its end); the move the settle makes differs
+    /// by the mean of that, `extra` times the span's share of the window, to within a chunk's
+    /// reading. A window cut short would not see the span (no difference) and a skip too short would
+    /// shift both runs alike.
+    #[test]
+    fn the_settle_reads_its_whole_window() {
+        let by = |notes: Vec<Note>| -> Vec<f64> {
+            notes
+                .iter()
+                .filter_map(|n| {
+                    n.what
+                        .strip_prefix("settle(by_ms=")?
+                        .strip_suffix(')')?
+                        .parse()
+                        .ok()
+                })
+                .collect()
+        };
+        let extra = 90_u64;
+        let (mut checked, mut moved) = (0, 0);
+        for profile in PROFILES {
+            let fps = programme_fps(profile);
+            let make = |span: Option<(u64, u64)>| {
+                let (arrivals, kr) = chain_return(fps, 4_900, 2, None, None, 5, 8);
+                let mut arrivals: Vec<Arrival> = arrivals
+                    .into_iter()
+                    .map(|a| Arrival {
+                        at: if (kr..kr + 3).contains(&a.k) {
+                            a.at
+                        } else {
+                            a.at + 60 * MS
+                        },
+                        audio_pts: if a.k >= kr {
+                            a.audio_pts + 600 * MS
+                        } else {
+                            a.audio_pts
+                        },
+                        label_shift: if a.k >= kr {
+                            a.label_shift + 600 * MS as i64
+                        } else {
+                            a.label_shift
+                        },
+                        ..a
+                    })
+                    .collect();
+                let back = arrivals.iter().find(|a| a.k == kr).expect("the return").at;
+                if let Some((from, until)) = span {
+                    arrivals = lag_between(arrivals, back + from, back + until, extra, true);
+                }
+                let mut r = run(fps, &arrivals, kr + 12 * fps);
+                by(r.p.take_notes().0)
+            };
+            let (skip, window) = (PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_SETTLE_MS);
+            let (from, until) = (skip + window * 3 / 10, skip + window * 7 / 10);
+            let plain = make(None);
+            let lagged = make(Some((from * MS, until * MS)));
+            assert_eq!(plain.len(), 1, "{fps} fps: one settle move, plain: {plain:?}");
+            assert_eq!(lagged.len(), 1, "{fps} fps: one settle move, lagged: {lagged:?}");
+            let want = (extra * (until - from) / window) as f64;
+            let got = (lagged[0] - plain[0]).abs();
+            assert!(
+                (got - want).abs() <= 12.0,
+                "{fps} fps: the span moved the settle by {got:.1} ms, want {want:.1}"
+            );
+            checked += 1;
+            moved += 1;
+        }
+        eprintln!("whole-window settles checked: {checked}, moved: {moved}");
+        assert_eq!(checked, PROFILES.len());
+    }
+
+    /// A stamp before the repeated one inside a clamped run is an older frame let go late, not the
+    /// run's end (GstVideoDecoder never lets a stamp go back): the run is broken, the stamps are not
+    /// known true, and the stamps that advance after it re-lock nothing, whatever the audio's offset.
+    /// (The re-lock there moved a camera's picture by the audio's whole re-base.) The audio's offset
+    /// is a pause off here, as a stream re-based onto a return's stamps is. A clean run's end
+    /// beside it does re-lock, to the same audio offset: the guard is the difference.
+    #[test]
+    fn an_older_frame_inside_a_clamped_run_breaks_it_without_a_re_lock() {
+        let period = i128::from(NS / 30);
+        let pause = 147 * period;
+        let (mut broken, mut ended) = (0, 0);
+        for (name, older) in [("an older frame", true), ("no older frame", false)] {
+            let mut t = VideoStamps::default();
+            let mut raw: Vec<i128> = (0..10).map(|k| k * period).collect();
+            raw.extend([9 * period + period / 2; 4]);
+            if older {
+                raw.push(9 * period + period / 4);
+            }
+            raw.extend((0..5).map(|k| 10 * period + k * period));
+            let offset_before = t.offset;
+            let mut ends = 0;
+            for &r in &raw {
+                let (_, c) = t.place(r, Some(pause));
+                ends += usize::from(c == Clamp::Ends);
+            }
+            if older {
+                assert_eq!(ends, 0, "{name}: no run ended");
+                assert_eq!(t.relocked, 0, "{name}: nothing re-locked");
+                assert_eq!(t.offset, offset_before, "{name}: the offset did not move");
+                broken += 1;
+            } else {
+                assert_eq!(ends, 1, "{name}: the run ended");
+                assert_ne!(t.relocked, 0, "{name}: the end re-locked");
+                ended += 1;
+            }
+        }
+        eprintln!("broken runs checked: {broken}, clean ends: {ended}");
+        assert_eq!((broken, ended), (1, 1));
     }
 }
