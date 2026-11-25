@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use domain::config::PLAYOUT_TARGET_MS;
+use domain::config::{OutputProfile, PLAYOUT_TARGET_MS};
 use harness::audio::AudioFacts;
 use harness::checker::{analyze, FrameRec, Inputs, SegmentScan, Settings};
 use harness::inputs::{crash_times, Beat, Emit, Timeline};
@@ -780,6 +780,19 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
     let mut w = camera_flap();
     w.playout_ms = w.ms("playout_target_ms") as f64;
     assert_pass(&judge(&w, "camera-flap", "", "flap-playout"), "flap-playout");
+    // C4 fix round 1 (the review's m1): the playout's real delay is the target rounded up to the
+    // programme's tick grid (166.7 ms at the fixture's 30 fps, a tick more than the target), and the
+    // pipeline's own hold (`budget_frame_to_encoder_ms`) adds on. At both worst cases each hold-off
+    // reads 667 ms: under a floor that took the target alone off (700), inside one that takes a
+    // tick more off (666).
+    let mut worst = camera_flap();
+    let tick = 1_000.0 / f64::from(OutputProfile::P720.fps);
+    let target = worst.ms("playout_target_ms") as f64;
+    worst.playout_ms = (target / tick).ceil() * tick + worst.ms("budget_frame_to_encoder_ms") as f64;
+    assert_pass(
+        &judge(&worst, "camera-flap", "", "flap-playout-worst"),
+        "flap-playout-worst",
+    );
     w.resume_after_ms = 0.0;
     assert_fails(
         &judge(&w, "camera-flap", "", "flap-playout-nohold"),
@@ -6770,9 +6783,17 @@ const NOT_CHAOS_RUNS: [&str; 3] = ["smoke", "sponsor-airings", "camera-burst"];
 /// the whole hold for the newest-frame slot C4 replaced), simulated as the camera sending nothing for
 /// that long at the hold's end. Each beat logs the camera's lines, no audio overflow. `edit` changes
 /// the world before it is judged.
+/// The checker's A/V offset as PR #113's first camera-burst run read it (CI run 45575918830): p50
+/// 25 ms, max 27 ms over 66 tone-to-flash pairs. The World draws no audio, so the report carries it.
+fn burst_av(r: &mut Value) {
+    r["audio"]["av_offset_ms"] =
+        json!({"p50": 25, "max_abs": 27, "pairs": 66, "camera_codec_delay_ms": 33.3});
+}
+
 fn camera_burst(freeze_ms: i64, edit: impl Fn(&mut World)) -> World {
     let hold = 300;
     let mut w = World::new(60);
+    w.report_patch = Some(burst_av);
     for s in [10.0, 20.0, 30.0, 40.0, 50.0] {
         let h = w.at(s);
         w.mark("burst", h, json!({"ms": hold}));
@@ -6798,7 +6819,10 @@ fn camera_burst(freeze_ms: i64, edit: impl Fn(&mut World)) -> World {
 
 /// camera-burst passes with the playout's freeze (the hold less the target), and each judged check
 /// reds on a world that breaks it: the newest-frame slot's freeze (the whole hold: C4's mutant, over
-/// 2 % of the pairs), an overflowed audio ring, no playout lines, and no hold asked.
+/// 2 % of the pairs), an overflowed audio ring, no playout lines, no hold asked, too few frames,
+/// strips or pairs, the audio out of step (the unstamped-audio mutant's: first in, first out, ahead
+/// by the playout's target and a tick) or too few A/V pairs, a slate inside the run, and an unclean
+/// exit. Every judged check has a red (the review's m6, sponsor-airings' rule).
 #[test]
 fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
     let freeze = 300 - PLAYOUT_TARGET_MS as i64;
@@ -6813,7 +6837,7 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
              audio_late_bytes=0 reanchors=0",
         );
     };
-    let reds: [(&str, World, &str); 4] = [
+    let reds: [(&str, World, &str); 11] = [
         (
             "burst-newest",
             camera_burst(300, |_| {}),
@@ -6836,6 +6860,71 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
             camera_burst(freeze, |w| w.marks.retain(|(n, _, _)| n != "burst")),
             "bursts_applied",
         ),
+        (
+            "burst-fewframes",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| {
+                    burst_av(r);
+                    r["frames"] = json!(1_699);
+                })
+            }),
+            "frames",
+        ),
+        (
+            "burst-fewstrips",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| {
+                    burst_av(r);
+                    r["camera"]["strip_frames"] = json!(1_699);
+                })
+            }),
+            "camera_strips",
+        ),
+        (
+            "burst-fewpairs",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| {
+                    burst_av(r);
+                    r["camera"]["cadence"]["pairs"] = json!(1_699);
+                })
+            }),
+            "cadence_pairs",
+        ),
+        (
+            "burst-av-unstamped",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| {
+                    r["audio"]["av_offset_ms"] =
+                        json!({"p50": -167, "max_abs": 170, "pairs": 66, "camera_codec_delay_ms": 33.3});
+                })
+            }),
+            "av_in_step",
+        ),
+        (
+            "burst-av-unpaired",
+            camera_burst(freeze, |w| {
+                w.report_patch = Some(|r| {
+                    r["audio"]["av_offset_ms"] =
+                        json!({"p50": 25, "max_abs": 27, "pairs": 29, "camera_codec_delay_ms": 33.3});
+                })
+            }),
+            "av_in_step",
+        ),
+        (
+            "burst-slate",
+            camera_burst(freeze, |w| {
+                let (from, slate) = (w.at(25.0), w.slate_after_ms as i64);
+                w.camera_gaps.push((from, from + slate + 2_000));
+            }),
+            "no_interior_slates",
+        ),
+        (
+            "burst-exit-1",
+            camera_burst(freeze, |w| {
+                w.run_patch = Some(|r| r["compositor"]["exit_code"] = json!(1))
+            }),
+            "compositor_exit",
+        ),
     ];
     for (tag, w, check) in &reds {
         assert_fails(&judge(w, "camera-burst", "", tag), check, tag);
@@ -6843,6 +6932,22 @@ fn camera_burst_repeats_under_two_percent_and_reds_each_way_it_can_go_wrong() {
     }
     eprintln!("camera-burst reds checked: {checked}");
     assert_eq!(checked, reds.len());
+    // Every judged check the case declares has a red world here: the checks are read off the good
+    // run's PASS lines, so a check added to the case reds this until it has a red of its own.
+    let mut judged: Vec<&str> = good
+        .lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("PASS "))
+        .filter_map(|l| l.split([':', ' ']).next())
+        .collect();
+    judged.sort_unstable();
+    judged.dedup();
+    let mut named: Vec<&str> = reds.iter().map(|r| r.2).collect();
+    named.sort_unstable();
+    named.dedup();
+    eprintln!("camera-burst judged checks, each with a red: {}", judged.len());
+    assert!(!judged.is_empty(), "the good run printed no PASS line");
+    assert_eq!(named, judged, "the reds' checks are the case's judged checks");
 }
 
 /// Every case file in harness/cases has a test here: a new case cannot ship unjudged.
