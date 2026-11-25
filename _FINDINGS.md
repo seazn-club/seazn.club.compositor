@@ -3570,3 +3570,45 @@ against the old 850 floor; `docs/_INDEX.md`'s decision row). Witnesses: 16 hand 
   session are the first reads.
 - **Owed:** the stg before/after on one real phone session (Owed 115), the camera-burst case's first
   CI run, and the GStreamer-side mutants (CI, on a throwaway PR).
+- **Corrected 2026-11-25 (the C4 review's C1, C2, I1, I2 and m1 to m10; fix round 1, before
+  merge).** Three of the facts above were wrong on CI, and one consequence was false.
+  - **Consequence 3's "the depth wanders inside 0 to 500 ms" was false.** The lower bound was
+    −500 ms: a camera that fell behind the clock (lead under −`PLAYOUT_AUDIO_SLACK_MS`) had every
+    audio chunk dropped as late, the video repeating, until the lead passed −500 ms, and no counter
+    or gate saw it (C2: a delay step of the target and two ticks, a slow camera clock, audio 200 ms
+    or more behind its video; at 30 ppm, by the review's model, about 1.8 h of audio then 4.6 h of
+    filler). Fact 3's re-anchor list missed the band.
+  - **Fact 1's one newest stamp for both streams re-anchored on alternate pushes** after a camera
+    pause whose audio and video stamps disagree by seconds: 8 of 12 camera-flap returns froze on the
+    pre-pause frame with filler audio (CI run 45575918709: `suppressed_ms` about −5 000, about 80
+    re-anchors a beat; C1).
+  - **The clock anchored on whichever stream arrived first**, so the later one's depth was the
+    target less the skew (I1). camera-burst's first CI run (45575918830) read 34 repeats in 1 953
+    pairs, 1.74 % (about 7 a hold), not the 1.4 % this finding expected, and the A/V offset p50
+    25 ms, max 27 ms over 66 pairs (m10).
+  - **Fact 4's "Live up to the target before the first frame airs" holds from Waiting and
+    Reconnecting only.** From Frozen the first fresh frame puts the domain Live at once
+    (`programme.rs`, `(Frozen, Fresh)`), and the playout re-anchors after the gap and holds the
+    returning frame about a target, the frozen frame repeating under `Emit` meanwhile (m4).
+  - **The rules now** (`adapters::playout`, fix round 1): each stream keeps its own newest stamp;
+    the audio is placed on the video's timeline by an offset in samples, re-based (counted as a
+    re-anchor) when a chunk lands more than `PLAYOUT_STREAM_SKEW_MAX_MS` (the cap less the target,
+    350 ms) from the newest fresh video stamp; the clock anchors the target behind the later of the
+    live streams (the smaller newest); a stream late for `PLAYOUT_LATE_REANCHOR_MS` (the target)
+    re-anchors, counted; a stream's first arrival after an anchor more than the target behind it
+    re-anchors once, uncounted; a stream's own jump back past the cap drops its queue (the video's
+    counted unaired). `audio_pad_bytes` counts only once the generation's audio has arrived, so a
+    camera with no audio track reads 0, not every period (m9). The input's gate (a loss, a give-up,
+    a pipeline error) and a rebuild flush the build's queued frames with its audio (m5).
+  - **The playout's delay is the target rounded up to the tick grid**: 166.7 ms at the 30 fps
+    profiles, a tick more than 150 (m1). camera-flap's floor now takes `tick_widest_ms` off too, and
+    "after every freeze the picture waits the target again" reads about 167 ms at 30 fps.
+  - **Evidence.** Host tests (`adapters::playout`): a pause whose stamps carry on, twice, with the
+    audio 10 ms either side of the video; audio skews of ±100 and ±250 ms with holds; a delay step of
+    the target and two ticks and of 300 ms (one re-anchor, at the lateness bound); a 3 000 ppm slow
+    camera over 120 s (each crossing re-anchors, real audio every second); a video jump while the
+    audio stops; a video-only hold (no false skew); a camera with no audio; a loss's flush. The
+    GStreamer seams (CI-only, I2): `media_time` reads the segment's running time
+    (`programme_output.rs`), and a real input's audio lands within 350 ms of its picture's stamp
+    (`input.rs`); camera-burst gains `av_in_step` (every tone-to-flash pair within
+    `budget_av_offset_ms`, 40 ms, at least 30 pairs), which the unstamped-audio mutant reds.
