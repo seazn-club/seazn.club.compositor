@@ -61,6 +61,11 @@ read from env the same way. It is independent of `RELAY_AIRINGS`. Web's heartbea
 only once web declares the four keys (web task T44); until then the key is absent. The compositor writes its
 `input give up` and `input received` log lines whatever the key says. See `docs/_INDEX.md`, Decision log, 2026-11-24.
 
+**Amended in part (2026-11-26, Task E).** Two more keys ride the same flag: `inputWidth` and `inputHeight`, the size in
+pixels of the camera's decoded picture before the compositor scales it into the programme's box, sent as a pair and only
+while the camera is connected. Web declares them before a host driver passes the flag (web `feat/heartbeat-input-stats`).
+See `docs/_INDEX.md`, Decision log, 2026-11-26 (Task E).
+
 Equivalents for item 5: Fly `restart: on-failure, max_retries: 2`; Docker
 `--restart on-failure:2`; Kubernetes Job `backoffLimit: 2` + `restartPolicy: OnFailure`; Nomad
 `restart { attempts = 2 }`; Cloud Run jobs `maxRetries: 2`.
