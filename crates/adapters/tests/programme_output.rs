@@ -2449,9 +2449,18 @@ fn an_encoder_that_stalls_reports_encoder_overrun_and_the_programme_carries_on()
             _ => runs.push((t, t, 1)),
         }
     }
-    let keys: Vec<usize> = d.keys.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
+    let keys: Vec<usize> = d
+        .keys
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k)
+        .map(|(i, _)| i)
+        .collect();
     eprintln!("stall accounting: pictures (from ms, to ms, frames) {runs:?}");
-    eprintln!("stall accounting: keyframes at {keys:?}; ring pruned {:?}", p.ring_pruned());
+    eprintln!(
+        "stall accounting: keyframes at {keys:?}; ring pruned {:?}",
+        p.ring_pruned()
+    );
     // The leaky queue dropped what the stalled encoder could not take; the programme went on.
     assert!(
         (d.frames.len() as u64) < total,
