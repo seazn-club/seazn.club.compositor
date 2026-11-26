@@ -1936,10 +1936,34 @@ fn swapping_twice_starts_each_sink_at_a_keyframe_and_drains_once() {
         }
         assert_eq!(d.video_pts_ms.first(), Some(&0), "{name}");
         let first_audio = *d.audio_pts_ms.first().expect("audio");
+        // A sink swapped in some ticks after the keyframe that starts it (still in x264's delay)
+        // never gets the audio the ring queued between the two, so its audio starts that late; the
+        // first sink, swapped in before any frame, starts with its picture.
+        let aac_frame_ms = 1_024 * 1_000 / 48_000;
+        let swap = match name {
+            "a.flv" => 0,
+            "b.flv" => each,
+            _ => 2 * each,
+        };
+        let missing_ms = if swap == 0 {
+            0
+        } else {
+            assert!(
+                key_in_the_delay(swap) && key_start(swap) <= swap,
+                "{name}: setup: its keyframe is in the delay"
+            );
+            (swap - key_start(swap)) * 1_000 / u64::from(P720.fps)
+        };
         assert!(
-            first_audio <= 1_024 * 1_000 / 48_000,
-            "{name}: audio starts at {first_audio} ms"
+            first_audio <= missing_ms + aac_frame_ms,
+            "{name}: audio starts at {first_audio} ms, over the {missing_ms} ms the ring's queue held"
         );
+        if name != "a.flv" {
+            assert!(
+                first_audio + 2 * aac_frame_ms >= missing_ms,
+                "{name}: audio starts at {first_audio} ms, short of the {missing_ms} ms"
+            );
+        }
         sinks += 1;
     }
     eprintln!("sinks checked: {sinks}");
@@ -3044,14 +3068,17 @@ fn each_output_rebases_its_first_timestamps_to_zero() {
     let _s = serial();
     let dir = Tmp::new("rebase");
     let (mut p, rx, _f, lines) = programme();
-    // Swapped in before the first frame, and the second sink swapped in a few ticks after the GOP's
-    // own keyframe (C7: none is asked), which is still in x264's delay and starts it.
+    // Swapped in before the first frame, and the second sink swapped in past the delay window of the
+    // GOP's own keyframe (C7: none is asked), so it starts at the GOP's next, still to be made. A swap
+    // inside the window starts at a keyframe already made, and the audio from before the swap is gone
+    // with the ring's queue (the file then starts its audio up to the window late, as the swap is late
+    // to its keyframe: `swapping_twice_...` bounds that); here the audio is held for the keyframe.
     swap_before_the_first_frame(&mut p, &lines, 1, &file_target(&dir.file("a.flv")));
-    let second = gop_ticks() + 6;
-    assert_eq!(
-        key_start(second),
-        gop_ticks(),
-        "setup: the GOP's own keyframe is in the delay"
+    let second = past_the_delay_window(gop_ticks() + delay_ticks() + WINDOW_EDGE_TICKS);
+    let start = key_start(second);
+    assert!(
+        start > second,
+        "setup: the GOP's next keyframe is still to be made"
     );
     pace(&mut p, 0..second, FrameChoice::Slate(SlateKind::Waiting));
     p.swap_sink(2, &file_target(&dir.file("b.flv")));
@@ -3059,7 +3086,7 @@ fn each_output_rebases_its_first_timestamps_to_zero() {
     // is read when it has.
     pace(
         &mut p,
-        second..second + 30 + delay_ticks(),
+        second..start + delay_ticks() + 10,
         FrameChoice::Slate(SlateKind::Waiting),
     );
     let (video, audio) = p.output_first_pts().expect("an output");
