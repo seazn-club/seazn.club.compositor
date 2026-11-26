@@ -812,7 +812,8 @@ fn the_received_bytes_count_every_builds_source_bytes() {
 /// `Cfg`), never the programme's 1280x720 that `videoconvertscale` letterboxes every frame into. Three
 /// builds on one port, each a different camera (landscape, full HD, portrait); none is the
 /// programme's size. Nothing before a build, and nothing again once the next build starts (it has
-/// announced none yet) or the input stops.
+/// announced none yet) or the input stops (a fourth camera, connected, so the stop has a size to
+/// clear).
 #[test]
 fn the_cameras_own_picture_size_is_recorded_not_the_programmes() {
     let _s = serial();
@@ -841,40 +842,111 @@ fn the_cameras_own_picture_size_is_recorded_not_the_programmes() {
         events_until(&rx, LOSS_BUDGET, is_loss);
         checked += 1;
     }
-    // The next build has announced none yet: nothing listens, so it never connects.
+    // The next build has announced none yet: nothing listens, so it never connects. Gen 3's size was
+    // still recorded when it was retired (a loss does not clear it), so this is the retire's clear.
     input.rebuild(4, &spec(free_port()));
     assert_eq!(picture.size(), None, "a new build starts with no size");
     checked += 1;
+    // A stop is its own case: a connected camera has a size, and stopping the input forgets it.
+    let l = Listener::start(port, &cfg(800, 600));
+    connect(&mut input, &rx, 5, &spec(port));
+    assert_eq!(
+        picture.size(),
+        Some(PictureSize {
+            width: 800,
+            height: 600
+        }),
+        "premise: gen 5's camera has a size to clear"
+    );
     input.stop();
     assert_eq!(picture.size(), None, "a stopped input has none");
+    drop(l);
     checked += 1;
     eprintln!("picture sizes checked: {checked}");
     assert_eq!(checked, 5);
     finish(input);
 }
 
-/// Task E: a build the domain gave up before its first picture records no size. Its pipeline runs on
-/// and its decoder still announces one (the frames it decodes are dropped at the gate, counted), so
-/// the gate is what keeps the size out.
+/// Task E: a build the domain gave up BEFORE its first picture (the connect timeout) still records
+/// the size its decoder announces inside the back-off. Its first picture is the one that tells the
+/// domain the camera is back (`InputAgain`), and that picture's caps event has passed while the gate
+/// was shut; a take-back re-opens the gate after it, so a size recorded only under the open gate
+/// leaves the connected camera with none for the whole build. The driver, not this adapter, keeps the
+/// size off the beat while the link is not connected (`driver.rs`), so recording it here is safe.
 #[test]
-fn a_build_given_up_before_its_first_picture_records_no_size() {
+fn a_build_given_up_before_its_first_picture_keeps_its_size_through_a_take_back() {
     let _s = serial();
     let picture = Arc::new(InputPicture::default());
     let l = Listener::new(&cfg(1_920, 1_080));
-    let (fresh, rx, _frames, _lines) = input(&P720);
+    let (fresh, rx, frames, _lines) = input(&P720);
     let mut input = fresh.with_picture(Arc::clone(&picture));
     rebuild_past_the_handshake(&mut input, 1, &spec(l.port));
     input.abandon(1);
-    let seen = events_for(&rx, Duration::from_millis(1_500));
+    let seen = events_until(&rx, Duration::from_secs(5), |e| {
+        *e == Event::InputAgain { gen: 1 }
+    });
     assert!(
         connects(&seen).is_empty() && frames_in(&seen) == 0,
         "premise: given up before its first picture, nothing of it passed: {seen:?}"
     );
     assert!(
         input.gate_dropped() > 0,
-        "premise: the build ran on and decoded, its frames dropped at the gate"
+        "premise: the build ran on and decoded, its pictures dropped at the gate"
     );
-    assert_eq!(picture.size(), None, "a gated build records no size");
+    input.take_back(1);
+    events_until(&rx, Duration::from_secs(5), |e| {
+        *e == Event::InputConnected { gen: 1 }
+    });
+    assert_eq!(input.taken_back(), 1, "taken back, not rebuilt");
+    assert_eq!(
+        picture.size(),
+        Some(PictureSize {
+            width: 1_920,
+            height: 1_080
+        }),
+        "the taken-back camera has the size its decoder announced inside the back-off"
+    );
+    assert_programme_shape(&frames, &P720, "taken back");
+    finish(input);
+}
+
+/// Task E, a phone turned over inside one build: the same connection, the same decoder, a new caps
+/// event for each change. The recorded size follows (landscape, portrait, landscape), is the camera's
+/// at each step and never the programme's, and nothing is rebuilt or lost.
+#[test]
+fn a_rotation_mid_stream_moves_the_recorded_size() {
+    let _s = serial();
+    let picture = Arc::new(InputPicture::default());
+    let l = Listener::new(&cfg(640, 360));
+    let (fresh, rx, _frames, _lines) = input(&P720);
+    let mut input = fresh.with_picture(Arc::clone(&picture));
+    connect(&mut input, &rx, 1, &spec(l.port));
+    let mut checked = 0;
+    let wait_for = |w: u32, h: u32| {
+        let want = Some(PictureSize { width: w, height: h });
+        let end = Instant::now() + Duration::from_secs(5);
+        while picture.size() != want {
+            assert!(
+                Instant::now() < end,
+                "the size {w}x{h} never showed; it is {:?}",
+                picture.size()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for(640, 360);
+    checked += 1;
+    l.resize(360, 640, "bt601");
+    wait_for(360, 640);
+    checked += 1;
+    l.resize(640, 360, "bt709");
+    wait_for(640, 360);
+    checked += 1;
+    let seen = events_for(&rx, Duration::from_millis(200));
+    assert!(losses(&seen).is_empty(), "a caps change is not a loss: {seen:?}");
+    assert_eq!(input.builds(), 1, "and nothing was rebuilt");
+    eprintln!("rotation sizes checked: {checked}");
+    assert_eq!(checked, 3);
     finish(input);
 }
 

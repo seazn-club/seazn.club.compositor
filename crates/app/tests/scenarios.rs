@@ -2005,6 +2005,21 @@ fn the_cameras_picture_size_rides_only_a_beat_whose_input_is_connected() {
             "no beat saw the input {link}: {counts:?}"
         );
     }
+    // The same size is on the `input received` line, and on the beats whose size rides: one line per
+    // connected beat, none for the others (the sample measures nothing else, so a beat that hides the
+    // size has no line). This is where a camera's size is read off a live relay's log, which is what
+    // shows the adapter's picture handle is wired at all.
+    let connected = counts["Connected"];
+    assert!(connected >= 2, "premise: more than one connected beat");
+    let want = format!(
+        "input received fps=- kbps=- picture={}x{}",
+        size.width, size.height
+    );
+    assert_eq!(
+        lines_starting(&log, "input received"),
+        vec![want; connected as usize],
+        "one line per connected beat, none for the rest"
+    );
 }
 
 /// A `Metrics` whose `fps` (the real output rate, Owed 86) the test sets between beats.
