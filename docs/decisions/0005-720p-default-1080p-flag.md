@@ -25,7 +25,7 @@ would use about 3 of the 4 cores at steady state.
   flag. The compositor is unchanged: it renders whatever the bootstrap's `output` block says.
 - The encoder is x264 `medium` (`gst_programme.rs`, PR #103) and the production guest is
   performance-6x, 6 CPUs and 12288 MB (`RUNNER_DEFAULT_GUEST`, PR #1052).
-- The size rule is p95 Machine CPU at most **75 %** of cores (`cost_cpu_p95_max_share`, was 50 %).
+- The size rule is p95 Machine CPU at most **85 %** of cores (`cost_cpu_p95_max_share`; 75 % from F-033, 50 % before; owner, 2026-11-25).
 - The "Why" above is superseded: F-033 measured 1080p `medium` on 6 CPUs at p95 2.85 to 3.68 cores
   on the worst-case cost legs (peak 4.26), within 75 %, and a 3 h soak (run 40585028513) passed
   15 of 15 checks.

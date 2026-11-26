@@ -58,7 +58,7 @@
   "cost_rally_every_s": 3,
   "cost_sample_from_s": 15,
   "cost_samples_min_ratio": 0.9,
-  "cost_cpu_p95_max_share": 0.75,
+  "cost_cpu_p95_max_share": 0.85,
   "cost_moments_min_per_min": 1,
   "cost_kill_late_max_s": 100
 }
