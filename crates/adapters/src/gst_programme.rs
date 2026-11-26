@@ -620,10 +620,11 @@ impl GstProgramme {
         // by. The adapter does: it asks nothing while the GOP's own keyframe is due within the delay
         // (`gst_output::own_key_in_flight`; the keyframe in the look-ahead serves the swap), and
         // otherwise the request's throttle sees every keyframe it can collide with. This property still
-        // holds a request off a keyframe the encoder HAS handed out, and one request off another
-        // (`a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor`).
+        // holds a request off a keyframe the encoder HAS handed out, and one request off another.
         // C7: at a 2 s GOP the floor (2.2 s) is over the GOP, so the adapter asks for none at all
-        // (`gst_output::forced_key_can_beat_the_gop`); the property stays as the second guard.
+        // (`gst_output::forced_key_can_beat_the_gop`, witnessed by
+        // `a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_gop_is_short`);
+        // the property stays as the second guard, and is only reached again by a GOP over the floor.
         encoder.set_property(
             "min-force-key-unit-interval",
             gst::ClockTime::from_mseconds(FORCED_KEYFRAME_MIN_INTERVAL_MS).nseconds(),

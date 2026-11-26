@@ -724,7 +724,7 @@ struct Reconnect {
 
 /// The keyframe asked for at the reconnect point (Owed 84): asked again at each entry until the
 /// encoder takes it or the stream has started, so a refused request does not leave the stream
-/// waiting for the encoder's own keyframe, up to a GOP away (3 s, F-036; PR #57 review m-6). The
+/// waiting for the encoder's own keyframe, up to a GOP away (3 s, F-036; 2 s since C7; PR #57 review m-6). With the floor over the GOP (C7) none is asked (`forced_key_can_beat_the_gop`), so the retry is reached only by a GOP over the floor. The
 /// request carries the running time a keyframe serves from (`KeyRequest`).
 #[derive(Default)]
 struct KeyAsk {
@@ -767,7 +767,7 @@ impl Feeder {
         // x264enc's min-pts has moved that frame's PTS on by 1 000 h (gstx264enc.c 1418; 1574-1583).
         // The 1 000 h becomes `last_force_key_unit_request` (1696), and the floor then throttles
         // every later forced keyframe (1600-1607) until the encoder stops: each later sink waits for
-        // the GOP's own keyframe, up to 3 s. `ask_key`'s `None` branch is that guard, and it writes
+        // the GOP's own keyframe, up to a GOP. `ask_key`'s `None` branch is that guard, and it writes
         // the line the tests wait on (the C1 review's m1: the line and the guard are one branch).
         if !pick.started() {
             self.ask_key(&mut ask, serves_from);
