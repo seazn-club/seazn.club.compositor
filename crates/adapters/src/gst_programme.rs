@@ -73,8 +73,8 @@ const AAC_BITRATE: i32 = 128_000;
 /// +1.4 to +4.2 VMAF at 6 Mbps for 0.8 s of frame delay (`domain::config::X264_DELAY_MS`) and 0 to 14 %
 /// more encoder CPU. B-frames stay off: they bought nothing and the output's rebase cannot carry them. C00 measured a 2 s keyframe interval with x264's scene cut on; F-036 made it
 /// a fixed 3 s GOP (`OutputProfile::gop_frames`) with the scene cut off (`X264_NO_SCENE_CUT`), which
-/// codes fewer keyframes, never more; C7 (the owner, 2026-11-26) shortened it to 2 s, Cloudflare's
-/// floor (`PROGRAMME_GOP_MS`), to cut the viewer's delay.
+/// codes fewer keyframes, never more; C7 (the owner, 2026-11-26) shortened it to 2.2 s, Cloudflare's
+/// floor and a margin (`PROGRAMME_GOP_MS`), to cut the viewer's delay.
 const X264_SPEED_PRESET: &str = "medium";
 // The VBV lives in `config` (`X264_VBV_MS`), since the first-GOP bound reads it (Owed 112); the
 // property takes a u32 of ms, and a value it cannot carry is a compile error.
@@ -86,7 +86,7 @@ const _: () = assert!(X264_RC_LOOKAHEAD_FRAMES <= i32::MAX as u32);
 const X264_OPTIONS: &str = "nal-hrd=cbr:filler=1";
 /// F-036: x264's scene cut off, so a hard cut in the picture (the slate to the camera, a camera
 /// returning) never starts a GOP early: Cloudflare errored the programme input for GOPs under 2 s
-/// (`ERR_GOP_OUT_OF_RANGE`), and at the 2 s GOP of C7 a cut starting a GOP early is the whole risk. x264enc 1.24.2 has no property for it, and reads its `option-string`
+/// (`ERR_GOP_OUT_OF_RANGE`), and at the 2.2 s GOP of C7, 0.2 s over that floor, a cut starting a GOP early is the whole risk. x264enc 1.24.2 has no property for it, and reads its `option-string`
 /// before its properties, none of which sets the scene cut. F-036's libx264 probe: across 210 frames
 /// with hard cuts, keyframes at frames 0, 30, 60, 69, 78, 87 and 177 with it on, at 0, 90 and 180
 /// with `scenecut=0`. x264's `min-keyint` cannot stand in for it: x264 clamps it to
@@ -113,7 +113,7 @@ pub enum SinkStall {
 }
 
 /// How long a planted hang holds: twice F-004's 15 s, past the backstop and a whole recovery (18 s
-/// with F-036's floor and F-040's encoder delay). The kept gap, not the output's budget, so F-036 left case 18's hold at 30 s.
+/// with the new keyframe's arrival: the GOP and F-040's encoder delay). The kept gap, not the output's budget, so F-036 left case 18's hold at 30 s.
 #[cfg(feature = "test-hooks")]
 pub const SINK_HANG_HOLD: Duration = Duration::from_millis(2 * domain::config::YOUTUBE_KEPT_GAP_MS);
 
@@ -621,10 +621,12 @@ impl GstProgramme {
         // (`gst_output::own_key_in_flight`; the keyframe in the look-ahead serves the swap), and
         // otherwise the request's throttle sees every keyframe it can collide with. This property still
         // holds a request off a keyframe the encoder HAS handed out, and one request off another.
-        // C7: at a 2 s GOP the floor (2.2 s) is over the GOP, so the adapter asks for none at all
-        // (`gst_output::forced_key_can_beat_the_gop`, witnessed by
-        // `a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_gop_is_short`);
-        // the property stays as the second guard, and is only reached again by a GOP over the floor.
+        // C7: at the shipped GOP the floor is the GOP (2.2 s each), so the adapter asks for none at
+        // all (`gst_output::forced_key_can_beat_the_gop`, witnessed by
+        // `a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_gop_is_short`).
+        // This property, the request and its retry are retained but INERT at this configuration; they
+        // run only for a GOP over the floor (see `FORCED_KEYFRAME_MIN_INTERVAL_MS`), and nothing
+        // exercises them end to end here.
         encoder.set_property(
             "min-force-key-unit-interval",
             gst::ClockTime::from_mseconds(FORCED_KEYFRAME_MIN_INTERVAL_MS).nseconds(),
@@ -946,11 +948,13 @@ impl ProgrammeOutput for GstProgramme {
         if let Some(old) = r.output.take() {
             old.retire(&self.shared);
         }
-        // The new output starts at a keyframe encoded after its sink can send (Owed 84): its feeder
-        // asks the encoder for one then, from its own thread. The encoder makes it at once, or at
-        // `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later (F-036), or
-        // none, when it has made one at or after `serves_from` already: the GOP's own keyframe,
-        // encoded after the reconnect point, starts the stream (the C1 review's I1). Before the ring
+        // The new output starts at a keyframe encoded after its sink can send (Owed 84). Since C7
+        // its feeder asks the encoder for none at the shipped GOP (the floor is not under it,
+        // `forced_key_can_beat_the_gop`): the GOP's own keyframe starts the stream, at most a GOP away.
+        // For a GOP over the floor it asks from its own thread: the encoder makes the keyframe at
+        // once, or at `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later
+        // (F-036), or none, when it has made one at or after `serves_from` already: the GOP's own
+        // keyframe, encoded after the reconnect point, starts the stream (the C1 review's I1). Before the ring
         // has taken any video the feeder asks nothing: the encoder's first frame is the keyframe
         // (`gst_output::KeyRequest`; CI on PR #109), nor when it starts from the encoder's first
         // frames (Owed 112, `gst_output::first_gop_backlog`).

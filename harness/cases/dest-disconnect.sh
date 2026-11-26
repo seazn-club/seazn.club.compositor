@@ -4,7 +4,7 @@
 # 80 s live.
 #
 # The output returns within BUDGET_OUTPUT_RECONNECT_MS of the clear (spec §6's 5 s and the
-# new sink's keyframe arrival: the GOP's own, C7's 2 s, and F-040's encoder delay); the programme lost per outage
+# forced keyframe's arrival: F-036's floor, F-040's encoder delay); the programme lost per outage
 # (the counter gap across it, in camera time, less its wall span: `output_outages[].lost_ms`) is at
 # most BUDGET_OUTPUT_LOST_MAX_MS; the input leg is untouched (every beat reads input connected) and
 # no pipeline is rebuilt. Anti-vacuity: the netem qdisc dropped packets, and an outage spans the cut.

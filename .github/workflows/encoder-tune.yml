@@ -43,8 +43,8 @@ env:
   # crowd on a field, the hard case). The first FRAMES frames of each, as raw I420.
   CLIPS_URL: https://media.xiph.org/video/derf/y4m
   FRAMES: "220"
-  # C7 (the programme GOP 3 s -> 2 s): a push runs the GOP legs only (G3 the 3 s control, G2 at 2 s; the
-  # paced job adds Q2, the product's no-key-asked rule at 2 s, and U2, C5's rule at 2 s as its control).
+  # C7 (the programme GOP 3 s -> 2.2 s): a push runs the GOP legs only (G3 the 3 s control, G2 at the shipped GOP; the
+  # paced job adds Q2, the product's no-key-asked rule at the shipped GOP, and U2, C5's rule there as its control).
   # C5's own legs are measured and recorded (F-033, F-040); a dispatch can name any.
   QUALITY_LEGS: ${{ github.event_name == 'workflow_dispatch' && inputs.quality_legs || 'G3,G2' }}
   PACED_LEGS: ${{ github.event_name == 'workflow_dispatch' && inputs.paced_legs || 'G3,G2,Q2,U2' }}

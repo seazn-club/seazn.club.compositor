@@ -35,7 +35,7 @@ FRAME_BYTES = W * H * 3 // 2
 COMMON = {
     "speed-preset": "medium",  # gst_programme.rs X264_SPEED_PRESET (owner ruling 2026-10-27, F-033)
     "bitrate": 6000,  # config.rs OutputProfile::P1080.video_kbps
-    "key-int-max": 90,  # the 3 s GOP of F-036/C5 (config.rs PROGRAMME_GOP_MS was 3000 then; 2000 since C7: legs G2/Q2/U2)
+    "key-int-max": 90,  # the 3 s GOP of F-036/C5 (config.rs PROGRAMME_GOP_MS was 3000 then; 2200 since C7: legs G2/Q2/U2)
     "vbv-buf-capacity": 1000,  # config.rs X264_VBV_MS
     # gst_programme.rs X264_OPTIONS + X264_NO_SCENE_CUT
     "option-string": "nal-hrd=cbr:filler=1:scenecut=0",
@@ -44,11 +44,13 @@ COMMON = {
 }
 CF_GOP_FLOOR_MS = 2000  # config.rs CF_KEYFRAME_INTERVAL_MIN_MS (Cloudflare: GOP between 2 and 10 s)
 PRODUCT_FLOOR_MS = 2200  # config.rs FORCED_KEYFRAME_MIN_INTERVAL_MS
-# C7 (2026-11-26): the shipped programme GOP is config.rs PROGRAMME_GOP_MS, 2 s (CF's floor itself); the
+# C7 (2026-11-26): the shipped programme GOP is config.rs PROGRAMME_GOP_MS, 2.2 s (CF's floor and the
+# margin; the review's I2/I5). Legs G2/Q2/U2 read it; F-042's first numbers were taken at 2 s, 60 frames
+# (the first cut), so a run of those legs now measures 66 frames; the
 # legs L1..R0 below keep the 3 s of the C5 run they were measured at (`COMMON`), so the C5 table still
 # reads. This file restates the domain's numbers (a measurement never imports the code under test), so
 # a later move of `CF_KEYFRAME_INTERVAL_MIN_MS` or the margin is a change here too: the constants below.
-PROGRAMME_GOP_MS = 2000
+PROGRAMME_GOP_MS = 2200
 C5_GOP_MS = 3000
 # C5 Phase B (the shipped guard, `gst_output::own_key_in_flight`): the adapter asks for no keyframe while
 # the GOP's own is due within the encoder's delay of the newest video it has taken, counted in FRAMES
@@ -116,24 +118,24 @@ def legs(vcpus=6):
         },
         {
             "id": "G2",
-            "name": "C7: the shipped encoder at the 2 s GOP (key-int-max 60)",
+            "name": "C7: the shipped encoder at the 2.2 s GOP (key-int-max 66)",
             "props": {**nt, "sync-lookahead": 0, "key-int-max": gop_frames(PROGRAMME_GOP_MS)},
             "gop_leg": True,
         },
         {
-            # C7: forced keys at the 2 s GOP the way the product asks since C7: never, since the
-            # floor (66 frames) is over the GOP (60): the GOP's own key serves every request.
+            # C7: forced keys at the shipped GOP the way the product asks since C7: never, since the
+            # floor (66 frames) is not under the GOP (66): the GOP's own key serves every request.
             "id": "Q2",
-            "name": "C7 product: 2 s GOP, no key asked (the floor is over the GOP)",
+            "name": "C7 product: 2.2 s GOP, no key asked (the floor is not under the GOP)",
             "props": {**nt, "sync-lookahead": 0, "key-int-max": gop_frames(PROGRAMME_GOP_MS)},
             "guard": "floor_over_gop",
             "paced_only": True,
         },
         {
-            # The control for Q2: the same 2 s GOP with C5's rule (asks unless the GOP's own is in the
+            # The control for Q2: the same 2.2 s GOP with C5's rule (asks unless the GOP's own is in the
             # delay). It should cut GOPs under 2 s: the reason the rule above exists.
             "id": "U2",
-            "name": "C7 control: 2 s GOP, C5's rule (asks, unless the GOP's own is in the delay)",
+            "name": "C7 control: 2.2 s GOP, C5's rule (asks, unless the GOP's own is in the delay)",
             "props": {**nt, "sync-lookahead": 0, "key-int-max": gop_frames(PROGRAMME_GOP_MS)},
             "guard": True,
             "paced_only": True,
@@ -608,8 +610,8 @@ def key_episode(Gst, GstVideo, leg, feed, offset_s):
     if forced is None:
         row["forced_key"] = None
     else:
-        # C7: the loop stops at the first key from the request, which at a 2 s GOP is the GOP's own; a
-        # request the encoder holds to the floor lands AFTER it (0.2 s on), and only a longer look sees
+        # C7: the loop stops at the first key from the request, which at the 2.2 s GOP is the GOP's own; a
+        # request the encoder holds to the floor lands on it or AFTER it, and only a longer look sees
         # that GOP. Feed the next tail seconds, then read every interval the run produced.
         for _ in range(int(TAIL_S * FPS)):
             r.push(n)
@@ -797,9 +799,9 @@ def cmd_selftest(_):
     assert p["L1"]["tune"] == "zerolatency" and "tune" not in p["L2"]
     assert (p["L2"]["rc-lookahead"], p["L3"]["rc-lookahead"], p["L4"]["bframes"]) == (15, 20, 2)
     # C7: the GOP legs, in frames, from the two GOPs in ms; every other leg keeps the C5 run's 3 s
-    assert (gop_frames(PROGRAMME_GOP_MS), gop_frames(C5_GOP_MS)) == (60, 90)
-    assert (p["G2"]["key-int-max"], p["G3"]["key-int-max"], p["Q2"]["key-int-max"], p["U2"]["key-int-max"]) == (60, 90, 60, 60)
-    assert "key-int-max=60" in enc_props(next(lg for lg in ls if lg["id"] == "G2"))
+    assert (gop_frames(PROGRAMME_GOP_MS), gop_frames(C5_GOP_MS)) == (66, 90)
+    assert (p["G2"]["key-int-max"], p["G3"]["key-int-max"], p["Q2"]["key-int-max"], p["U2"]["key-int-max"]) == (66, 90, 66, 66)
+    assert "key-int-max=66" in enc_props(next(lg for lg in ls if lg["id"] == "G2"))
     assert "key-int-max=90" in enc_props(next(lg for lg in ls if lg["id"] == "G3"))
     assert "key-int-max=90" in enc_props(next(lg for lg in ls if lg["id"] == "X1"))
     assert [lg["id"] for lg in chosen_legs("G3,G2")] == ["G3", "G2"] and len(chosen_legs("")) == len(ls)
@@ -826,14 +828,14 @@ def cmd_selftest(_):
     # inside the GOP leave the same frames in flight (the review's I3; a time rule moves them).
     lost = lambda i: ns(i + 30)
     assert [n for n in range(0, 180) if key_in_flight(outs(n, lost)) == "in_flight"] == yes
-    # C7: at a 60-frame GOP the delay window is the newest frames 36..59; with the floor (66 frames) over
-    # the GOP the product asks nothing at any of them (`refusal_for`), and with no video out it is the
+    # C7: at a 66-frame GOP the delay window is the newest frames 42..65; with the floor (66 frames) not
+    # under the GOP the product asks nothing at any of them (`refusal_for`), and with no video out it is the
     # first-frame answer; a leg with no guard never refuses.
     g2, q2, u2 = (next(lg for lg in ls if lg["id"] == i) for i in ("G2", "Q2", "U2"))
-    assert gop_frames(PRODUCT_FLOOR_MS) == 66 and leg_gop_frames(q2) == 60
-    assert [n for n in range(0, 120) if key_in_flight(outs(n), 60) == "in_flight"] == list(range(36, 60))
-    assert all(refusal_for(q2, outs(n)) == "floor_over_gop" for n in range(0, 120))
-    assert [n for n in range(0, 120) if refusal_for(u2, outs(n)) == "in_flight"] == list(range(36, 60))
+    assert gop_frames(PRODUCT_FLOOR_MS) == 66 and leg_gop_frames(q2) == 66
+    assert [n for n in range(0, 140) if key_in_flight(outs(n), 66) == "in_flight"] == list(range(42, 66))
+    assert all(refusal_for(q2, outs(n)) == "floor_over_gop" for n in range(0, 140))
+    assert [n for n in range(0, 140) if refusal_for(u2, outs(n)) == "in_flight"] == list(range(42, 66))
     assert refusal_for(q2, []) == "first_frame" and refusal_for(g2, outs(40)) is None
     x1 = next(lg for lg in ls if lg["id"] == "X1")
     assert refusal_for(x1, outs(40)) is None and leg_gop_frames(x1) == 90

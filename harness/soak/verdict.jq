@@ -235,7 +235,7 @@ if ($page != "real" and $page != "test") then error("verdict: page must be real 
    else empty end),
 
   # 2. Zero unexplained output gaps: every outage overlaps a dest disconnect and ends at most
-  #    BUDGET_OUTPUT_RECONNECT_MS (§6's 5 s and the new sink's keyframe arrival: the GOP's 2 s (C7), F-040's delay) after that disconnect
+  #    BUDGET_OUTPUT_RECONNECT_MS (§6's 5 s and the forced keyframe's arrival: F-036's floor, F-040's delay) after that disconnect
   #    ended; no PTS gap.
   [$outages[] | . as $o | select([$disc[] | select(overlaps($o; .))] | length == 0)] as $unexplained
   | [$outages[] | . as $o | ([$disc[] | select(overlaps($o; .))] | first) as $d

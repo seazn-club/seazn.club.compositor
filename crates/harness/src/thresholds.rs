@@ -34,8 +34,8 @@ pub const SPEC_OUTPUT_RECONNECT_MS: u64 = 5_000;
 /// F-036's floor and F-040's encoder delay (the C1 review's I2(a); the owner's apply-rec ruling
 /// 2026-11-24, docs/_INDEX.md: spec §6's "≤5 s" now reads "≤5 s + forced-key floor", and since C5
 /// the floor is joined by the look-ahead's 0.8 s). A reconnected sink starts at the keyframe its swap
-/// asks for (since C7, the GOP's own: the floor is over the GOP), which the encoder makes after its
-/// last one and then holds in its look-ahead. Its readers: run-case.sh's
+/// asks for (since C7 none is asked: the GOP is the floor, so the GOP's own), made after the last one and
+/// then held in the encoder's look-ahead. Its readers: run-case.sh's
 /// `output_reconnect`, case 18 (`output-hung.sh`) and the soak's verdict 2 (`soak/verdict.jq`).
 /// Not lib.jq's error-to-swap bound, which waits for no keyframe (`SPEC_OUTPUT_RECONNECT_MS`).
 pub const BUDGET_OUTPUT_RECONNECT_MS: u64 = SPEC_OUTPUT_RECONNECT_MS + FORCED_KEYFRAME_ARRIVAL_MS;
@@ -487,11 +487,11 @@ mod tests {
         assert!(t.output_backoff_cap_ms < SPEC_OUTPUT_RECONNECT_MS);
         assert_eq!(
             BUDGET_OUTPUT_RECONNECT_MS,
-            5_000 + 2_000 + 800,
-            "spec §6's 5 s, the 2 s GOP (C7: the shorter of it and F-036's floor) and F-040's encoder delay"
+            5_000 + 2_200 + 800,
+            "spec §6's 5 s, F-036's floor and F-040's encoder delay"
         );
         // The output's recovery paths add the same arrival to F-004's 15 s.
-        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_000 + 800);
+        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_200 + 800);
         // The restart budget is YouTube's split (F-004) and no looser.
         assert_eq!(BUDGET_PROCESS_RESTART_OUTPUT_MS, 15_000);
     }

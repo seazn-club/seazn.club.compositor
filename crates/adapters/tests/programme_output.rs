@@ -1935,39 +1935,14 @@ fn swapping_twice_starts_each_sink_at_a_keyframe_and_drains_once() {
             );
         }
         assert_eq!(d.video_pts_ms.first(), Some(&0), "{name}");
+        // C7 (the review's I1): the audio the ring queued between a keyframe still in x264's delay
+        // and the swap is held for it, so every sink's audio starts with its picture, within one
+        // AAC frame (it was up to `X264_DELAY_MS` late, and this test once bounded that lag).
         let first_audio = *d.audio_pts_ms.first().expect("audio");
-        // A sink swapped in some ticks after the keyframe that starts it (still in x264's delay)
-        // never gets the audio the ring queued between the two, so its audio starts that late; the
-        // first sink, swapped in before any frame, starts with its picture.
-        let aac_frame_ms = 1_024 * 1_000 / 48_000;
-        // The audio encoder runs about 60 ms ahead of the video one (`Picker`'s note; 282 ms measured
-        // against the 333 ms between keyframe and swap), so some of the audio after the swap is
-        // ahead of the keyframe too: the lower bound allows that and a margin.
-        const AUDIO_AHEAD_OF_VIDEO_MS: u64 = 100;
-        let swap = match name {
-            "a.flv" => 0,
-            "b.flv" => each,
-            _ => 2 * each,
-        };
-        let missing_ms = if swap == 0 {
-            0
-        } else {
-            assert!(
-                key_in_the_delay(swap) && key_start(swap) <= swap,
-                "{name}: setup: its keyframe is in the delay"
-            );
-            (swap - key_start(swap)) * 1_000 / u64::from(P720.fps)
-        };
         assert!(
-            first_audio <= missing_ms + aac_frame_ms,
-            "{name}: audio starts at {first_audio} ms, over the {missing_ms} ms the ring's queue held"
+            first_audio <= 1_024 * 1_000 / 48_000,
+            "{name}: audio starts at {first_audio} ms"
         );
-        if name != "a.flv" {
-            assert!(
-                first_audio + AUDIO_AHEAD_OF_VIDEO_MS >= missing_ms,
-                "{name}: audio starts at {first_audio} ms, short of the {missing_ms} ms"
-            );
-        }
         sinks += 1;
     }
     eprintln!("sinks checked: {sinks}");
@@ -2121,8 +2096,8 @@ fn a_keyframe_made_after_the_reconnect_point_serves_the_swap_and_none_is_forced(
 /// starts there; past the delay the encoder has handed it out, and the file starts at the GOP's next.
 /// Before C5 a request in the first group was safe because x264 had no delay; with a look-ahead it
 /// passed GstVideoEncoder's throttle unseen and cut a GOP of one or two frames, and, asked 0.1 s after
-/// one, F-040 measured 4 of 14 requests under 2 s; at the 2 s GOP of C7 the held request would land
-/// at the floor, 6 frames behind the GOP's own, in every case. The file's keyframes are a GOP apart
+/// one, F-040 measured 4 of 14 requests under 2 s; at the 2.2 s GOP of C7 (the floor is the GOP) the held
+/// request would land on the GOP's own keyframe's frame or after it, in every case. The file's keyframes are a GOP apart
 /// and no interval in it is under Cloudflare's floor, whichever group the swap is in; the sweep
 /// reports how many of each it ran.
 #[test]
@@ -2134,7 +2109,7 @@ fn a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_go
     // the window's edge.
     let inside = [1, 2, delay / 3, delay - WINDOW_EDGE_TICKS - 1];
     let past = [delay + WINDOW_EDGE_TICKS + 4];
-    let (mut cases, mut intervals, mut served, mut waited) = (0, 0, 0, 0);
+    let (mut cases, mut intervals, mut served, mut waited, mut audio_checked) = (0, 0, 0, 0, 0);
     for profile in [P720, OutputProfile::P1080] {
         let gop = u64::from(profile.gop_frames());
         for after in inside.into_iter().chain(past) {
@@ -2183,6 +2158,15 @@ fn a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_go
                 "{case}: {n} frames: the keyframe came more than {OWED84_KEY_WAIT_TICKS} ticks late"
             );
             assert_eq!(key_indexes(&d), vec![0, gop], "{case}");
+            // C7 (the review's I1): the audio starts with the picture, within one AAC frame, whether
+            // the swap is inside the delay window (the keyframe is made and the ring's audio from it
+            // on is held for it) or past it (the audio that arrives before the keyframe is).
+            let first_audio = *d.audio_pts_ms.first().expect("audio");
+            assert!(
+                first_audio <= 1_024 * 1_000 / 48_000,
+                "{case}: audio starts at {first_audio} ms"
+            );
+            audio_checked += 1;
             let key_ms: Vec<u64> = d.parsed.iter().filter(|f| f.1).map(|f| f.0).collect();
             for w in key_ms.windows(2) {
                 assert!(
@@ -2202,11 +2186,12 @@ fn a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_go
     }
     eprintln!(
         "swapped after the GOP's keyframe: cases {cases} ({served} served by the GOP's own in the delay, \
-         {waited} waited for its next), key intervals checked {intervals}"
+         {waited} waited for its next), key intervals checked {intervals}, audio starts checked {audio_checked}"
     );
     assert_eq!(cases, 2 * (inside.len() + past.len()));
     assert_eq!((served, waited), (2 * inside.len(), 2 * past.len()));
     assert!(intervals >= cases, "intervals checked: {intervals}");
+    assert_eq!(audio_checked, cases, "audio starts checked");
 }
 
 #[test]
@@ -3072,17 +3057,15 @@ fn each_output_rebases_its_first_timestamps_to_zero() {
     let _s = serial();
     let dir = Tmp::new("rebase");
     let (mut p, rx, _f, lines) = programme();
-    // Swapped in before the first frame, and the second sink swapped in past the delay window of the
-    // GOP's own keyframe (C7: none is asked), so it starts at the GOP's next, still to be made. A swap
-    // inside the window starts at a keyframe already made, and the audio from before the swap is gone
-    // with the ring's queue (the file then starts its audio up to the window late, as the swap is late
-    // to its keyframe: `swapping_twice_...` bounds that); here the audio is held for the keyframe.
+    // Swapped in before the first frame, and the second sink swapped in a few ticks after the GOP's
+    // own keyframe (C7: none is asked), which is still in x264's delay and starts it. The audio the
+    // ring queued since that keyframe is held for it (the review's I1), so the audio starts with it.
     swap_before_the_first_frame(&mut p, &lines, 1, &file_target(&dir.file("a.flv")));
-    let second = past_the_delay_window(gop_ticks() + delay_ticks() + WINDOW_EDGE_TICKS);
-    let start = key_start(second);
-    assert!(
-        start > second,
-        "setup: the GOP's next keyframe is still to be made"
+    let second = gop_ticks() + 6;
+    assert_eq!(
+        key_start(second),
+        gop_ticks(),
+        "setup: the GOP's own keyframe is in the delay"
     );
     pace(&mut p, 0..second, FrameChoice::Slate(SlateKind::Waiting));
     p.swap_sink(2, &file_target(&dir.file("b.flv")));
@@ -3090,7 +3073,7 @@ fn each_output_rebases_its_first_timestamps_to_zero() {
     // is read when it has.
     pace(
         &mut p,
-        second..start + delay_ticks() + 10,
+        second..second + 30 + delay_ticks(),
         FrameChoice::Slate(SlateKind::Waiting),
     );
     let (video, audio) = p.output_first_pts().expect("an output");
@@ -3389,7 +3372,7 @@ const OWED84_MARGIN_TICKS: u64 = 10;
 /// encoder's own next keyframe, a GOP away, bounded).
 const OWED84_KEY_WAIT_TICKS: u64 = 6;
 
-// C7: the GOP is 2 s and the forced keyframe's floor 2.2 s, so a forced keyframe can never beat the GOP's
+// C7: the GOP is 2.2 s and the forced keyframe's floor 2.2 s too, so a forced keyframe can never beat the GOP's
 // own and the feeder asks for none (`gst_output::forced_key_can_beat_the_gop`): every sink starts at
 // the GOP's own next keyframe, and these tests place a swap against it alone. They need the floor at
 // or over the GOP (the premise of `key_due`) and room in the GOP for the encoder's delay window (twice
@@ -3762,9 +3745,13 @@ fn a_sink_whose_connect_is_pending_when_the_destination_returns_sends_nothing_qu
     let slate = FrameChoice::Slate(SlateKind::Reconnecting);
     pace(&mut p, 0..60, slate);
     p.swap_sink(1, &rtmp_target(&server));
-    // Held through the GOP's keyframe at 120 and past its delay window: the sink then waits for the
-    // GOP's next (`past_the_delay_window`), and the ring holds the one at 120 (older programme).
+    // Held through the GOP's second keyframe (tick 2 x GOP) and past it: the sink then waits for the
+    // GOP's next (`past_the_delay_window`), and the ring holds the one passed (older programme).
     let held_to = 150;
+    assert!(
+        held_to > 2 * gop_ticks(),
+        "setup: the second GOP keyframe is behind the held publish"
+    );
     let samples = pace_with_nothing_queued(&mut p, 60..held_to, slate);
     {
         let rec = server.record();

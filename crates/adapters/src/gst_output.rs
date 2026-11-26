@@ -12,18 +12,24 @@
 //! the stream restarts at the next keyframe, so viewers never get a burst of old frames; F-023).
 //! The feeder takes nothing from the ring until the sink can send (`Gate`): a file at once, and
 //! rtmp2sink once its publish is accepted. Until then the ring stays the only queue, and it drops
-//! its oldest. At that moment (the reconnect point) the feeder asks the encoder for a keyframe (made
-//! at once, or, within `FORCED_KEYFRAME_MIN_INTERVAL_MS` of the encoder's last keyframe, at that
-//! floor: F-036), and no video frame the ring holds then may start the stream (`Picker`): the first
-//! frame sent is a keyframe encoded after the reconnect point, and no audio older than it is sent. A request the
-//! encoder does not take is asked again at each entry. A drain that reaches an output that has sent
-//! nothing, at the gate or after it, ends with the encoders (`release_unsent`).
+//! its oldest. At that moment (the reconnect point) no video frame the ring holds may start the
+//! stream (`Picker`): the first frame sent is a keyframe encoded after the reconnect point, and no
+//! audio older than it is sent; the audio the ring holds from that keyframe's time on is kept for it
+//! (`audio_to_hold`, C7), since the audio encoder has no delay and the keyframe may still be in x264's.
+//! Since C7 the feeder asks the encoder for a keyframe only when one asked for can come before the
+//! GOP's own (`forced_key_can_beat_the_gop`: the floor, `FORCED_KEYFRAME_MIN_INTERVAL_MS`, under the GOP;
+//! F-036): a request is made at once, or, within the floor of the encoder's last keyframe, held to it,
+//! and asked again at each entry until the encoder takes it. At the shipped GOP the floor is the GOP
+//! and nothing is asked: the stream starts at the GOP's own next keyframe, at most a GOP away. A drain
+//! that reaches an output that has sent nothing, at the gate or after it, ends with the encoders
+//! (`release_unsent`).
 //!
 //! **One exception: the encoder's first frames** (Owed 112). A sink that can send only after the
 //! encoder's first frames, while the ring still holds all of them, at most
 //! `FIRST_GOP_CATCH_UP_MAX_MS` of them and under `OUTPUT_QUEUE_BYTES` a track, starts at the
 //! encoder's first keyframe and asks nothing (a bounded exception to Owed 84, pending the owner):
-//! dropping them would hold the stream to F-036's floor after frame 0, a head outage of up to 2.2 s.
+//! dropping them would hold the stream to the GOP's next keyframe after frame 0, a head outage of up
+//! to a GOP (`NEW_OUTPUT_KEY_WAIT_MS`).
 //!
 //! **Progress** (Owed 13). A poll every `OUTPUT_PROGRESS_POLL_MS` reads the sink's bytes-SENT total,
 //! rtmp2sink `stats` field `out-bytes-total` (F-010), or the file's size for `file://`, and sends
@@ -720,12 +726,20 @@ struct Reconnect {
     /// Owed 112: the encoder's first frames, taken out of the ring at the gate, from which the
     /// stream starts at the encoder's first keyframe; empty on every other path.
     first_gop: VecDeque<Entry>,
+    /// C7 (the review's I1): the audio the ring holds at the reconnect point, to be held by the
+    /// `Picker` for the keyframe the stream starts on. The audio encoder has no delay, so when that
+    /// keyframe is the GOP's own, made before the swap and still in x264's delay, the audio from its
+    /// time on is in the ring now and in no later entry; the `Picker` sends what is at or after the
+    /// keyframe and nothing older. Empty on the Owed 112 path (`first_gop` holds its audio).
+    held_audio: VecDeque<Entry>,
 }
 
 /// The keyframe asked for at the reconnect point (Owed 84): asked again at each entry until the
 /// encoder takes it or the stream has started, so a refused request does not leave the stream
-/// waiting for the encoder's own keyframe, up to a GOP away (3 s, F-036; 2 s since C7; PR #57 review m-6). With the floor over the GOP (C7) none is asked (`forced_key_can_beat_the_gop`), so the retry is reached only by a GOP over the floor. The
-/// request carries the running time a keyframe serves from (`KeyRequest`).
+/// waiting for the encoder's own keyframe, up to a GOP away (PR #57 review m-6). With the floor not
+/// under the GOP (the shipped case, C7) none is asked (`forced_key_can_beat_the_gop`), so this retry
+/// runs only for a GOP over the floor. The request carries the running time a keyframe serves from
+/// (`KeyRequest`).
 #[derive(Default)]
 struct KeyAsk {
     tries: u32,
@@ -746,6 +760,7 @@ impl Feeder {
             seq,
             serves_from,
             first_gop,
+            held_audio,
         }) = self.reconnect_point()
         else {
             return;
@@ -756,6 +771,11 @@ impl Feeder {
         // the stream at its first keyframe; nothing is asked then (`pick.started()` below). Empty
         // on every other path.
         for e in first_gop {
+            pick.take(e, |e, base| self.push(e, base));
+        }
+        // C7 (the review's I1): the audio queued before the swap, held for the keyframe (never sent
+        // ahead of it: `Picker::take`).
+        for e in held_audio {
             pick.take(e, |e, base| self.push(e, base));
         }
         // F-036 (CI on PR #109): before the ring has taken any video, nothing is asked. x264's first
@@ -929,9 +949,11 @@ impl Feeder {
                         seq,
                         serves_from,
                         first_gop,
+                        held_audio: VecDeque::new(),
                     });
                 }
                 let seq = r.next_seq;
+                let held_audio = audio_to_hold(&r.entries);
                 drop(r);
                 self.shared.log(&format!(
                     "output gen={}: the sink can send after {waited} ms; the {held} video frames queued \
@@ -942,6 +964,7 @@ impl Feeder {
                     seq,
                     serves_from,
                     first_gop: VecDeque::new(),
+                    held_audio,
                 });
             }
             let r = locked(&self.ring.state);
@@ -1013,6 +1036,8 @@ impl Feeder {
 ///   encoder runs about 60 ms ahead of the video one, so a keyframe's first audio arrives before it
 ///   (dropping it lost 2 or 3 AAC frames per sink). Once the keyframe sets the base, the held audio
 ///   at or after it is sent, and no audio before it, so the audio never starts ahead of the video.
+///   C7: the audio the ring holds at the reconnect point is held the same way (`audio_to_hold`), for
+///   a keyframe already made and still in x264's delay.
 /// - A seq gap (the ring dropped entries this output never took) makes the video resume at a
 ///   keyframe.
 pub(crate) struct Picker<S = gst::Sample> {
@@ -1078,6 +1103,17 @@ impl<S> Picker<S> {
     }
 }
 
+/// C7 (the review's I1): the audio entries of the ring at the reconnect point, oldest first. The
+/// stream starts at a keyframe that may be the GOP's own, made before the swap and still inside
+/// x264's delay (`own_key_in_flight`); the audio encoder has no delay, so the audio from that
+/// keyframe's time to the swap is in the ring and in nothing taken later. Dropped with the video
+/// (the reconnect point is `next_seq`), the stream's audio began as late as the swap was after its
+/// keyframe, up to `X264_DELAY_MS`, a silent lead-in under a picture. The `Picker` holds these as it
+/// holds the audio that arrives before a keyframe and sends only what is at or after it.
+pub(crate) fn audio_to_hold<S: Clone>(entries: &VecDeque<Entry<S>>) -> VecDeque<Entry<S>> {
+    entries.iter().filter(|e| !e.video).cloned().collect()
+}
+
 /// `RingState::video_since_key` after one more video entry: a keyframe is frame 0 of its GOP, any
 /// other entry one more, and before any keyframe there is nothing to count from.
 fn since_key_after(since: Option<u64>, key: bool) -> Option<u64> {
@@ -1114,15 +1150,17 @@ pub(crate) fn own_key_in_flight(video_since_key: Option<u64>, gop_frames: u32) -
 pub(crate) const FLOOR_OVER_GOP_LINE: &str =
     "the keyframe is not asked: a forced keyframe cannot come before the GOP's own";
 
-/// C7: whether a keyframe asked for can come before the GOP's own: only when the floor it is held to
-/// is shorter than the GOP, both in frames (x264 counts frames; `OutputProfile::
-/// forced_key_can_beat_the_gop` is the same comparison on the declared intervals). Held to the floor
-/// after the last keyframe, a request made when the floor is the GOP or longer is made at or after the
-/// GOP's own keyframe's frame, which x264 has already coded and not yet handed out
-/// (`own_key_in_flight`), so GstVideoEncoder's throttle cannot see it and the request cuts a GOP of
-/// the few frames between: under Cloudflare's 2 s. A GOP or a floor not yet set (0) asks as before.
+/// C7: whether a keyframe asked for can come before the GOP's own: only when the floor it is held
+/// to is shorter than the GOP, both in frames (x264 counts frames; `domain::config::forced_key_can_beat`
+/// is the one authority, and `OutputProfile::forced_key_can_beat_the_gop` the same comparison on the
+/// profile). Held to the floor after the last keyframe, a request made when the floor is the GOP or
+/// longer is made at or after the GOP's own keyframe's frame, which x264 has already coded and not yet
+/// handed out (`own_key_in_flight`), so GstVideoEncoder's throttle cannot see it and the request cuts
+/// a GOP of the few frames between: under Cloudflare's floor. A GOP or a floor not yet set (0) asks
+/// nothing (the review's M3: unset fails closed, at the cost of waiting for the GOP's own keyframe,
+/// never of a GOP under the floor; `set_gop_frames` runs when the encoder is built, before any sink).
 pub(crate) fn forced_key_can_beat_the_gop(gop_frames: u32, floor_frames: u32) -> bool {
-    gop_frames == 0 || floor_frames == 0 || floor_frames < gop_frames
+    domain::config::forced_key_can_beat(gop_frames, floor_frames)
 }
 
 /// Owed 112: whether a sink that can send only now starts from the encoder's first keyframe rather
@@ -1368,6 +1406,104 @@ mod tests {
         );
     }
 
+    /// C7 (the review's I1): the encoded ring as a swap finds it. Video: 30 fps, a keyframe every GOP
+    /// (66 frames, 2 200 ms), each frame out of x264 `delay` ms after its PTS (`X264_DELAY_MS`); audio:
+    /// 21 ms frames with no delay. Returns the swap's reconnect seq, the ring's entries then, and what
+    /// is pushed after, all in the order the encoders hand them out.
+    fn ring_at_a_swap(swap_ms: u64, delay_ms: u64) -> (u64, VecDeque<Entry<u64>>, Vec<Entry<u64>>) {
+        const GOP_MS: u64 = 2_200;
+        let mut events: Vec<(u64, bool, bool, u64)> = Vec::new(); // wall, video, key, pts
+        for i in 0..400u64 {
+            let pts = i * 1_000 / 30;
+            events.push((pts + delay_ms, true, (pts % GOP_MS) == 0, pts));
+        }
+        for j in 0..400u64 {
+            events.push((j * 21, false, false, j * 21));
+        }
+        events.sort_by_key(|e| (e.0, e.1));
+        let entries: Vec<Entry<u64>> = events
+            .iter()
+            .enumerate()
+            .map(|(seq, e)| entry(seq as u64, e.1, e.2, e.3))
+            .collect();
+        let reconnect = events.iter().take_while(|e| e.0 < swap_ms).count();
+        let ring: VecDeque<Entry<u64>> = entries[..reconnect].iter().cloned().collect();
+        (reconnect as u64, ring, entries[reconnect..].to_vec())
+    }
+
+    /// What a `Picker` sends from `held` then `later`: the first video entry's PTS (the base, the
+    /// stream's keyframe) and the PTS of the first audio entry sent after it, with the audio count.
+    fn start_of_the_stream(
+        reconnect: u64,
+        held: VecDeque<Entry<u64>>,
+        later: &[Entry<u64>],
+    ) -> (Option<u64>, Option<u64>, usize) {
+        let mut pick = Picker::new(reconnect);
+        let (mut base, mut first_audio, mut audio) = (None, None, 0);
+        for e in held.into_iter().chain(later.iter().cloned()) {
+            pick.take(e, |e, b| {
+                if e.video {
+                    base.get_or_insert(b.mseconds());
+                } else {
+                    first_audio.get_or_insert(e.pts.mseconds());
+                    audio += 1;
+                }
+            });
+        }
+        (base, first_audio, audio)
+    }
+
+    /// The review's I1. A sink swapped in `after` ms after the GOP's own keyframe, while it is still in
+    /// x264's delay, starts at that keyframe; the audio queued since is in the ring, and dropped with
+    /// the video the stream's audio began as late as the swap was after the keyframe. With the audio
+    /// held (`audio_to_hold`) it starts within one AAC frame (21 ms) of the picture, and never before
+    /// it. The sweep crosses the delay's edge (800 ms) and the next GOP's keyframe and counts each
+    /// side; the control (nothing held, the old behaviour) must show the lag, or the sweep proves nothing.
+    #[test]
+    fn the_audio_queued_before_a_swap_starts_with_the_keyframe_it_starts_on() {
+        const GOP_MS: u64 = 2_200;
+        const DELAY_MS: u64 = 800;
+        const AAC_FRAME_MS: u64 = 21;
+        let (mut cases, mut in_delay, mut past, mut lagging_control) = (0, 0, 0, 0);
+        // From just after the GOP's keyframe (made at 2 200 ms) to just after the next one's delay.
+        for swap in (2_201..2 * GOP_MS + DELAY_MS + 200).step_by(37) {
+            let (reconnect, ring, later) = ring_at_a_swap(swap, DELAY_MS);
+            // The expected keyframe, from the declarations: a GOP's own keyframe made before the swap
+            // and not yet out of x264 starts the stream, else the next one made after it.
+            let made = swap / GOP_MS * GOP_MS;
+            let inside = swap < made + DELAY_MS;
+            let want = if inside { made } else { made + GOP_MS };
+            let (base, first, audio) = start_of_the_stream(reconnect, audio_to_hold(&ring), &later);
+            assert_eq!(base, Some(want), "swap {swap}");
+            let first = first.unwrap_or_else(|| panic!("swap {swap}: no audio sent"));
+            assert!(
+                first >= want && first < want + AAC_FRAME_MS,
+                "swap {swap}: audio starts at {first} ms, the picture at {want} ms"
+            );
+            assert!(audio > 0, "swap {swap}");
+            let (_, control_first, _) = start_of_the_stream(reconnect, VecDeque::new(), &later);
+            let control_first = control_first.expect("control audio");
+            if inside && swap - made >= 2 * AAC_FRAME_MS {
+                assert!(
+                    control_first >= want + AAC_FRAME_MS,
+                    "swap {swap}: the old behaviour does not lag ({control_first} ms from {want}): the case proves nothing"
+                );
+                lagging_control += 1;
+            }
+            if inside {
+                in_delay += 1;
+            } else {
+                past += 1;
+            }
+            cases += 1;
+        }
+        eprintln!("audio at a start: {cases} swaps ({in_delay} in the delay, {past} past it), the control lagged in {lagging_control}");
+        assert!(
+            in_delay >= 15 && past >= 15 && lagging_control >= 10,
+            "{in_delay} {past} {lagging_control}"
+        );
+    }
+
     #[test]
     fn with_no_keyframe_after_the_reconnect_point_nothing_is_sent() {
         let ring: Vec<_> = ring_with_an_old_keyframe()
@@ -1507,7 +1643,7 @@ mod tests {
     /// `delay` frames on (x264's look-ahead and frame threads), is held to the floor after the last
     /// keyframe, and so is made at frame `max(since + delay, floor)` after it; the GOP's own comes at
     /// frame `gop`, and a request made at or after it cuts a GOP of the frames between (under
-    /// Cloudflare's floor). The sweep covers the shipped 2 s GOP (never asked: the floor is over it),
+    /// Cloudflare's floor). The sweep covers the shipped 2.2 s GOP (never asked: the floor is the GOP),
     /// the 3 s GOP before C7 (asked until the GOP's keyframe is in the delay), and a 1 s GOP; it
     /// reports how many of each answer it saw, so a rule that is always yes or always no fails.
     #[test]
@@ -1540,23 +1676,28 @@ mod tests {
         }
         eprintln!("ask sweep: checked {checked}, asked {asked}, refused {refused}");
         assert!(checked > 0 && asked > 0 && refused > 0);
-        // The shipped GOP: the floor is over it, so none is ever asked (the owner's 2 s, C7).
+        // The shipped GOP: the floor is the GOP, so none is ever asked (C7).
         assert_eq!(asked_at_the_shipped_gop, 0);
-        assert_eq!(u64::from(shipped), 60, "setup: the shipped GOP is 2 s at 30 fps");
+        assert_eq!(
+            u64::from(shipped),
+            66,
+            "setup: the shipped GOP is 2.2 s at 30 fps"
+        );
     }
 
     /// C7: the comparison itself, at its edge and with nothing set. Equal is refused: a request held
     /// to a floor equal to the GOP is made on the GOP's own keyframe's frame or after it.
     #[test]
-    fn the_floor_must_be_strictly_under_the_gop_and_unset_values_ask_as_before() {
+    fn the_floor_must_be_strictly_under_the_gop_and_unset_values_ask_nothing() {
         for (gop, floor, want) in [
             (90, 66, true),
             (67, 66, true),
             (66, 66, false),
             (65, 66, false),
             (60, 66, false),
-            (0, 66, true),
-            (60, 0, true),
+            (0, 66, false),
+            (60, 0, false),
+            (0, 0, false),
         ] {
             assert_eq!(
                 forced_key_can_beat_the_gop(gop, floor),
