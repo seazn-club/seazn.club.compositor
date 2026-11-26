@@ -4738,7 +4738,10 @@ fn cef_hung_hides_and_restarts_graphics_and_reds_when_the_hang_is_never_seen() {
     );
     for (tag, strip_ms) in [
         ("hung-ci-delay", 758),
-        ("hung-strip-at-lag-budget", lag),
+        // The strip reads a gap at the first frame on or after it (CI run 45743066857 read a gap
+        // placed at 950 as 955), so the edge case sits one frame period (plus the integer
+        // truncation of 33.3) inside the budget: its read lands on or under the bound.
+        ("hung-strip-at-lag-budget", lag - (w.ms("frame_period_ms") + 1)),
         ("hung-strip-at-early-budget", -budget),
     ] {
         assert_pass(
