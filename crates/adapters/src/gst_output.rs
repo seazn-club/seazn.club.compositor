@@ -157,6 +157,9 @@ struct RingState {
     video_since_key: Option<u64>,
     /// The programme's GOP in frames (`key-int-max`), 0 until the programme sets it.
     gop_frames: u32,
+    /// The forced keyframe's floor in frames (`FORCED_KEYFRAME_MIN_INTERVAL_MS`), 0 until the
+    /// programme sets it (C7: `forced_key_can_beat_the_gop` reads it with the GOP).
+    floor_frames: u32,
     /// The entries the ring dropped for its span or its count, per track (the test hooks read it).
     #[cfg(feature = "test-hooks")]
     pruned: Encoded,
@@ -205,9 +208,12 @@ impl EncodedRing {
         locked(&self.state).entries.len()
     }
 
-    /// The programme's GOP in frames, set when it builds its encoder (`own_key_in_flight`).
-    pub(crate) fn set_gop_frames(&self, gop_frames: u32) {
-        locked(&self.state).gop_frames = gop_frames;
+    /// The programme's GOP in frames, set when it builds its encoder (`own_key_in_flight`), and the
+    /// forced keyframe's floor in frames (C7, `forced_key_can_beat_the_gop`).
+    pub(crate) fn set_gop_frames(&self, gop_frames: u32, floor_frames: u32) {
+        let mut r = locked(&self.state);
+        r.gop_frames = gop_frames;
+        r.floor_frames = floor_frames;
     }
 
     /// The entries dropped for the ring's span or count so far, (video, audio) (the test hooks read it).
@@ -729,6 +735,9 @@ struct KeyAsk {
     /// `ask_key` has said that nothing is asked because the GOP's own keyframe is in the encoder
     /// (F-040, `own_key_in_flight`): said once.
     said_in_flight: bool,
+    /// `ask_key` has said that nothing is asked because the forced keyframe's floor is not under the
+    /// GOP (C7, `forced_key_can_beat_the_gop`): said once.
+    said_floor_over_gop: bool,
 }
 
 impl Feeder {
@@ -802,6 +811,27 @@ impl Feeder {
             return;
         };
         if ask.taken {
+            return;
+        }
+        // C7: with the floor over the GOP, a keyframe asked for can only be made after the GOP's own
+        // (held to the floor), and, the GOP's own being in x264's delay, right behind it: a GOP under
+        // Cloudflare's floor. The GOP's own keyframe serves every swap, at most a GOP away.
+        let (can_beat, gop, floor) = {
+            let r = locked(&self.ring.state);
+            (
+                forced_key_can_beat_the_gop(r.gop_frames, r.floor_frames),
+                r.gop_frames,
+                r.floor_frames,
+            )
+        };
+        if !can_beat {
+            if !std::mem::replace(&mut ask.said_floor_over_gop, true) {
+                self.shared.log(&format!(
+                    "output gen={}: {FLOOR_OVER_GOP_LINE} (floor {floor} frames, GOP {gop}): the GOP's own \
+                     keyframe, at most a GOP on, serves this sink",
+                    self.gen
+                ));
+            }
             return;
         }
         // F-040: the GOP's own keyframe is in the encoder's delay, due within `X264_DELAY_MS`, and
@@ -1077,6 +1107,22 @@ fn since_key_after(since: Option<u64>, key: bool) -> Option<u64> {
 pub(crate) fn own_key_in_flight(video_since_key: Option<u64>, gop_frames: u32) -> Option<u64> {
     let due_in = u64::from(gop_frames).checked_sub(video_since_key?)?;
     (due_in > 0 && due_in <= u64::from(X264_DELAY_FRAMES)).then_some(due_in)
+}
+
+/// C7: the line `ask_key` writes, once, when it asks for no keyframe because the floor is not under
+/// the GOP (the programme tests wait on it).
+pub(crate) const FLOOR_OVER_GOP_LINE: &str =
+    "the keyframe is not asked: a forced keyframe cannot come before the GOP's own";
+
+/// C7: whether a keyframe asked for can come before the GOP's own: only when the floor it is held to
+/// is shorter than the GOP, both in frames (x264 counts frames; `OutputProfile::
+/// forced_key_can_beat_the_gop` is the same comparison on the declared intervals). Held to the floor
+/// after the last keyframe, a request made when the floor is the GOP or longer is made at or after the
+/// GOP's own keyframe's frame, which x264 has already coded and not yet handed out
+/// (`own_key_in_flight`), so GstVideoEncoder's throttle cannot see it and the request cuts a GOP of
+/// the few frames between: under Cloudflare's 2 s. A GOP or a floor not yet set (0) asks as before.
+pub(crate) fn forced_key_can_beat_the_gop(gop_frames: u32, floor_frames: u32) -> bool {
+    gop_frames == 0 || floor_frames == 0 || floor_frames < gop_frames
 }
 
 /// Owed 112: whether a sink that can send only now starts from the encoder's first keyframe rather
@@ -1453,6 +1499,83 @@ mod tests {
         }
         eprintln!("keyframe-in-flight sweep: checked {checked}, in flight {in_flight}");
         assert!(checked > 0 && in_flight > 0 && in_flight < checked);
+    }
+
+    /// C7: a keyframe is asked for exactly when it would be made BEFORE the GOP's own. The expected
+    /// answer is GstVideoEncoder's own model, not this rule's arithmetic: a request made when the
+    /// newest frame the ring holds is `since` frames after the last keyframe reaches the encoder
+    /// `delay` frames on (x264's look-ahead and frame threads), is held to the floor after the last
+    /// keyframe, and so is made at frame `max(since + delay, floor)` after it; the GOP's own comes at
+    /// frame `gop`, and a request made at or after it cuts a GOP of the frames between (under
+    /// Cloudflare's floor). The sweep covers the shipped 2 s GOP (never asked: the floor is over it),
+    /// the 3 s GOP before C7 (asked until the GOP's keyframe is in the delay), and a 1 s GOP; it
+    /// reports how many of each answer it saw, so a rule that is always yes or always no fails.
+    #[test]
+    fn a_keyframe_is_asked_only_when_it_would_be_made_before_the_gops_own() {
+        let floor = u64::from(domain::config::OutputProfile::P1080.forced_keyframe_min_frames());
+        let delay = u64::from(domain::config::X264_DELAY_FRAMES);
+        let (mut checked, mut asked, mut refused) = (0u64, 0u64, 0u64);
+        let mut asked_at_the_shipped_gop = 0u64;
+        let shipped = domain::config::OutputProfile::P1080.gop_frames();
+        for gop in [shipped, 90, 30] {
+            let gop = u32::try_from(gop).expect("frames");
+            for since in 0..u64::from(gop) {
+                let lands_at = (since + delay).max(floor);
+                let want = lands_at < u64::from(gop);
+                let got = forced_key_can_beat_the_gop(gop, floor as u32)
+                    && own_key_in_flight(Some(since), gop).is_none();
+                assert_eq!(
+                    got, want,
+                    "GOP {gop}, newest frame {since} after the last keyframe"
+                );
+                if got {
+                    asked += 1;
+                    if gop == shipped {
+                        asked_at_the_shipped_gop += 1;
+                    }
+                } else {
+                    refused += 1;
+                }
+                checked += 1;
+            }
+        }
+        eprintln!("ask sweep: checked {checked}, asked {asked}, refused {refused}");
+        assert!(checked > 0 && asked > 0 && refused > 0);
+        // The shipped GOP: the floor is over it, so none is ever asked (the owner's 2 s, C7).
+        assert_eq!(asked_at_the_shipped_gop, 0);
+        assert_eq!(u64::from(shipped), 60, "setup: the shipped GOP is 2 s at 30 fps");
+    }
+
+    /// C7: the comparison itself, at its edge and with nothing set. Equal is refused: a request held
+    /// to a floor equal to the GOP is made on the GOP's own keyframe's frame or after it.
+    #[test]
+    fn the_floor_must_be_strictly_under_the_gop_and_unset_values_ask_as_before() {
+        for (gop, floor, want) in [
+            (90, 66, true),
+            (67, 66, true),
+            (66, 66, false),
+            (65, 66, false),
+            (60, 66, false),
+            (0, 66, true),
+            (60, 0, true),
+        ] {
+            assert_eq!(
+                forced_key_can_beat_the_gop(gop, floor),
+                want,
+                "GOP {gop}, floor {floor}"
+            );
+        }
+        for p in [
+            domain::config::OutputProfile::P720,
+            domain::config::OutputProfile::P1080,
+        ] {
+            assert_eq!(
+                forced_key_can_beat_the_gop(p.gop_frames(), p.forced_keyframe_min_frames()),
+                p.forced_key_can_beat_the_gop(),
+                "{}p: the frames rule and the declared intervals agree",
+                p.height
+            );
+        }
     }
 
     /// F-040: no keyframe taken yet, or a GOP the programme has not set, is nothing to predict from:

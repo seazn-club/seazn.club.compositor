@@ -73,7 +73,8 @@ const AAC_BITRATE: i32 = 128_000;
 /// +1.4 to +4.2 VMAF at 6 Mbps for 0.8 s of frame delay (`domain::config::X264_DELAY_MS`) and 0 to 14 %
 /// more encoder CPU. B-frames stay off: they bought nothing and the output's rebase cannot carry them. C00 measured a 2 s keyframe interval with x264's scene cut on; F-036 made it
 /// a fixed 3 s GOP (`OutputProfile::gop_frames`) with the scene cut off (`X264_NO_SCENE_CUT`), which
-/// codes fewer keyframes, never more.
+/// codes fewer keyframes, never more; C7 (the owner, 2026-11-26) shortened it to 2 s, Cloudflare's
+/// floor (`PROGRAMME_GOP_MS`), to cut the viewer's delay.
 const X264_SPEED_PRESET: &str = "medium";
 // The VBV lives in `config` (`X264_VBV_MS`), since the first-GOP bound reads it (Owed 112); the
 // property takes a u32 of ms, and a value it cannot carry is a compile error.
@@ -85,7 +86,7 @@ const _: () = assert!(X264_RC_LOOKAHEAD_FRAMES <= i32::MAX as u32);
 const X264_OPTIONS: &str = "nal-hrd=cbr:filler=1";
 /// F-036: x264's scene cut off, so a hard cut in the picture (the slate to the camera, a camera
 /// returning) never starts a GOP early: Cloudflare errored the programme input for GOPs under 2 s
-/// (`ERR_GOP_OUT_OF_RANGE`). x264enc 1.24.2 has no property for it, and reads its `option-string`
+/// (`ERR_GOP_OUT_OF_RANGE`), and at the 2 s GOP of C7 a cut starting a GOP early is the whole risk. x264enc 1.24.2 has no property for it, and reads its `option-string`
 /// before its properties, none of which sets the scene cut. F-036's libx264 probe: across 210 frames
 /// with hard cuts, keyframes at frames 0, 30, 60, 69, 78, 87 and 177 with it on, at 0, 90 and 180
 /// with `scenecut=0`. x264's `min-keyint` cannot stand in for it: x264 clamps it to
@@ -601,7 +602,9 @@ impl GstProgramme {
         encoder.set_property("sync-lookahead", X264_SYNC_LOOKAHEAD_FRAMES);
         encoder.set_property("bitrate", profile.video_kbps);
         encoder.set_property("key-int-max", profile.gop_frames());
-        self.shared.ring.set_gop_frames(profile.gop_frames());
+        self.shared
+            .ring
+            .set_gop_frames(profile.gop_frames(), profile.forced_keyframe_min_frames());
         encoder.set_property("bframes", 0u32);
         encoder.set_property("vbv-buf-capacity", X264_VBV_PROPERTY_MS);
         encoder.set_property("option-string", format!("{X264_OPTIONS}:{X264_NO_SCENE_CUT}"));
@@ -619,6 +622,8 @@ impl GstProgramme {
         // otherwise the request's throttle sees every keyframe it can collide with. This property still
         // holds a request off a keyframe the encoder HAS handed out, and one request off another
         // (`a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor`).
+        // C7: at a 2 s GOP the floor (2.2 s) is over the GOP, so the adapter asks for none at all
+        // (`gst_output::forced_key_can_beat_the_gop`); the property stays as the second guard.
         encoder.set_property(
             "min-force-key-unit-interval",
             gst::ClockTime::from_mseconds(FORCED_KEYFRAME_MIN_INTERVAL_MS).nseconds(),

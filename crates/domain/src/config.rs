@@ -236,15 +236,15 @@ pub const OUTPUT_FPS_MIN_WINDOW_MS: Ms = 2_500;
 pub const YOUTUBE_KEPT_GAP_MS: Ms = 15_000;
 
 /// Every output recovery path the broadcast must survive finishes its output gap UNDER this: F-004's
-/// 15 s and the forced keyframe's arrival (`FORCED_KEYFRAME_ARRIVAL_MS`: F-036's floor, and F-040's
-/// encoder delay since C5; the C1 review's I2, the controller's ruling and the owner's apply-rec,
-/// 2026-11-24). A recovering sink's picture comes back at the keyframe its swap asks for, which the
-/// encoder holds to the floor after its last one and then holds in its look-ahead: up to that long
-/// after the new sink's first bytes. The rest of each path keeps F-004's 15 s
+/// 15 s and the forced keyframe's arrival (`FORCED_KEYFRAME_ARRIVAL_MS`: the shorter of F-036's floor
+/// and the GOP, and F-040's encoder delay since C5; the C1 review's I2, the controller's ruling and the owner's apply-rec,
+/// 2026-11-24). A recovering sink's picture comes back at the next keyframe: the one its swap asks for, held to
+/// the floor after the last (before C7), or the GOP's own (since: `FORCED_KEYFRAME_MIN_INTERVAL_MS`),
+/// and then held in the encoder's look-ahead: up to that long after the new sink's first bytes. The rest of each path keeps F-004's 15 s
 /// (`output_egress_flat_ms` takes the arrival back out, so the backstop's threshold does not move: a
-/// false hung declaration costs more than the floor). 18 s today (17.2 s before C5) is past the
-/// longest gap YouTube was seen to keep and short of the 30 s that split the broadcast; the cost if
-/// YouTube splits between them is a documented worst gap 3 s longer, not 2.2. Not in it: F-028's lost
+/// false hung declaration costs more than the floor). 17.8 s today (18 s from C5 to C7, 17.2 s before
+/// C5) is past the longest gap YouTube was seen to keep and short of the 30 s that split the
+/// broadcast; the cost if YouTube splits between them is a documented worst gap 2.8 s longer. Not in it: F-028's lost
 /// forced keyframe (a destination that drops it, seen once in two MediaMTX runs, waits for the
 /// encoder's next own keyframe, a GOP after the forced one). No recovery path the domain models
 /// loses a keyframe, so it is stated here, not budgeted.
@@ -267,23 +267,40 @@ pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 5_000;
 /// duration (keyframe interval) must be between 2 and 10 seconds. Closed GOPs are required"). Outside
 /// it the input errors (`live_input.errored`, `ERR_GOP_OUT_OF_RANGE`), as the programme input (our
 /// x264 output) did twice on stg, sessions d908c90c and 5e5403ce, 2026-11-24. The floor.
+///
+/// C7 (2026-11-26): the page says it for "all live inputs", and its Low-Latency HLS section only
+/// recommends "a GOP size of 2 - 4 seconds"; the troubleshooting page words the error as "less than
+/// 2 seconds or greater than 8" and gives no separate limit for LL-HLS. Only a 2023 blog post
+/// (open beta) recommends 1 s, a recommendation, not a documented floor, and the current docs
+/// contradict it. So 2 s is the floor for every input until Cloudflare measures otherwise (F-041).
+///
+/// **THE one constant for the programme's keyframe spacing** (C7): the programme's GOP
+/// (`PROGRAMME_GOP_MS`) and the forced keyframe's floor (`FORCED_KEYFRAME_MIN_INTERVAL_MS`) both read
+/// it, and so does every budget derived from either. A move to 1 s, once Cloudflare is measured to
+/// take it on a Low-Latency HLS input, is this number alone.
 pub const CF_KEYFRAME_INTERVAL_MIN_MS: Ms = 2_000;
 /// F-036: Cloudflare's keyframe interval range, its ceiling (`CF_KEYFRAME_INTERVAL_MIN_MS`).
 pub const CF_KEYFRAME_INTERVAL_MAX_MS: Ms = 10_000;
 
-/// F-036: the programme's GOP, one keyframe every 3 s (the C1 brief): the capture app's own fix for
-/// the same 2 s edge (it measured ±14 ms of jitter at 2 s), a second inside Cloudflare's floor. C09
-/// sets x264enc's `key-int-max` to it in frames (`OutputProfile::gop_frames`) with x264's scene cut
-/// off (`scenecut=0`, which x264 honours and its `min-keyint` cannot replace: x264 clamps that to
-/// `key-int-max / 2 + 1`, F-036), so every GOP is this long, unless an output swap forces a keyframe
-/// (Owed 84; `FORCED_KEYFRAME_MIN_INTERVAL_MS` bounds that one).
-pub const PROGRAMME_GOP_MS: Ms = 3_000;
+/// The programme's GOP: one keyframe every 2 s, the shortest Cloudflare's live input takes
+/// (`CF_KEYFRAME_INTERVAL_MIN_MS`). C7 (the owner, 2026-11-26) moved it off F-036's 3 s, which was a
+/// second's margin over that floor for two causes that are gone: x264's scene cut (off since F-036,
+/// `scenecut=0`) and Owed 84's forced keyframes (held to `FORCED_KEYFRAME_MIN_INTERVAL_MS`); the
+/// phone's own ±14 ms jitter at 2 s (F-036) is not measured on this encoder, which counts
+/// frames and stamps tick `i` at `i × 10⁹ / fps` ns (F-041 reads the shipped stream's intervals). Cloudflare cuts live HLS segments at
+/// keyframes (stg: 3 to 3.33 s segments, TARGETDURATION 4, the viewer about two segments behind), so
+/// a shorter GOP shortens every segment. C09 sets x264enc's `key-int-max` to it in frames
+/// (`OutputProfile::gop_frames`) with x264's scene cut off (`scenecut=0`, which x264 honours and its
+/// `min-keyint` cannot replace: x264 clamps that to `key-int-max / 2 + 1`, F-036), so every GOP is
+/// exactly this long. A forced keyframe (Owed 84) can no longer beat it (see
+/// `FORCED_KEYFRAME_MIN_INTERVAL_MS`).
+pub const PROGRAMME_GOP_MS: Ms = CF_KEYFRAME_INTERVAL_MIN_MS;
 
 /// F-036 (the C1 review's I1, the controller's ruling 2026-11-24): the margin a forced keyframe keeps
 /// over Cloudflare's floor. A held keyframe lands exactly at the floor (the programme stamps tick `i`
 /// at `i × 10⁹ / fps` ns, and GstVideoEncoder throttles on a strict `>`), and whether Cloudflare takes
 /// exactly 2 000 ms is not measured; the phone errored at 2 s ±14 ms. 200 ms: whole frames at 25, 30
-/// and 60 fps, and a GOP less the floor still leaves Owed 84's tests their 16 ticks (`config` test).
+/// and 60 fps.
 pub const FORCED_KEYFRAME_MARGIN_MS: Ms = 200;
 
 /// F-036: the shortest GOP a forced keyframe may cut, Cloudflare's floor and a margin. Owed 84's
@@ -291,6 +308,14 @@ pub const FORCED_KEYFRAME_MARGIN_MS: Ms = 200;
 /// keyframe, it is deferred to this interval, never dropped. C09 sets it as x264enc's
 /// `min-force-key-unit-interval` (GstVideoEncoder, since 1.18), which holds the request in running
 /// time, the stream's own clock: a wall-clock rule cannot see when the last keyframe was encoded.
+///
+/// C7: at a 2 s GOP the floor (2.2 s) is LONGER than the GOP, so a forced keyframe can never come
+/// before the GOP's own: held to the floor, it would be made 0.2 s after the GOP's own keyframe
+/// while that keyframe is still inside x264's delay (`X264_DELAY_MS`), a GOP of 0.2 s, under
+/// Cloudflare's floor. So the adapter asks for none (`gst_output::forced_key_can_beat_the_gop`,
+/// read from `OutputProfile::forced_key_can_beat_the_gop`) and a new output starts at the GOP's
+/// own next keyframe, at most a GOP away. The floor stays, so a longer GOP brings the forced
+/// keyframe back with no change here.
 pub const FORCED_KEYFRAME_MIN_INTERVAL_MS: Ms = CF_KEYFRAME_INTERVAL_MIN_MS + FORCED_KEYFRAME_MARGIN_MS;
 
 /// The phone's GOP: the capture app publishes a keyframe every 3 s (the C1 brief; F-036, the same
@@ -364,19 +389,29 @@ pub const X264_DELAY_MS: Ms = {
     (X264_DELAY_FRAMES as Ms * 1_000).div_ceil(slowest)
 };
 
-/// F-036 and F-040: the longest a keyframe the encoder is asked for takes to reach the output after
-/// the encoder's last one: the floor it is held to (`FORCED_KEYFRAME_MIN_INTERVAL_MS`, in the
-/// encoder's input time) and then the frame delay (`X264_DELAY_MS`) before it comes out. What every
-/// output recovery path adds to its own terms where it said "the floor" before F-040
-/// (`OUTPUT_GAP_BUDGET_MS`, `output_egress_flat_ms`, the harness's `BUDGET_OUTPUT_RECONNECT_MS`).
+/// F-036, F-040 and C7: the longest a keyframe a new output starts at takes to reach the output after
+/// the encoder's last one: the shorter of the floor a forced keyframe is held to
+/// (`FORCED_KEYFRAME_MIN_INTERVAL_MS`) and the GOP's own (`PROGRAMME_GOP_MS`), both in the encoder's
+/// input time, and then the frame delay (`X264_DELAY_MS`) before it comes out. At a 2 s GOP the
+/// GOP's own keyframe always comes first (2.0 s against 2.2 s), so this is a GOP and the delay: 2.8 s
+/// (3.0 s before C7, when the floor was the shorter). What every output recovery path adds to its own
+/// terms (`OUTPUT_GAP_BUDGET_MS`, `output_egress_flat_ms`, the harness's `BUDGET_OUTPUT_RECONNECT_MS`).
 ///
 /// A bound, not a path (the C5 review's m1): a request made at the ring's newest video `n` after the
-/// encoder's last keyframe `K` is made at input time `max(n + delay, K + floor)` and comes out when
-/// the ring reaches it, so the modelled wait is `max(delay, K + floor - n)`, at most the floor alone
-/// (2.2 s), and the sum below is up to the delay (0.8 s) over it. The sum stays: a tighter bound would
-/// move `OUTPUT_GAP_BUDGET_MS`, the chaos budgets and `thresholds.json`, and no run has measured a
-/// path that needs them tighter. Owed 124.
-pub const FORCED_KEYFRAME_ARRIVAL_MS: Ms = FORCED_KEYFRAME_MIN_INTERVAL_MS + X264_DELAY_MS;
+/// encoder's last keyframe `K` is served when the ring reaches the first keyframe after `n`, so the
+/// modelled wait is at most the shorter interval alone, and the sum below is up to the delay (0.8 s)
+/// over it. The sum stays: a tighter bound would move `OUTPUT_GAP_BUDGET_MS`, the chaos budgets and
+/// `thresholds.json` a second time, and no run has measured a path that needs them tighter. Owed 124.
+pub const FORCED_KEYFRAME_ARRIVAL_MS: Ms = NEW_OUTPUT_KEY_WAIT_MS + X264_DELAY_MS;
+
+/// C7: the shorter of the floor a forced keyframe is held to and the GOP's own interval, in the
+/// encoder's input time: how long after the encoder's last keyframe the next one a new output can
+/// start at is made (`FORCED_KEYFRAME_ARRIVAL_MS` adds the frame delay).
+pub const NEW_OUTPUT_KEY_WAIT_MS: Ms = if FORCED_KEYFRAME_MIN_INTERVAL_MS < PROGRAMME_GOP_MS {
+    FORCED_KEYFRAME_MIN_INTERVAL_MS
+} else {
+    PROGRAMME_GOP_MS
+};
 
 /// Owed 112 (C3b, `_FINDINGS.md` F-038; chaos runs 45480676592 `cef-hung` and 45498019823
 /// `dest-stall-rule`, head outages of 813 and 816 ms): the longest backlog of the encoder's first
@@ -384,8 +419,9 @@ pub const FORCED_KEYFRAME_ARRIVAL_MS: Ms = FORCED_KEYFRAME_MIN_INTERVAL_MS + X26
 /// instead of dropping it (Owed 84 drops every frame queued before a sink can send). Dropping it
 /// costs a head outage: the keyframe asked for then is held to `FORCED_KEYFRAME_MIN_INTERVAL_MS`
 /// after frame 0 (F-036 fact 4), so the stream starts the floor less the backlog late. Taking it
-/// costs the backlog as latency, sent at once (a burst, F-023's 4 s there). Half the floor is where
-/// the two are equal (1 100 ms), and the burst stays within one coded picture buffer
+/// costs the backlog as latency, sent at once (a burst, F-023's 4 s there). Half the wait for the
+/// next keyframe (`NEW_OUTPUT_KEY_WAIT_MS`: the floor, 1 100 ms halved, before C7; the GOP, 1 000 ms
+/// halved, since) is where the two are equal, and the burst stays within one coded picture buffer
 /// (`X264_VBV_MS`, the C3b review's m1), so the lesser of the two: 1 000 ms today. The races seen
 /// were 37 to 38 ms (one frame). A bounded exception to Owed 84's option A, PENDING the owner's
 /// ruling (docs/_INDEX.md, "Owed 112 built"): a smaller bound is this one constant. Under the GOP
@@ -394,12 +430,12 @@ pub const FORCED_KEYFRAME_ARRIVAL_MS: Ms = FORCED_KEYFRAME_MIN_INTERVAL_MS + X26
 ///
 /// F-040 (C5): the encoder's frame delay (`X264_DELAY_MS`) does NOT move it. A sink that can send
 /// `T` after the programme's frame 0 finds `T - delay` of backlog in the ring (the first frame
-/// comes out `delay` late). Dropping it, the key asked then is made at the floor in input time and
-/// comes out `delay` later, so the stream starts at `floor + delay` and the head outage is
-/// `floor + delay - T`: `floor - backlog` again, the delay in both terms. Half the floor stays where
+/// comes out `delay` late). Dropping it, the key it waits for is made at the wait in input time and
+/// comes out `delay` later, so the stream starts at `wait + delay` and the head outage is
+/// `wait + delay - T`: `wait - backlog` again, the delay in both terms. Half the wait stays where
 /// taking and dropping cost the same.
 pub const FIRST_GOP_CATCH_UP_MAX_MS: Ms = {
-    let half_floor = FORCED_KEYFRAME_MIN_INTERVAL_MS / 2;
+    let half_floor = NEW_OUTPUT_KEY_WAIT_MS / 2;
     if half_floor < X264_VBV_MS {
         half_floor
     } else {
@@ -544,7 +580,7 @@ pub const TICK_WIDEST_MS: Ms = {
 /// comes back up to that after the next sink's first bytes), the next sink's whole connect, the base
 /// back-off (the swap is failure 1 from Connected), the poll that sees the last growth late, and a
 /// tick each for the backstop and the build; then floored to the poll's grid. With today's numbers
-/// 18 000 - 3 000 - 5 000 - 500 - 250 - 2 x 34 = 9 182, so 9 000 ms, as before F-036 and F-040 (the C1
+/// 17 800 - 2 800 - 5 000 - 500 - 250 - 2 x 34 = 9 182, so 9 000 ms, as before F-036 and F-040 (the C1
 /// review's I2: the floor does not shorten hung detection, and neither does the delay). A threshold
 /// the budget cannot hold is a compile error (the subtraction underflows).
 pub const fn output_egress_flat_ms(backoff_base_ms: Ms, connect_timeout_ms: Ms) -> Ms {
@@ -727,6 +763,14 @@ impl OutputProfile {
     /// F-036: `FORCED_KEYFRAME_MIN_INTERVAL_MS` in this profile's frames.
     pub fn forced_keyframe_min_frames(&self) -> u32 {
         frames_in(self.fps, FORCED_KEYFRAME_MIN_INTERVAL_MS)
+    }
+
+    /// C7: whether a keyframe asked for can come before the GOP's own: only when the floor it is held
+    /// to is shorter than the GOP, in frames (x264 counts frames). At a 2 s GOP it cannot (66 frames
+    /// against 60), and the one asked would be made right behind the GOP's own, still in x264's
+    /// delay, a GOP under Cloudflare's floor; so none is asked (`gst_output::ask_key`).
+    pub fn forced_key_can_beat_the_gop(&self) -> bool {
+        self.forced_keyframe_min_frames() < self.gop_frames()
     }
 
     /// Owed 86: the real output frame rate below which the output is starved
@@ -1145,10 +1189,11 @@ mod tests {
     // a whole number of frames, so x264's frame counts land on the millisecond, and the GOP and the
     // floor sit inside Cloudflare's range, the floor strictly above its edge.
     //
-    // The bound: Owed 84's programme tests (`adapters/tests/programme_output.rs`) place a swap a
-    // floor after the GOP's keyframe and need the encoder's own next keyframe at least
-    // `OWED84_MARGIN_TICKS` (10) + `OWED84_KEY_WAIT_TICKS` (6) ticks after it, so the GOP less the
-    // floor is at least 16 frames (24 today; a 2 500 ms floor would leave 15).
+    // C7: the GOP is 2 s, Cloudflare's floor itself, and the forced keyframe's floor (2.2 s) is
+    // therefore longer than the GOP: a forced keyframe can never come before the GOP's own, so none
+    // is asked (`OutputProfile::forced_key_can_beat_the_gop`, `gst_output::ask_key`). Owed 84's
+    // programme tests used to need the GOP at least 16 frames over the floor; they now place a swap
+    // against the GOP's own keyframe alone.
     #[test]
     fn the_gop_and_the_forced_keyframe_floor_sit_inside_cloudflares_range() {
         assert_eq!(
@@ -1156,25 +1201,23 @@ mod tests {
             (2_000, 10_000),
             "Cloudflare's range"
         );
-        assert_eq!(PROGRAMME_GOP_MS, 3_000, "the brief's 3 s");
+        assert_eq!(PROGRAMME_GOP_MS, 2_000, "the owner's 2 s (C7, 2026-11-26)");
         assert_eq!(FORCED_KEYFRAME_MARGIN_MS, 200, "the ruling's margin");
         assert_eq!(
             FORCED_KEYFRAME_MIN_INTERVAL_MS,
             2_000 + 200,
             "Cloudflare's floor and the margin"
         );
+        // One constant: the GOP is Cloudflare's shortest interval and the floor that and a margin, so
+        // a move to a shorter GOP is `CF_KEYFRAME_INTERVAL_MIN_MS` alone and the floor follows it.
+        const _: () = assert!(PROGRAMME_GOP_MS == CF_KEYFRAME_INTERVAL_MIN_MS);
+        const _: () =
+            assert!(FORCED_KEYFRAME_MIN_INTERVAL_MS == PROGRAMME_GOP_MS + FORCED_KEYFRAME_MARGIN_MS);
         // Constant against constant: the compiler checks it (clippy refuses a runtime assert).
         const _: () = assert!(FORCED_KEYFRAME_MIN_INTERVAL_MS > CF_KEYFRAME_INTERVAL_MIN_MS);
-        let (owed84_margin_ticks, owed84_key_wait_ticks) = (10, 6);
+        const _: () = assert!(PROGRAMME_GOP_MS >= CF_KEYFRAME_INTERVAL_MIN_MS);
         let mut checked = 0;
         for p in BOTH_MODES {
-            assert!(
-                p.gop_frames() - p.forced_keyframe_min_frames()
-                    >= owed84_margin_ticks + owed84_key_wait_ticks,
-                "{p:?}: GOP {} less floor {} frames",
-                p.gop_frames(),
-                p.forced_keyframe_min_frames()
-            );
             for ms in [PROGRAMME_GOP_MS, FORCED_KEYFRAME_MIN_INTERVAL_MS] {
                 let fps = Ms::from(p.fps);
                 assert_eq!(fps * ms % 1_000, 0, "{p:?}: {ms} ms is not whole frames");
@@ -1184,13 +1227,15 @@ mod tests {
                 );
                 checked += 1;
             }
-            // 30 fps (ADR 0005): 90 frames a GOP, the floor 66.
+            // 30 fps (ADR 0005): 60 frames a GOP, the floor 66.
             assert_eq!(
                 (p.gop_frames(), p.forced_keyframe_min_frames()),
-                (90, 66),
+                (60, 66),
                 "{p:?}"
             );
-            assert!(p.forced_keyframe_min_frames() < p.gop_frames(), "{p:?}");
+            // The floor is over the GOP: a forced keyframe cannot beat the GOP's own.
+            assert!(p.forced_keyframe_min_frames() > p.gop_frames(), "{p:?}");
+            assert!(!p.forced_key_can_beat_the_gop(), "{p:?}");
         }
         // The margin holds whole frames at the rates the ruling names, not only ours.
         for fps in [25, 30, 60] {
@@ -1198,6 +1243,15 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 7, "intervals checked: {checked}");
+    }
+
+    // C7: the shorter of the floor and the GOP is what a new output waits for, and it is the GOP.
+    #[test]
+    fn a_new_output_waits_for_the_gops_own_keyframe_when_the_floor_is_over_the_gop() {
+        assert_eq!(NEW_OUTPUT_KEY_WAIT_MS, 2_000, "the GOP, under the 2.2 s floor");
+        assert_eq!(FORCED_KEYFRAME_ARRIVAL_MS, 2_000 + 800, "the GOP and the delay");
+        const _: () = assert!(NEW_OUTPUT_KEY_WAIT_MS <= PROGRAMME_GOP_MS);
+        const _: () = assert!(NEW_OUTPUT_KEY_WAIT_MS <= FORCED_KEYFRAME_MIN_INTERVAL_MS);
     }
 
     // F-040 (C5), each number against its source, written here and not read back: the chosen leg's
@@ -1233,13 +1287,13 @@ mod tests {
         assert_eq!(X264_DELAY_MS, 800);
         assert_eq!(
             FORCED_KEYFRAME_ARRIVAL_MS,
-            2_000 + 200 + 800,
-            "Cloudflare's floor, the margin and the delay"
+            2_000 + 800,
+            "the GOP (the shorter of it and the 2.2 s floor) and the delay"
         );
         assert_eq!(
             OUTPUT_GAP_BUDGET_MS,
-            15_000 + 2_200 + 800,
-            "F-004's 15 s, the floor and the delay"
+            15_000 + 2_000 + 800,
+            "F-004's 15 s, the GOP and the delay"
         );
         // The first-GOP catch-up does not take the delay: backlog and head outage are both
         // measured in the encoder's own pts, so the delay is in both and the half-floor stays the
@@ -1253,18 +1307,22 @@ mod tests {
         assert_eq!(OUTPUT_PROGRESS_POLL_MS, 250);
     }
 
-    // Owed 112 (C3b, F-038): the lesser of half F-036's floor and x264's VBV (the C3b review's m1),
-    // whole frames in both modes, inside the first GOP.
+    // Owed 112 (C3b, F-038): the lesser of half the wait for a new output's keyframe and x264's VBV
+    // (the C3b review's m1), whole frames in both modes, inside the first GOP.
     #[test]
-    fn the_first_gop_catch_up_is_half_the_floor_within_one_vbv() {
+    fn the_first_gop_catch_up_is_half_the_key_wait_within_one_vbv() {
         assert_eq!(X264_VBV_MS, 1_000, "C00's VBV (F-005)");
-        // Half the floor (2 200 / 2 = 1 100) is over one VBV (1 000): the VBV binds.
-        assert_eq!(FIRST_GOP_CATCH_UP_MAX_MS, 1_000, "half the floor, within one VBV");
+        // Half the wait (the 2 000 ms GOP: 1 000; the 2 200 ms floor was 1 100) is at one VBV (1 000):
+        // both bind, at 1 000.
+        assert_eq!(
+            FIRST_GOP_CATCH_UP_MAX_MS, 1_000,
+            "half the key wait, within one VBV"
+        );
         // Constant against constant: the compiler checks it (clippy refuses a runtime assert).
         const _: () = assert!(
             FIRST_GOP_CATCH_UP_MAX_MS < PROGRAMME_GOP_MS
                 && FIRST_GOP_CATCH_UP_MAX_MS <= X264_VBV_MS
-                && FIRST_GOP_CATCH_UP_MAX_MS <= FORCED_KEYFRAME_MIN_INTERVAL_MS / 2
+                && FIRST_GOP_CATCH_UP_MAX_MS <= NEW_OUTPUT_KEY_WAIT_MS / 2
         );
         let mut checked = 0;
         for p in BOTH_MODES {
@@ -1301,12 +1359,13 @@ mod tests {
     }
 
     // F-004: the same broadcast survived a 15 s gap, and a 30 s gap split it. F-036 (the C1 review's
-    // I2, 2026-11-24): the output's budget is that and the forced keyframe's 2.2 s floor, F-040 (C5):
-    // and the encoder's 0.8 s delay, still short of the gap that split it.
+    // I2, 2026-11-24): the output's budget is that and a new output's keyframe wait (the forced
+    // keyframe's 2.2 s floor, F-040 (C5): and the encoder's 0.8 s delay; C7: the 2 s GOP, which is the
+    // shorter), still short of the gap that split it.
     #[test]
     fn output_gap_budget_is_the_15_s_youtube_kept_in_f004() {
         assert_eq!(YOUTUBE_KEPT_GAP_MS, 15_000);
-        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_200 + 800);
+        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_000 + 800);
         // Short of F-004's split; constant against constant, so the compiler checks it.
         const _: () = assert!(OUTPUT_GAP_BUDGET_MS < 30_000);
     }
