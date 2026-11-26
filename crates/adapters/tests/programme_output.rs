@@ -2466,7 +2466,23 @@ fn an_encoder_that_stalls_reports_encoder_overrun_and_the_programme_carries_on()
         (d.frames.len() as u64) < total,
         "nothing was dropped, so the stall was not real"
     );
-    assert!(d.frames.len() >= 60, "{}", d.frames.len());
+    // F-040: every frame the leaky queue did not drop comes out. Each drop is one overrun, so the
+    // frames out and the overruns account for every frame pushed, within the pipeline's own depth
+    // (`OWED84_MARGIN_TICKS`' note: the appsrcs hold at most 3 ticks). Not a typed floor: the
+    // delayed encoder's in-flight frames come out after the stall, behind audio that never stalled,
+    // and one of them dropped by the ring's span made the output wait for the next keyframe, a GOP
+    // away: 59 of 144 came out (check run 45750515672), 55 on the run before.
+    let in_the_pipeline = 3;
+    assert!(
+        d.frames.len() as u64 + overruns as u64 + in_the_pipeline >= total,
+        "{} frames out, {overruns} dropped at the queue, of {total}",
+        d.frames.len()
+    );
+    assert_eq!(
+        p.ring_pruned().0,
+        0,
+        "the ring dropped a picture for the audio ahead of it"
+    );
     assert_eq!(p.builds(), 1);
 }
 

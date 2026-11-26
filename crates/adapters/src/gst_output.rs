@@ -76,12 +76,14 @@ const _: () = assert!(
         && OUTPUT_SINK_TIMEOUT_MS / 1_000 <= u32::MAX as u64
 );
 
-/// The encoded ring's span (plan, Global Constraints: "Encoded ring buffer 2 s, dropping the oldest").
+/// The encoded ring's span (plan, Global Constraints: "Encoded ring buffer 2 s, dropping the oldest"):
+/// how far behind its own track's newest entry an entry may be (`prune`). Per track since F-040, so
+/// the audio running ahead of a late video track never drops the video.
 pub const ENCODED_RING_SPAN: Duration = Duration::from_secs(2);
-// Owed 112: the first-GOP backlog a sink starts from is one the ring can still hold. F-040: the ring
-// spans PTS, and the audio encoder has no delay, so with the video encoder's (`X264_DELAY_MS`) the
-// newest entry runs that far ahead of the newest video: the first keyframe is dropped by span when the
-// backlog and the lead reach it, so both fit.
+// Owed 112: the first-GOP backlog a sink starts from is one the ring can still hold. F-040: the audio
+// encoder has no delay, so with the video encoder's (`X264_DELAY_MS`) the newest audio runs that far
+// ahead of the newest video. The span is per track (`prune`), so that lead drops nothing; the delay
+// stays in this sum as a margin, which the ring's span covers either way.
 const _: () = assert!(((FIRST_GOP_CATCH_UP_MAX_MS + X264_DELAY_MS) as u128) < ENCODED_RING_SPAN.as_millis());
 /// A hard cap on the ring's entries beside its span, so that samples with no PTS cannot grow it:
 /// 2 s holds 60 video frames at 30 fps and about 94 AAC frames at 48 kHz (1 024 samples each), 154 in
@@ -158,7 +160,7 @@ struct RingState {
     pruned: Encoded,
 }
 
-/// The programme → output hand-off: bounded by span and by count, dropping the oldest.
+/// The programme → output hand-off: bounded by span (per track) and by count, dropping the oldest.
 #[derive(Default)]
 pub(crate) struct EncodedRing {
     state: Mutex<RingState>,
@@ -180,29 +182,14 @@ impl EncodedRing {
             r.encoded.audio += 1;
         }
         r.entries.push_back(e);
-        loop {
-            let over_count = r.entries.len() > ENCODED_RING_MAX_ENTRIES;
-            let over_span = match (r.entries.front(), r.entries.back()) {
-                (Some(a), Some(b)) => b.pts.saturating_sub(a.pts) > span(),
-                _ => false,
-            };
-            if !(over_count || over_span) {
-                break;
-            }
-            let gone = r.entries.pop_front();
-            #[cfg(feature = "test-hooks")]
-            {
-                if let Some(gone) = gone {
-                    if gone.video {
-                        r.pruned.video += 1;
-                    } else {
-                        r.pruned.audio += 1;
-                    }
-                }
-            }
-            #[cfg(not(feature = "test-hooks"))]
-            drop(gone);
+        let dropped = prune(&mut r.entries);
+        #[cfg(feature = "test-hooks")]
+        {
+            r.pruned.video += dropped.0;
+            r.pruned.audio += dropped.1;
         }
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = dropped;
         drop(r);
         self.wake.notify_all();
     }
@@ -295,6 +282,40 @@ impl EncodedRing {
         drop(r);
         self.wake.notify_all();
     }
+}
+
+/// Counts `gone` against its track in `dropped`, (video, audio).
+fn count_dropped<S>(gone: Option<Entry<S>>, dropped: &mut (u64, u64)) {
+    match gone {
+        Some(e) if e.video => dropped.0 += 1,
+        Some(_) => dropped.1 += 1,
+        None => {}
+    }
+}
+
+/// What the ring's two bounds drop once an entry has been pushed on `entries`' back; returns how many
+/// of each track, (video, audio). The count bound takes the oldest entries. The span bound is PER
+/// TRACK (F-040): an entry goes when it is more than `ENCODED_RING_SPAN` behind the newest entry of
+/// its own track, the one just pushed. Measured across tracks, a video encoder that is late (its
+/// frame delay, or a stall) had its pictures dropped by the audio, which is not late: the first
+/// output after a 2 s stall saw the stalled encoder's own in-flight frames more than a span behind
+/// the audio, and one dropped picture made the output wait for the encoder's next natural keyframe,
+/// up to a GOP (`PROGRAMME_GOP_MS`) of picture later, for every picture that followed it.
+pub(crate) fn prune<S>(entries: &mut VecDeque<Entry<S>>) -> (u64, u64) {
+    let mut dropped = (0u64, 0u64);
+    while entries.len() > ENCODED_RING_MAX_ENTRIES {
+        count_dropped(entries.pop_front(), &mut dropped);
+    }
+    let Some((video, newest)) = entries.back().map(|e| (e.video, e.pts)) else {
+        return dropped;
+    };
+    while let Some(i) = entries.iter().position(|e| e.video == video) {
+        if newest.saturating_sub(entries[i].pts) <= span() {
+            break;
+        }
+        count_dropped(entries.remove(i), &mut dropped);
+    }
+    dropped
 }
 
 fn span() -> gst::ClockTime {
@@ -1663,5 +1684,145 @@ mod tests {
         ] {
             assert!(n >= 30, "the sweep reached {what} only {n} times");
         }
+    }
+
+    /// The ring as `push` fills it: the entry goes on the back, then the bounds drop what they must.
+    /// Returns what was dropped, (video, audio).
+    fn pushed(ring: &mut VecDeque<Entry<u64>>, e: Entry<u64>) -> (u64, u64) {
+        ring.push_back(e);
+        prune(ring)
+    }
+
+    /// An entry stamped `pts_ns`, its seq and sample the order it is made in.
+    fn stamped(seq: u64, video: bool, pts_ns: u64) -> Entry<u64> {
+        let mut e = Entry::new(seq, video, false, gst::ClockTime::from_nseconds(pts_ns));
+        e.seq = seq;
+        e
+    }
+
+    /// One AAC frame's span in ns: 1 024 samples at 48 kHz.
+    const AAC_NS: u64 = 1_024 * 1_000_000_000 / 48_000;
+
+    /// The oldest and newest PTS the ring holds on one track, `None` for an empty track.
+    fn track_pts(ring: &VecDeque<Entry<u64>>, video: bool) -> Option<(gst::ClockTime, gst::ClockTime)> {
+        let mut pts = ring.iter().filter(|e| e.video == video).map(|e| e.pts);
+        let first = pts.next()?;
+        Some(pts.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p))))
+    }
+
+    /// F-040 (the C5 check run 45750515672, a 2 s encoder stall): the stalled encoder's in-flight
+    /// frames come out late, behind audio that never stalled. They sit in the ring a span and the
+    /// delay behind the newest audio, and none may be dropped for it: one dropped picture made the
+    /// output wait for the encoder's next keyframe, up to a GOP away, before it sent any. The audio
+    /// track stays bounded by the same span, so the check reads both tracks.
+    #[test]
+    fn pictures_a_stalled_encoder_delivers_late_are_not_dropped_for_the_audio_ahead_of_them() {
+        let span_ns = ENCODED_RING_SPAN.as_nanos() as u64;
+        let delay_ns = domain::config::X264_DELAY_MS * 1_000_000;
+        let (mut checked, mut audio_dropped) = (0u64, 0u64);
+        for profile in [
+            domain::config::OutputProfile::P720,
+            domain::config::OutputProfile::P1080,
+        ] {
+            let fps = u64::from(profile.fps);
+            let late = u64::from(domain::config::X264_DELAY_FRAMES);
+            let mut ring = VecDeque::new();
+            let mut video_dropped = 0;
+            let mut seq = 0;
+            for i in 0..late {
+                let (v, a) = pushed(&mut ring, stamped(seq, true, i * 1_000_000_000 / fps));
+                (video_dropped, audio_dropped) = (video_dropped + v, audio_dropped + a);
+                seq += 1;
+            }
+            // The audio that kept running: to a span and the delay past the newest picture.
+            let newest_picture = (late - 1) * 1_000_000_000 / fps;
+            let audio_to = newest_picture + span_ns + delay_ns;
+            assert!(
+                audio_to > span_ns,
+                "{}p: the audio is not past the first picture by a span, so nothing is witnessed",
+                profile.height
+            );
+            let mut t = 0;
+            while t <= audio_to {
+                let (v, a) = pushed(&mut ring, stamped(seq, false, t));
+                (video_dropped, audio_dropped) = (video_dropped + v, audio_dropped + a);
+                seq += 1;
+                t += AAC_NS;
+            }
+            let kept = ring.iter().filter(|e| e.video).count() as u64;
+            assert_eq!(video_dropped, 0, "{}p: pictures dropped", profile.height);
+            assert_eq!(kept, late, "{}p: pictures kept", profile.height);
+            let (lo, hi) = track_pts(&ring, false).expect("audio is held");
+            assert!(
+                hi.saturating_sub(lo) <= span(),
+                "{}p: the audio spans {lo}..{hi}",
+                profile.height
+            );
+            checked += seq;
+        }
+        assert!(audio_dropped > 0, "the audio track was never bounded");
+        assert!(checked > 0, "nothing was pushed");
+    }
+
+    /// Each track is bounded by the span behind its own newest entry, keeping everything inside it,
+    /// and the ring by its count when PTS never moves. The expected counts are the span's frames at
+    /// each track's own rate, not read from the rule.
+    #[test]
+    fn each_track_keeps_exactly_a_span_and_the_ring_its_count() {
+        let span_ns = ENCODED_RING_SPAN.as_nanos() as u64;
+        let mut checked = 0;
+        for profile in [
+            domain::config::OutputProfile::P720,
+            domain::config::OutputProfile::P1080,
+        ] {
+            let fps = u64::from(profile.fps);
+            // Video alone, then audio alone, each for three spans.
+            for video in [true, false] {
+                let step = if video { 1_000_000_000 / fps } else { AAC_NS };
+                let mut ring = VecDeque::new();
+                let mut dropped = 0;
+                let n = 3 * span_ns / step;
+                for i in 0..n {
+                    let (v, a) = pushed(&mut ring, stamped(i, video, i * step));
+                    dropped += v + a;
+                }
+                let kept = ring.len() as u64;
+                let (lo, hi) = track_pts(&ring, video).expect("the track is held");
+                assert!(
+                    hi.saturating_sub(lo) <= span(),
+                    "{}p video {video}",
+                    profile.height
+                );
+                // Everything within a span of the newest stays: a span holds `span / step` whole
+                // intervals, one entry more than that.
+                assert_eq!(kept, span_ns / step + 1, "{}p video {video}", profile.height);
+                assert_eq!(kept + dropped, n, "{}p video {video}", profile.height);
+                checked += n;
+            }
+        }
+        // The edge itself: an entry exactly a span behind its track's newest stays, a nanosecond
+        // more and it goes, on each track.
+        for video in [true, false] {
+            let mut ring = VecDeque::new();
+            assert_eq!(pushed(&mut ring, stamped(0, video, 0)), (0, 0));
+            assert_eq!(pushed(&mut ring, stamped(1, video, span_ns)), (0, 0));
+            assert_eq!(ring.len(), 2, "video {video}: a span behind");
+            let gone = pushed(&mut ring, stamped(2, video, span_ns + 1));
+            assert_eq!(gone, if video { (1, 0) } else { (0, 1) }, "video {video}");
+            assert_eq!(ring.len(), 2, "video {video}: a span and a ns behind");
+            checked += 3;
+        }
+        // The count bound, at one PTS so that no span applies.
+        let mut ring = VecDeque::new();
+        let (mut dropped, extra) = (0, 5);
+        for i in 0..ENCODED_RING_MAX_ENTRIES as u64 + extra {
+            let (v, a) = pushed(&mut ring, stamped(i, i % 2 == 0, 0));
+            dropped += v + a;
+            checked += 1;
+        }
+        assert_eq!(ring.len(), ENCODED_RING_MAX_ENTRIES);
+        assert_eq!(dropped, extra);
+        assert_eq!(ring.front().map(|e| e.seq), Some(extra), "the oldest went");
+        assert!(checked > 0, "nothing was pushed");
     }
 }
