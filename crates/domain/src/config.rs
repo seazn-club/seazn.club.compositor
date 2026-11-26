@@ -345,6 +345,13 @@ pub const X264_DELAY_MS: Ms = {
 /// encoder's input time) and then the frame delay (`X264_DELAY_MS`) before it comes out. What every
 /// output recovery path adds to its own terms where it said "the floor" before F-040
 /// (`OUTPUT_GAP_BUDGET_MS`, `output_egress_flat_ms`, the harness's `BUDGET_OUTPUT_RECONNECT_MS`).
+///
+/// A bound, not a path (the C5 review's m1): a request made at the ring's newest video `n` after the
+/// encoder's last keyframe `K` is made at input time `max(n + delay, K + floor)` and comes out when
+/// the ring reaches it, so the modelled wait is `max(delay, K + floor - n)`, at most the floor alone
+/// (2.2 s), and the sum below is up to the delay (0.8 s) over it. The sum stays: a tighter bound would
+/// move `OUTPUT_GAP_BUDGET_MS`, the chaos budgets and `thresholds.json`, and no run has measured a
+/// path that needs them tighter. Owed 124.
 pub const FORCED_KEYFRAME_ARRIVAL_MS: Ms = FORCED_KEYFRAME_MIN_INTERVAL_MS + X264_DELAY_MS;
 
 /// Owed 112 (C3b, `_FINDINGS.md` F-038; chaos runs 45480676592 `cef-hung` and 45498019823

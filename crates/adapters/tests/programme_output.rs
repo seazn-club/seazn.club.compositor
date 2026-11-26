@@ -3562,6 +3562,9 @@ fn assert_all_camera(case: &str, d: &Decoded) -> usize {
 /// the frames checked. F-040: `drain_at` is when the drain began. The drain's EOS flushes the
 /// frames x264 still holds (up to `X264_DELAY_MS` of programme) at once, so a message received after
 /// it may run that much further ahead than the burst bound; before it, the bound is the slack alone.
+/// That is what these scenarios show, not a product guarantee: nothing after the encoder paces its
+/// output, so an encoder stall or a CPU catch-up releases the same frames at once mid-stream, which
+/// no test bounds (Owed 123).
 fn assert_fresh_start(
     case: &str,
     server: &FakeRtmp,
