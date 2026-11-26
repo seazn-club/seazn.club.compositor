@@ -3879,8 +3879,8 @@ cadence, the nudge's one discard an outage: `window 0, discards 1`), worst case 
 |---|---|---|---|
 | Past the hold, one rise | 8.9 s | 4.9 s (budget 5.2 s, derived) | 0 of 42 |
 | Inside the hold, rise at drop + 10 s, close at + 31 s | 5.07 s after the close | 5.07 s | 0 of 42: **unchanged, hold-bound** |
-| Two rises 1.1 s apart, PHONE first (servable from the second) | 13.07 s | 5.03 s | 0 of 42 |
-| Two rises 1.1 s apart, CLOUDFLARE first (servable from the first) | 8.88 s | 6.13 s | 10 of 42 (the re-armed discard throws away a build that was about to be served; one more build) |
+| Two rises 1.1 s apart, PHONE first (servable from the second) | 13.07 s (mean 7.66 s) | 5.03 s (mean 4.65 s) | 0 of 42 |
+| Two rises 1.1 s apart, CLOUDFLARE first (servable from the first) | 8.88 s (mean 6.61 s) | 6.13 s (mean 5.75 s) | 10 of 42 (the re-armed discard throws away a build that was about to be served; one more build) |
 | Flapping, three rises 2 s apart | 12.92 s | 4.88 s | 0 of 42 |
 
 The 26 s stg case (a return inside the hold) is not improved, and the headline 8.9 to 4.9 s is the post-hold
@@ -3896,6 +3896,8 @@ flapping, later in 10 of 42. So `InputLink::on_phone_live_edge` re-arms the disc
 `publishing` beat, and one flap). Web raises the counter on the phone's own beat reporting `publishing` after a
 not-live beat (`phone-live.ts` `stepPhoneLive`), not on the phone's log line, so the phone-first gap on stg is
 the beat's, not the log's: which order lands is open (Owed 129 measures it). Both are in the table.
+
+**Owner ruling (owner chat, 2026-11-26: "Ok 3", on N2).** The nudge's discard is up to 3 an outage, re-armed on each counter rise. It supersedes the earlier once-an-outage ruling of Owed 108 (F-032), which held until this date; the cap of 1 stays reachable as `input_nudge_discards_per_outage` and is the scenarios' control.
 
 **The build bound under re-arming.** Each rise latches ONE nudge (several rises in one reply are one), one nudge is
 one build, and discards are capped per outage, so an outage costs at most the cap's builds more than today. A web

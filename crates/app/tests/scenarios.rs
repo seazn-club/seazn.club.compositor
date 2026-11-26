@@ -3735,9 +3735,15 @@ fn one_return_with_two_rises_is_no_worse_than_today_in_either_order() {
             later += usize::from(on.to_live > was.to_live);
         }
         let (worst_on, worst_off) = worst(&runs);
+        let n = runs.len() as u64;
+        let (sum_on, sum_off): (u64, u64) = runs
+            .iter()
+            .fold((0, 0), |a, r| (a.0 + r.1.to_live, a.1 + r.2.to_live));
         eprintln!(
-            "{order}: {} runs, later than today in {later}; worst {worst_on} ms against {worst_off}",
-            runs.len()
+            "{order}: {} runs, later than today in {later}; worst {worst_on} ms against {worst_off}; mean {} ms against {}",
+            runs.len(),
+            sum_on / n,
+            sum_off / n
         );
         assert!(
             worst_on <= worst_off,
