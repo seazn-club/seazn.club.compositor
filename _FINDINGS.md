@@ -3799,3 +3799,130 @@ ring's 2 s, since the audio encoder (no delay) runs ahead of the video by the de
 cost legs on the PR head (C:snow, D:snow, performance-6x), p95 ≤ 5.1. (3) A Cloudflare stg run of High profile
 and look-ahead ingest, and the camera A/V offset with the 0.8 s video delay (Phase A Owed 3 and 4). (4) The
 80 % warning has no mechanism in `cost.jq` (pass or fail); not built.
+
+
+## F-041: after the phone returns, the relay's own share of the wait is the beat grid; the rest is Cloudflare's SRT hold, which no relay rule can shorten (C6, 2026-11-26; stg session `c02f56a0`)
+
+**Question** (the owner, 2026-11-26: "fix it"). Two returns on stg session `c02f56a0` took 11 s and about
+26 s from a publishing phone to a live programme. Why, and what brings the picture back in 2 to 3 s?
+
+**Evidence.** Read-only, from stg `fixture_stream_samples` (relay beats, `source = 'heartbeat'`, and
+Cloudflare's `live_input.*` webhooks, `source = 'notification'`). The relay's own log lines of that run are
+not kept (Owed 106), and that build's beat carries no give-up reason (`RELAY_INPUT_BEAT` is off), so every
+relay-side instant below is an INFERENCE from the thresholds, marked so. Beat times are web's receive times
+on a 5 s grid.
+
+- **Case B (a 1.9 s network switch, 2026-11-26 09:50 UTC).** The last frame is about 24.3 (the `frozen` beat
+  at 24.775). Cloudflare reads the drop at 24.44 and the new publisher `connected` at 25.05. The `reconnecting`
+  slate is on the 28.8 beat (4.5 s after the last frame, `slate_after_ms`), with the input still `connected`:
+  the link is Running with no frame, waiting for the stall rule (`input_stall_after_ms`, 5 s: the stall is
+  about 29.3, inferred). The first `connecting` beat is 33.9 (rebuilds 8) because the beat grid first sampled
+  it: the relay did NOT notice 9 s late. Builds then die and rebuild (rebuilds 9, 10, 11, beats 38.9, 48.8,
+  58.7: `connecting`, `backoff`, `connecting`) until `live` on 59.8. F-032 finding 1: Cloudflare holds a dropped
+  publisher's SRT broadcast and closes every attached reader 29.92 to 31.18 s after the drop, whatever
+  arrives meanwhile: the close is 54.3 to 55.6, then the hold-end rule's base wait (1 s, `input_link.rs`
+  `on_error`) and one connect's first frame (F-032: 3.0 s median, 4.2 s slowest) and the return's hold-off
+  (`resume_after_ms`) is 58.5 to 61.5. **The relay was live at 59.8, inside F-032's floor** (the hold plus 3.3 s,
+  finding 11). Nothing in the relay is late in this case.
+- **Case A (airplane mode, 09:45 UTC).** The phone's own publish flapped: Cloudflare `connected` 45:48.1,
+  `disconnected` 46:09.1, `connected` 46:18.6, `disconnected` 46:21.1 with **`ERR_GOP_OUT_OF_RANGE`** (a phone-side
+  fault: Cloudflare refused the phone's first stream after the network came back, three seconds in), then
+  `connected` 46:27.5 and stable. Each Cloudflare drop restarts its hold (F-032: anchored on the drop), so the
+  hold ran to about 46:51 and the 11 s return (publisher stable 26.4, live 38.4) is a connect that was served
+  inside it: F-032's 9 to 16 % lottery, not a floor. The link's rebuild count (1 to 7) is a build every 6 s on
+  average, each a silent connect (no byte) or an error.
+- **The same question over 30 days of stg beats** (`dist.mjs`, a read-only script in the session scratch;
+  27 outages with a Cloudflare `connected` inside them), Cloudflare `connected` to programme `live`: the 16
+  outages under 6 s (the phone's blips; the reader stays attached) took 0.4 to 2.7 s (median 1.4); the 11
+  outages of 15 s or more took 9.7, 10.8, 11.3, 12.0, 12.3, 17.1, 25.1, 26.4, 31.3, 34.8 and 49.7 s. Five of
+  the eleven are the 10 to 12 s class (a return after the hold: the beat grid plus a connect), the rest the
+  hold's 17 to 50 s.
+
+**Answers.**
+
+1. **Pull.** The relay pulls SRT from Cloudflare's Input A: `srtsrc` as the caller, `auto-reconnect` off
+   (`adapters/src/gst_input.rs` `build`, the `make("srtsrc", "src")`); the domain owns reconnection:
+   `domain/src/input_link.rs` (`InputLink::on_tick` builds a due generation and gives a connect up at
+   `input_connect_timeout_ms`; `back_off` waits `backoff::delay`).
+2. **Not late.** The stall rule is 5 s from the last frame and the beats are a 5 s grid (above).
+3. **The 5 s steps are the beat grid**, not a back-off step. The schedule is 1, 2, 4, 4 s (`input_backoff_*`,
+   F-036) and a connect that carries no byte waits out the whole 9 s (`input_connect_timeout_ms`, F-036).
+4. **What brings it back, and what cannot.** Picture 2 to 3 s after a stable publish is not reachable on SRT
+   playback: a served reader's first byte comes 2.46 s after its build (p50 of 425 readers; p99 3.6 s) and
+   its first decoded frame 3.03 s (p50 of 419; p90 3.9 s), with the 1 s return's hold-off after it: about
+   4 s from the build, whatever the relay does, and Cloudflare serves no reader attached before the
+   publisher or inside its 30 s hold except by lottery. The relay's own term is how soon it builds after the
+   phone is back, and that is the beat's grid: web's `phoneLiveEdge` reaches the relay only in a heartbeat's
+   reply (Owed 108 fix (b)), up to 5 s late.
+
+**What C6 changes.** One rule, in the domain (`Supervisor::beat_if_due`): while the camera is down
+(`input_down_since`, set when the link leaves Running after having run), inside
+`input_recovery_beat_window_ms` (60 s), and only for a session whose replies have carried a `phoneLiveEdge`
+counter (web omits it with no phone-live history, so there is nothing to answer: the review's I2), a beat is due
+`input_recovery_beat_gap_ms` (the phase beat's 1 s, derived) after the last one. It costs web at most 60 extra
+beats an outage, and none to a link that never ran, a camera that runs, a session with no counter, or the final
+hold; after the window the 5 s cadence returns. Each outage re-arms the window, so a camera that flaps all session
+beats at the gap all session: the bound there is the gap floor (never faster than one beat a gap, held over an
+hour of flapping in `recovery_beat.rs`), which is the rate web's samples cap is already priced at (a beat a second
+for the 3 h hard cap), not a new one.
+
+**What it improves, and what it does not (PR #115 review, I1, I3 and N1).** Measured through the real driver,
+supervisor and link (`app/tests/scenarios.rs`), Cloudflare MODELLED at F-032's medians (a build made once the
+publisher is servable is served: first byte 2 460 ms, first frame 3 025 ms; one made earlier never is), the first
+edge swept over a beat's phase in 250 ms steps, 720p and 1080p (42 runs: 21 phases of one deterministic
+Cloudflare, not 42 samples of it). The counter is raised at the instant the plan says; web's webhook delivery,
+the phone's own beat and the handler's round trips are NOT in the numbers, only a 50 ms reply. Read them as
+design numbers, not as a stg result (Owed 129). The control is TODAY: the relay as it was before C6 (the 5 s
+cadence, the nudge's one discard an outage: `window 0, discards 1`), worst case over the phases:
+
+| Return | Today (worst) | After C6 (worst) | Phases later than today |
+|---|---|---|---|
+| Past the hold, one rise | 8.9 s | 4.9 s (budget 5.2 s, derived) | 0 of 42 |
+| Inside the hold, rise at drop + 10 s, close at + 31 s | 5.07 s after the close | 5.07 s | 0 of 42: **unchanged, hold-bound** |
+| Two rises 1.1 s apart, PHONE first (servable from the second) | 13.07 s (mean 7.66 s) | 5.03 s (mean 4.65 s) | 0 of 42 |
+| Two rises 1.1 s apart, CLOUDFLARE first (servable from the first) | 8.88 s (mean 6.61 s) | 6.13 s (mean 5.75 s) | 10 of 42 (the re-armed discard throws away a build that was about to be served; one more build) |
+| Flapping, three rises 2 s apart | 12.92 s | 4.88 s | 0 of 42 |
+
+The 26 s stg case (a return inside the hold) is not improved, and the headline 8.9 to 4.9 s is the post-hold
+class only (5 of the 11 long outages in F-041's 30 days). The rule never makes the hold shorter.
+
+**Why each rise now brings its own discard (N1, Owed 130 closed here).** The first round kept Owed 108's one
+discard an outage. With a beat a second the FIRST rise is then sent alone, and if it lands before the publisher is
+servable (the phone's beat before Cloudflare's `connected`: stg `c02f56a0`'s RTMPS return had the phone first by
+1.1 s) the discard is spent on a build Cloudflare cannot serve, and the second rise waits out the 9 s connect
+timeout. Measured on that code: phone first, later than today in 32 of 42 phases and worst 12.8 s against 13.1 s;
+flapping, later in 10 of 42. So `InputLink::on_phone_live_edge` re-arms the discard on every rise, capped by
+`input_nudge_discards_per_outage` (3: the counter's two writers, Cloudflare's `connected` and the phone's
+`publishing` beat, and one flap). Web raises the counter on the phone's own beat reporting `publishing` after a
+not-live beat (`phone-live.ts` `stepPhoneLive`), not on the phone's log line, so the phone-first gap on stg is
+the beat's, not the log's: which order lands is open (Owed 129 measures it). Both are in the table.
+
+**Owner ruling (owner chat, 2026-11-26: "Ok 3", on N2).** The nudge's discard is up to 3 an outage, re-armed on each counter rise. It supersedes the earlier once-an-outage ruling of Owed 108 (F-032), which held until this date; the cap of 1 stays reachable as `input_nudge_discards_per_outage` and is the scenarios' control.
+
+**The build bound under re-arming.** Each rise latches ONE nudge (several rises in one reply are one), one nudge is
+one build, and discards are capped per outage, so an outage costs at most the cap's builds more than today. A web
+that raised the counter on every reply for an hour of a flapping camera (`recovery_beat.rs`): 801 builds against
+today's 401 (200 outages, four builds an outage against two), under both the bound of today's plus the cap an
+outage and the structural one (a nudge's build is a reply apart, a gap; the schedule's a base wait). Per session
+that is a flat 1 per gap at the very worst, against a web that cannot do it.
+
+**What C6 does not change, and why.**
+
+- A **shorter connect timeout** for a connect that has carried no byte (the owner's suggestion). Not built: a
+  served reader's first byte waits for the next keyframe (F-032: p50 2.46 s on a 2 s GOP), the phone's GOP is
+  3 s, and F-036 recorded stg first frames 6 to 8 s after the connect (an estimate). No first-byte time for a
+  3 s GOP is measured, so a bound under it can abandon served readers over and over (a livelock for the whole of
+  a window), and the take-back's 1 s only rescues a frame inside it. Owed 126 asks for the number first.
+- **The hold itself.** Cloudflare's SRT playback holds a dropped publisher 30 s whatever arrives (F-032), and each
+  Cloudflare disconnect restarts it. A return inside it costs the hold plus 3.3 s (case B). Another read path
+  is the only fix (F-032 finding 16: HLS shows a new publisher at about +11 s; WebRTC playback unmeasured).
+  Owed 125; no live Cloudflare call was allowed here.
+
+**Not covered by the chaos harness, and why.** `harness/` serves the camera from MediaMTX, which has no hold: a
+reader attached to an absent path is refused at once, and one attached to a paused publisher is served the
+moment it resumes (`camera-stop`). A docker case for a republish would pass on today's code. The proof is the
+driver-level scenario above, which can model the hold, and it runs locally.
+
+**Owed to CI.** Nothing in `adapters` changed. check.yml's tests and the chaos harness (`camera-stop`,
+`camera-flap`, `reader-kicked`: more beats during their input outages, which no case judges as a count) are
+CI's.

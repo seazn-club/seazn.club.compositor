@@ -60,7 +60,10 @@ struct Run {
 
 impl Run {
     fn booted(step: Ms) -> Self {
-        let th = t();
+        Self::booted_t(step, t())
+    }
+
+    fn booted_t(step: Ms, th: Thresholds) -> Self {
         let s = Supervisor::new(th.clone()).decide(Event::Tick, 0).next;
         let d = s.decide(
             Event::BootstrapOk {
@@ -84,7 +87,12 @@ impl Run {
     /// through `last`; `events` go in at the first tick at or after each instant, before its frame.
     /// Stops at the first tick after `last`, not yet decided.
     fn on_air_with(step: Ms, last: Ms, events: &[(Ms, Event)]) -> Self {
-        let mut r = Self::booted(step);
+        Self::on_air_with_t(step, last, events, t())
+    }
+
+    /// `on_air_with` on the given thresholds.
+    fn on_air_with_t(step: Ms, last: Ms, events: &[(Ms, Event)], th: Thresholds) -> Self {
+        let mut r = Self::booted_t(step, th);
         let mut sent = 0;
         while r.now <= last {
             while let Some((at, e)) = events.get(sent) {
@@ -457,11 +465,12 @@ fn an_increase_during_a_connect_that_carries_media_keeps_it() {
     assert_eq!(checked, STEPS.len());
 }
 
-/// Two increases in one outage discard one connect: the first gives gen 3 up, the second, during
-/// gen 4's connect (no media either), keeps it to its connect timeout and acts there.
+/// Each RISE of the counter brings its own discard (C6, F-041, Owed 130; was once an outage): the first
+/// gives gen 3 up, the second, during gen 4's connect (no media either), gives gen 4 up and builds gen 5
+/// at once. Each discard is one build, so the builds an outage can cost are the rises. A reply that
+/// repeats the last value (no rise) discards nothing, and neither does a lower one.
 #[test]
-fn two_increases_in_one_outage_give_one_discard() {
-    let th = t();
+fn each_rise_in_one_outage_gives_its_own_discard() {
     let mut checked = 0;
     for step in STEPS {
         let mut r = Run::on_air(step, 0);
@@ -474,27 +483,64 @@ fn two_increases_in_one_outage_give_one_discard() {
             Some(&(first, 4)),
             "setup: the first discards gen 3"
         );
+        // Not a rise: the same value again, then a lower one. Nothing is discarded.
+        let same = r.now;
+        r.send(edge(1));
+        r.tick();
+        r.send(edge(0));
+        r.tick();
+        assert!(
+            r.abandons_from(same).is_empty() && r.builds.last() == Some(&(first, 4)),
+            "step {step}: a repeat or a lower value discarded: {:?}",
+            r.abandons_from(same)
+        );
         let second = r.now;
         r.send(edge(2));
         r.tick();
-        let out = r.idle_until_abandon(r.abandons.len() + 1);
         assert_eq!(
-            out,
-            (first_tick(first + th.input_connect_timeout_ms, step), 4),
-            "kept"
+            r.abandons_from(second),
+            vec![(second, 4)],
+            "step {step}: the second rise discards gen 4"
         );
-        let discards = r.abandons_from(second).len() - 1;
-        r.idle_until_build(5);
         assert_eq!(
-            r.builds[4],
-            (out.0 + step, 5),
-            "step {step}: the second acts at the timeout"
+            r.builds.last(),
+            Some(&(second, 5)),
+            "step {step}: and builds gen 5 at once"
         );
-        assert_eq!(discards, 0, "step {step}: one discard an outage");
         checked += 1;
     }
-    eprintln!("outages with two increases checked: {checked}");
+    eprintln!("outages with two rises checked: {checked}");
     assert_eq!(checked, STEPS.len());
+}
+
+/// The cap on the discards (C6, Owed 130, `input_nudge_discards_per_outage`): a web that raised the
+/// counter on every reply discards that many connects in one outage and no more; the rest latch and act
+/// at the connect timeout. The cap is read from the thresholds, and with the cap at one the outage
+/// discards once, which is Owed 108's rule. Anti-vacuity: the rises sent exceed the cap, and the number
+/// of discards is checked against it for each step and each cap.
+#[test]
+fn rises_beyond_the_cap_do_not_discard() {
+    let mut checked = 0;
+    for cap in [1, t().input_nudge_discards_per_outage] {
+        let th = Thresholds {
+            input_nudge_discards_per_outage: cap,
+            ..t()
+        };
+        for step in STEPS {
+            let mut r = Run::on_air_with_t(step, LAST, &[(step, edge(0))], th.clone());
+            r.idle_until_build(3);
+            let start = r.now;
+            for count in 1..=(cap as u64 + 3) {
+                r.send(edge(count));
+                r.tick();
+            }
+            let discards = r.abandons_from(start).len();
+            assert_eq!(discards, cap, "step {step}, cap {cap}: discards in one outage");
+            checked += 1;
+        }
+    }
+    eprintln!("capped outages checked: {checked}");
+    assert_eq!(checked, 2 * STEPS.len());
 }
 
 /// Several increases read in one reply are one nudge: a jump from 3 to 6 is the run a step to 4 is.

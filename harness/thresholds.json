@@ -49,6 +49,8 @@
   "input_connect_timeout_ms": 9000,
   "input_decode_wait_ms": 8000,
   "input_hold_end_after_ms": 20000,
+  "input_nudge_discards_per_outage": 3,
+  "input_recovery_beat_window_ms": 60000,
   "input_srt_latency_ms": 1000,
   "input_stall_after_ms": 5000,
   "kick_alert_count": 3,

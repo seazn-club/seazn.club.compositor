@@ -291,6 +291,13 @@ pub struct Supervisor {
     /// The last beat `beat_if_due` sent, and the programme phase it carried (C2, S3): a phase that
     /// has moved since beats once `phase_beat_gap_ms` has passed since it.
     last_beat: Option<(Ms, ProgrammePhase)>,
+    /// The camera has been Running at least once this process (C6): a Backoff before that is a phone
+    /// that has not started, which a faster beat cannot shorten (the first `phoneLiveEdge` is a baseline).
+    input_ran: bool,
+    /// When the camera left Running and has not been back since (C6, F-041): the instant of the first
+    /// tick that saw it not Running after a Running one. Beats run at `input_recovery_beat_gap_ms` for
+    /// `input_recovery_beat_window_ms` from it.
+    input_down_since: Option<Ms>,
     deadline_at: Ms,
     output_ever_connected: bool,
     heartbeat_failures: u32,
@@ -322,6 +329,8 @@ impl Supervisor {
             heartbeat_interval_ms: hb,
             next_beat_at: 0,
             last_beat: None,
+            input_ran: false,
+            input_down_since: None,
             deadline_at: Ms::MAX,
             output_ever_connected: false,
             heartbeat_failures: 0,
@@ -472,6 +481,8 @@ impl Supervisor {
     fn start_hold(&mut self, now: Ms, reason: ExitReason) {
         self.lifecycle = Lifecycle::Holding { since: now, reason };
         self.programme.finish();
+        // No link is ticked in the hold, so no outage runs there: the plain cadence (C6).
+        self.input_down_since = None;
         // (Confirm pass N1, 2026-10-15) The first hold tick beats at once, so web learns `final` at
         // the start of the hold, not up to `heartbeat_interval_ms` later (`_INDEX.md` Owed 10).
         self.next_beat_at = now;
@@ -481,16 +492,48 @@ impl Supervisor {
     /// from the last beat's once `phase_beat_gap_ms` has passed since it (C2, S3: the "edge beat", so
     /// web reads a change on the next beat, not up to a cadence later). Either restarts the cadence.
     /// The gap bounds a flapping phase to one beat a gap (`Thresholds::phase_beat_gap_ms`).
+    ///
+    /// C6 (F-041): while the camera is down inside `input_recovery_beat_window_ms` a beat is also due
+    /// `input_recovery_beat_gap_ms` after the last one. Web's `phoneLiveEdge` reaches the relay only in a
+    /// beat's reply, so this is how soon a returned phone nudges the link (Owed 108 fix (b)).
     fn beat_if_due(&mut self, now: Ms, fx: &mut Vec<Effect>) {
         let phase = self.programme.phase();
         let edge = self
             .last_beat
             .is_some_and(|(at, sent)| sent != phase && elapsed(now, at) >= self.t.phase_beat_gap_ms());
-        if now >= self.next_beat_at || edge {
+        let recovery = self.recovery_beats(now)
+            && self
+                .last_beat
+                .is_some_and(|(at, _)| elapsed(now, at) >= self.t.input_recovery_beat_gap_ms());
+        if now >= self.next_beat_at || edge || recovery {
             fx.push(Effect::SendHeartbeat(self.health(now)));
             self.last_beat = Some((now, phase));
             self.next_beat_at = now.saturating_add(self.heartbeat_interval_ms);
         }
+    }
+
+    /// C6: the camera's outage clock, read once a tick after the link's own rules ran. It starts at the
+    /// first tick that finds the link not Running after a Running one, and stops when it is Running
+    /// again. A link that never ran has no outage to beat faster for (`input_ran`).
+    fn track_input_outage(&mut self, now: Ms) {
+        if matches!(self.input.state(), InputState::Running { .. }) {
+            self.input_ran = true;
+            self.input_down_since = None;
+        } else if self.input_ran {
+            self.input_down_since.get_or_insert(now);
+        }
+    }
+
+    /// C6: inside the recovery window (`track_input_outage`'s clock, `input_recovery_beat_window_ms`),
+    /// and web has sent a counter to nudge with. The only thing a faster beat buys is a rise of
+    /// `phoneLiveEdge` in its reply, and web omits the field for a session with no phone-live history
+    /// (`heartbeat.ts`), so a link whose counter is still `None` has nothing to be answered (the PR #115
+    /// review, I2).
+    fn recovery_beats(&self, now: Ms) -> bool {
+        self.input_nudge().counter.is_some()
+            && self
+                .input_down_since
+                .is_some_and(|since| elapsed(now, since) < self.t.input_recovery_beat_window_ms)
     }
 
     fn booting(&mut self, event: Event, now: Ms, attempt: u32, retry_at: Option<Ms>, fx: &mut Vec<Effect>) {
@@ -577,6 +620,7 @@ impl Supervisor {
                 let nudge = self.input.check_nudge(now, &t);
                 let tick = self.input.on_tick(now, &t);
                 fx.extend(stall.into_iter().chain(nudge).chain(tick).map(input_effect));
+                self.track_input_outage(now);
                 if self.output.on_tick(now, &t) {
                     fx.push(Effect::SwapSink {
                         gen: self.output.generation(),
@@ -2473,6 +2517,8 @@ mod tests {
             input_bytes_fresh_ms: 1_187,
             input_srt_latency_ms: 1_181,
             input_hold_end_after_ms: 20_021,
+            input_recovery_beat_window_ms: 60_023,
+            input_nudge_discards_per_outage: 5,
             kick_alert_count: 3,
             kick_window_ms: 300_061,
             output_backoff_base_ms: 541,

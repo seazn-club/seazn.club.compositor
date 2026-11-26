@@ -196,10 +196,13 @@ pub struct InputLink {
     phone_live_edge: Option<u64>,
     /// A nudge latched by an increase of that counter and not acted on yet.
     nudged: bool,
-    /// The nudge's one discard of a connect an outage: spent by the discard, re-armed when a
-    /// generation reaches Running. Armed from the start: web's counter says the phone is back whether
+    /// The nudge's one discard of a connect: spent by the discard, re-armed by each rise of the counter
+    /// (C6, Owed 130) and when a generation reaches Running. Armed from the start: web's counter says the phone is back whether
     /// or not this process has had a camera yet (an in-place restart has not).
     discard_armed: bool,
+    /// The discards this outage has made (C6, Owed 130): each rise re-arms `discard_armed`, and
+    /// `input_nudge_discards_per_outage` caps them. Cleared when a generation reaches Running.
+    discards: usize,
     /// The current generation's first byte has left its source (`on_media`). False at each build.
     media: bool,
     /// The last generation given up and why (C2, S4): set by every move from Connecting or Running
@@ -235,6 +238,7 @@ impl InputLink {
             phone_live_edge: None,
             nudged: false,
             discard_armed: true,
+            discards: 0,
             media: false,
             last_give_up: None,
             give_ups: 0,
@@ -301,6 +305,7 @@ impl InputLink {
         // and the next outage gets its own discard.
         self.nudged = false;
         self.discard_armed = true;
+        self.discards = 0;
     }
 
     /// A decoded frame of generation `gen` reached the adapter's shut gate (C3, S2; Owed 49's
@@ -355,6 +360,12 @@ impl InputLink {
     pub fn on_phone_live_edge(&mut self, count: u64) {
         if self.phone_live_edge.is_some_and(|seen| count > seen) {
             self.nudged = true;
+            // C6 (F-041, Owed 130; the PR #115 re-review's N1): each rise is a new edge of the phone's
+            // publish, so it brings its own discard. A rise that came before the publisher was servable
+            // (the phone's beat before Cloudflare's `connected`, a flap) spent the old once-an-outage
+            // discard on a build Cloudflare could not serve, and the next rise then waited out the
+            // connect timeout. Bounded by the rises (one latch a reply, one build a latch).
+            self.discard_armed = true;
         }
         self.phone_live_edge = Some(count);
     }
@@ -375,8 +386,11 @@ impl InputLink {
                 self.back_off(now, 0, t);
                 None
             }
-            InputState::Connecting { .. } if !self.media && self.discard_armed => {
+            InputState::Connecting { .. }
+                if !self.media && self.discard_armed && self.discards < t.input_nudge_discards_per_outage =>
+            {
                 self.discard_armed = false;
+                self.discards += 1;
                 let gen = self.generation;
                 // Not `abandoned`: the rebuild is due now, so there is no window to take it back in.
                 self.give_up(now, 0, GiveUpReason::PhoneLiveDiscard, t);
