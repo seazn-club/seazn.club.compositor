@@ -3926,3 +3926,71 @@ driver-level scenario above, which can model the hold, and it runs locally.
 **Owed to CI.** Nothing in `adapters` changed. check.yml's tests and the chaos harness (`camera-stop`,
 `camera-flap`, `reader-kicked`: more beats during their input outages, which no case judges as a count) are
 CI's.
+
+## F-042: the programme's GOP is 2 s, the forced keyframe's floor is over it so none is asked, and the VMAF cost is under 0.4 points (C7, 2026-11-26)
+
+**Why 3 s was chosen (F-036).** Two causes, both gone: x264's scene cut (a cut inside a GOP started one under 2 s; off
+since F-036, `scenecut=0`) and Owed 84's forced keyframes (a request landing close behind a natural one; held to the
+floor since F-036). The phone's own ±14 ms jitter at 2 s was the margin, and it is the phone's, not this encoder's (it
+counts frames and stamps tick `i` at `i × 10⁹ / fps`). No ruling forbids 2 s; the owner approved the move 2026-11-26 to
+cut viewer latency (Cloudflare cuts live HLS segments at keyframes: stg showed 3 to 3.33 s segments, TARGETDURATION 4,
+camera to viewer 24.5 s).
+
+**Cloudflare's floor, regular input against LL input (the coordinator's question).** The floor is 2 s for all live
+inputs. <https://developers.cloudflare.com/stream/stream-live/start-stream-live/>, "Requirements": "GOP duration
+(keyframe interval) must be between 2 and 10 seconds", stated for live inputs without a split; its Low-Latency HLS
+section only RECOMMENDS "a GOP size of 2 - 4 seconds" (no separate limit). The troubleshooting page words the error as
+"less than 2 seconds or greater than 8". The 2023 LL-HLS open-beta post
+(<https://blog.cloudflare.com/cloudflare-stream-low-latency-hls-open-beta/>) recommends 1 s: a recommendation in a
+dated post, not a documented floor, contradicted by the current docs. Measured on the wire: nothing; a 1 s GOP has not
+been tried against Cloudflare, and the phone's 2 s edge errors (F-036) say the limit is enforced. So 2 s is built, and
+a move to 1 s is one constant (below), to be taken only after a stg run shows `ERR_GOP_OUT_OF_RANGE` does not come.
+
+**One constant.** `CF_KEYFRAME_INTERVAL_MIN_MS` (2 000) is the GOP (`PROGRAMME_GOP_MS`), and the forced keyframe's floor
+is that plus the 200 ms margin (`FORCED_KEYFRAME_MIN_INTERVAL_MS`). The phone's 3 s `CAMERA_GOP_MS` is the camera's and
+unchanged. Derived from it, not retyped: `NEW_OUTPUT_KEY_WAIT_MS` (the shorter of floor and GOP, 2 000),
+`FORCED_KEYFRAME_ARRIVAL_MS` (that plus the 800 ms encoder delay, 2 800, was 3 000), `OUTPUT_GAP_BUDGET_MS` 18 000 →
+17 800, harness `budget_output_reconnect_ms` 8 000 → 7 800, `FIRST_GOP_CATCH_UP_MAX_MS` (half the wait, 1 000, unmoved).
+
+**The forced key cannot beat the GOP.** With GOP 60 frames and floor 66, a request lands at `max(since + 24, 66)` frames
+after the last keyframe: after the GOP's own key at 60. Asked while that key is in x264's delay it cuts a GOP of 6 frames
+(0.2 s), under Cloudflare's floor. So `gst_output::forced_key_can_beat_the_gop` (`OutputProfile::forced_key_can_beat_the_gop`:
+floor under GOP) is false at 2 s and the adapter asks for none; a new output starts at the GOP's own next keyframe, at
+most a GOP away (2 s), or at the GOP's keyframe already in the delay. The earlier rule (C5's `own_key_in_flight`) stays
+for a longer GOP. Measured (`encoder-tune`, run 45828709098, G2 encoder with real forced-key events at offsets 0.1 to
+3.4 s, 2 reps): the control **U2** (C5's rule at 2 s) cut a **200 ms GOP in 10 of 50 intervals** (at every request
+asked 1 s, 1.5 s, 2 s, 3 s, 3.4 s in); **Q2** (the shipped rule, nothing asked) cut **0 of 40, shortest 2 000 ms**. The
+first run (45825931627) stopped each episode at the first key from the request, which at 2 s is the GOP's own, and read
+U2 as clean: the reason this table now reads every interval of the run.
+
+**VMAF cost of 2 s (libvmaf 3.2.0, x264enc medium, 6 000 kbps, 1080p30, 220 frames; the shipped L2 + `sync-lookahead=0`
+encoder; G3 = key-int-max 90, G2 = 60). Mean (1 %, 5 %):**
+
+| clip | G3 (3 s) | G2 (2 s) | Δ mean | Δ 1 % |
+|---|---|---|---|---|
+| ball | 97.66 (97.4, 97.5) | 97.66 (97.4, 97.5) | 0.00 | 0.0 |
+| touchdown_pass | 91.53 (81.1, 85.0) | 91.16 (81.1, 84.8) | **−0.37** | 0.0 |
+| rush_field_cuts | 82.89 (73.9, 78.6) | 82.83 (74.7, 77.3) | −0.06 | +0.8 |
+| snow | 15.23 (13.5, 13.7) | 15.34 (13.5, 13.8) | +0.11 | 0.0 |
+
+The largest mean drop is 0.37, under the 1 point that would be reported. Bitrates read 5 919 to 6 231 kbps for both.
+x264's own SEI reads `keyint=60 keyint_min=6 scenecut=0` against `keyint=90 keyint_min=9`.
+
+**CPU.** The encoder alone on the 4-vCPU runner (paced 30 fps): G3 0.34 cores, G2 0.33, encode latency 771 / 772 ms
+both. The Fly cost legs (performance-6x, 16 min, p95 cores, size rule p95 ≤ 5.1; run 45825969361 at the PR head):
+**C:snow 3.731 (PASS)** (avg 3.536, max 4.318), **D:snow 5.576 (FAIL cpu, over 5.1)** (avg 4.926, max 5.89,
+compositor 4.754 of it). The control, `main` (3 s, with #115), D:snow alone, run 45832881352: **4.737 (PASS)**
+(avg 4.175, max 5.271). F-040's L2 reads of the 3 s encoder were C 4.013 and D 3.458 on another day (noise ±0.6 to 1.0
+core). So D reads +0.84 over a same-day control and 2.1 over F-040's, with the encoder-only ratio flat (0.34 against
+0.33) and C lower, not higher: a second D on the 2 s head is not run (the brief said once); this one fails the rule and
+is reported as it reads.
+
+**Audio at a start (found by the tests).** A sink started by a keyframe already in x264's delay (a swap up to 0.8 s after
+a GOP's keyframe, now 40 % of swaps at a 2 s GOP) gets no audio from between the keyframe and the swap: the ring's queue is
+dropped at the reconnect point, so its audio starts that late (the video PTS is 0 and the audio's is right, there is
+only up to 0.8 s of picture without sound at the start of the stream). It was true of C5's in-delay swap too; not changed
+here.
+
+**Owed.** (1) A second D:snow on the 2 s head, and a C5-style p95 control (the 3 s L2 head) for D, to separate noise from
+the GOP; D is over 5.1 once. (2) A Cloudflare stg run of the 2 s programme GOP: segment length, TARGETDURATION and
+camera-to-viewer delay (24.5 s before), and no `ERR_GOP_OUT_OF_RANGE`. (3) Audio at a start inside the delay window (above).
