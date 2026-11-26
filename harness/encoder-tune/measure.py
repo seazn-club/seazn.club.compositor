@@ -542,6 +542,9 @@ def key_in_flight(outs, gop_frames=GOP_FRAMES, delay_frames=DELAY_FRAMES):
     return "in_flight" if 0 < due_in <= delay_frames else None
 
 
+TAIL_S = 3.0  # seconds fed after the first key from a request, so a later forced key is seen (C7)
+
+
 def leg_gop_frames(leg):
     """The leg's `key-int-max` (the leg's own, else `COMMON`'s)."""
     return int(leg["props"].get("key-int-max", COMMON["key-int-max"]))
@@ -605,15 +608,23 @@ def key_episode(Gst, GstVideo, leg, feed, offset_s):
     if forced is None:
         row["forced_key"] = None
     else:
+        # C7: the loop stops at the first key from the request, which at a 2 s GOP is the GOP's own; a
+        # request the encoder holds to the floor lands AFTER it (0.2 s on), and only a longer look sees
+        # that GOP. Feed the next tail seconds, then read every interval the run produced.
+        for _ in range(int(TAIL_S * FPS)):
+            r.push(n)
+            n += 1
         time.sleep(0.5)
         all_keys = sorted(o[1] for o in r.snapshot() if o[2] and o[1] is not None)
         prior = [k for k in all_keys if k < forced[1]]
+        intervals = [(b - a) / 1e6 for a, b in zip(all_keys, all_keys[1:])]
         row.update(
             forced_key=True,
             delay_ms=(forced[0] - t_send) * 1000,
             held_ms=(forced[1] - req_rt) / 1e6,
             gop_ms=((forced[1] - prior[-1]) / 1e6) if prior else None,
             keys_rt_ms=[k / 1e6 for k in all_keys],
+            intervals_ms=intervals,
         )
     r.close()
     return row
@@ -736,11 +747,13 @@ def cmd_table(a):
                     continue
                 d = statistics.fmean(e["delay_ms"] for e in got)
                 g = [e["gop_ms"] for e in got if e["gop_ms"] is not None]
-                gops += g
+                # C7: every interval the episode produced, not only the first key's (a forced key
+                # landing after the GOP's own is a later, shorter one).
+                gops += [i for e in got for i in e.get("intervals_ms", [])] or g
                 sk = sum(1 for e in got if e.get("skipped"))
                 first = sum(1 for e in got if e.get("skipped") == "first_frame")
                 cells.append(
-                    f"{d:.0f} ({fmt(min(g), 0) if g else '-'})"
+                    f"{d:.0f} ({fmt(min([i for e in got for i in e.get('intervals_ms', [])] or g), 0) if g or any(e.get('intervals_ms') for e in got) else '-'})"
                     + ("" if len(got) == len(rs) else f" {len(got)}/{len(rs)}")
                     + (f" [{sk} not asked" + (f", {first} served by key 0" if first else "") + "]" if sk else "")
                 )
