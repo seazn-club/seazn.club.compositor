@@ -1554,11 +1554,12 @@ mod tests {
 
     /// The review's I1 and N1, three ways a sink comes to start (`gate_ms`: a healthy swap, a short
     /// gate wait, and an outage longer than the ring's span), and every swap tick across the delay
-    /// window and past it. Whichever way, the new sink's audio:
-    /// - starts within one AAC frame (21 ms) of its picture, and never before it;
-    /// - is every audio frame from there on exactly once, in order: no duplicate PTS, none backwards,
-    ///   none missing (the N1 defect sent each such frame twice on a gate wait, and recovered nothing
-    ///   on a healthy swap, where the old feeder had taken the audio).
+    /// window and past it. Whichever way, the new sink's audio starts within one AAC frame (21 ms)
+    /// of its picture and never before it, and is every audio frame from there on exactly once, in
+    /// order: no duplicate PTS, none backwards, none missing (the N1 defect sent each such frame twice
+    /// on a gate wait, and recovered nothing on a healthy swap, where the old feeder had taken the
+    /// audio).
+    ///
     /// The expected keyframe comes from the declarations: one made before the sink can send and not yet
     /// out of x264 (a keyframe is made every GOP and comes out `DELAY_MS` later) starts the stream,
     /// else the next one made. The sweep counts each path and each side of the delay window, and the
