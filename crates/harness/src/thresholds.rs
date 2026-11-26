@@ -12,6 +12,7 @@
 use domain::config::{
     OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN,
     FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
+    PLAYOUT_CAP_MS, PLAYOUT_EARLY_REANCHOR_MS, PLAYOUT_SETTLE_MS, PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_TARGET_MS,
     TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
 };
 use serde_json::{json, Map, Value};
@@ -51,6 +52,26 @@ pub const BUDGET_FRAME_TO_ENCODER_MS: u64 = 150;
 /// failure table, timing budgets and resource bounds are adopted as written"); §6's own text names
 /// no A/V number.
 pub const BUDGET_AV_OFFSET_MS: u64 = 40;
+/// The worst single tone-to-flash pair the A/V gate keeps (C4 round 6, owner 2026-11-25, "middle
+/// point"): 50 ms. The 40 above is judged on the run's MEDIAN (`av_in_step`'s p50 check, which is what
+/// catches a whole-run steady offset), and the spec's ±40 is that number. Source: owner 2026-11-25,
+/// middle point; 45 to 50 ms is the ITU-R BT.1359 audio-lead detectability edge. CI read a constant
+/// 21 to 50 ms per run on the same code (camera-burst, runs 45714249799: p50 22, 49, 45), the playout's
+/// own view of those runs identical (`docs/_INDEX.md`, C4 round 6).
+pub const BUDGET_AV_PAIR_MAX_MS: u64 = 50;
+/// C4's gate ruling (owner, 2026-11-25, option 1): the kept-pair budget (`BUDGET_AV_PAIR_MAX_MS`) is judged on the pairs taken from
+/// `av_return_cut_ms` after each ANCHOR (the playout's own return from the camera, the wall time of
+/// its `reanchor(gap` line; the run's first pair at the start), and the pairs before it have their
+/// own bound, `BUDGET_AV_OFFSET_EXCLUDED_MS`. The cut spans, openly: the return's hold-off
+/// (`resume_after_ms`, the strip's wait before it shows a returning camera), the playout's settle
+/// skip (`PLAYOUT_SETTLE_SKIP_MS`) and its settle (`PLAYOUT_SETTLE_MS`), about 2.7 s. The first pair
+/// after a return lands ~2.0 s after it, over the budget on three CI runs (44 to 58 ms); the cut
+/// excludes it. The carrier of that excursion is unproven (`docs/_INDEX.md` Owed 121), so the pairs
+/// are bounded, not budgeted: a storm in them still fails. Source of the bound: the checker's A/V
+/// max on main's pre-C4 code, 72 ms (camera-flap chaos legs 45508994483, max 72, and 45498019823,
+/// max 65; camera-stop 45508994483, max 72; smoke on ten pre-C4 PR runs of 2026-11-24, 72 to 88).
+/// It is main's camera-flap and camera-stop maximum, not the worst smoke read.
+pub const BUDGET_AV_OFFSET_EXCLUDED_MS: u64 = 72;
 /// Spec §6, the failure table's score feed row: the page "signals `scoreStale` after 10 s" (the
 /// page's `SCORE_STALE_AFTER_MS`, R2005). The harness page's own stale rule reads this value from
 /// fake-control (`control::PageControl`), so the page and case 7's bound share one number.
@@ -111,6 +132,9 @@ pub struct AdapterConsts {
     /// C11's `TEARDOWN_LEAK_AFTER_MS`: still not back this long after the kill, it counts leaked
     /// (case 16: the leak count, about `reaper_kill_after_ms` + this after the retirement).
     pub teardown_leak_after_ms: u64,
+    /// The programme's audio per ms (`AUDIO_RATE` × `AUDIO_FRAME_BYTES` / 1 000): camera-flap's
+    /// late-audio budget, a span of ms, is read in the beats' bytes.
+    pub audio_bytes_per_ms: u64,
 }
 
 /// `harness/thresholds.json`, as `dump-thresholds` writes it.
@@ -160,6 +184,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         encoded_ring_span_ms,
         reaper_kill_after_ms,
         teardown_leak_after_ms,
+        audio_bytes_per_ms,
     } = adapters;
     let mut m = Map::new();
     let mut put = |k: &str, v: Value| {
@@ -219,6 +244,14 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("tick_widest_ms", json!(TICK_WIDEST_MS));
     put("chromium_gpu_deaths_abort", json!(CHROMIUM_GPU_DEATHS_ABORT));
     put("frame_period_ms", json!(OutputProfile::P720.frame_period_ms()));
+    // C4's playout: the camera's picture airs this long behind its arrival, so a hold-off read in
+    // camera time (camera-flap's `suppressed_ms`) is this much shorter than the wall's.
+    put("playout_target_ms", json!(PLAYOUT_TARGET_MS));
+    // C4 fix round 2: the playout's cap (the picture's worst wait under I1's rule: the target plus
+    // the audio's trail; camera-flap's floor and its late-audio budget) and the early rule's wait
+    // (whether its one correction can land after a return's switch: camera-flap's windows).
+    put("playout_cap_ms", json!(PLAYOUT_CAP_MS));
+    put("playout_early_reanchor_ms", json!(PLAYOUT_EARLY_REANCHOR_MS));
     // Owed 86's starvation alarm, for the same profile: raised by a beat below the floor, cleared by
     // one at or above the recovered level (case 6, the honest beat).
     put("output_fps_floor", json!(OutputProfile::P720.fps_floor()));
@@ -230,6 +263,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put("encoded_ring_span_ms", json!(encoded_ring_span_ms));
     put("reaper_kill_after_ms", json!(reaper_kill_after_ms));
     put("teardown_leak_after_ms", json!(teardown_leak_after_ms));
+    put("audio_bytes_per_ms", json!(audio_bytes_per_ms));
     // The budgets.
     put("budget_slate_after_loss_ms", json!(budget_slate_after_loss_ms()));
     put("budget_return_to_live_ms", json!(BUDGET_RETURN_TO_LIVE_MS));
@@ -243,6 +277,17 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     );
     put("budget_frame_to_encoder_ms", json!(BUDGET_FRAME_TO_ENCODER_MS));
     put("budget_av_offset_ms", json!(BUDGET_AV_OFFSET_MS));
+    put("budget_av_pair_max_ms", json!(BUDGET_AV_PAIR_MAX_MS));
+    put(
+        "budget_av_offset_excluded_ms",
+        json!(BUDGET_AV_OFFSET_EXCLUDED_MS),
+    );
+    // The cut after an anchor the budget is judged from: the return's hold-off, the settle's skip and
+    // the settle (`resume_after_ms`, `PLAYOUT_SETTLE_SKIP_MS`, `PLAYOUT_SETTLE_MS`; never a typed number).
+    put(
+        "av_return_cut_ms",
+        json!(resume_after_ms + PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS),
+    );
     put("budget_score_stale_after_ms", json!(BUDGET_SCORE_STALE_AFTER_MS));
     put("budget_fps_mean_min", json!(BUDGET_FPS_MEAN_MIN));
     put("budget_zygote_verdict_ms", json!(BUDGET_ZYGOTE_VERDICT_MS));
@@ -277,6 +322,7 @@ pub fn committed_adapters(v: &Value) -> Option<AdapterConsts> {
         encoded_ring_span_ms: n("encoded_ring_span_ms")?,
         reaper_kill_after_ms: n("reaper_kill_after_ms")?,
         teardown_leak_after_ms: n("teardown_leak_after_ms")?,
+        audio_bytes_per_ms: n("audio_bytes_per_ms")?,
     })
 }
 
@@ -318,8 +364,9 @@ mod tests {
             encoded_ring_span_ms: 3,
             reaper_kill_after_ms: 4,
             teardown_leak_after_ms: 5,
+            audio_bytes_per_ms: 6,
         });
-        let pairs: [(&str, u64); 10] = [
+        let pairs: [(&str, u64); 14] = [
             ("slate_after_ms", t.slate_after_ms),
             ("resume_after_ms", t.resume_after_ms),
             ("output_connect_timeout_ms", t.output_connect_timeout_ms),
@@ -330,6 +377,13 @@ mod tests {
             ("cef_hang_after_ms", t.cef_hang_after_ms),
             ("heartbeat_interval_ms", t.heartbeat_interval_ms),
             ("cef_gpu_deaths_to_restart", t.cef_gpu_deaths_to_restart as u64),
+            ("playout_target_ms", PLAYOUT_TARGET_MS),
+            (
+                "av_return_cut_ms",
+                t.resume_after_ms + PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS,
+            ),
+            ("budget_av_offset_excluded_ms", BUDGET_AV_OFFSET_EXCLUDED_MS),
+            ("budget_av_pair_max_ms", BUDGET_AV_PAIR_MAX_MS),
         ];
         for (k, want) in pairs {
             assert_eq!(v[k].as_u64(), Some(want), "{k}");
@@ -388,6 +442,20 @@ mod tests {
         }
         eprintln!("mode budgets checked: {checked}");
         assert!(checked > 0);
+    }
+
+    /// The A/V gate's two numbers (owner, 2026-11-25): the cut is the return hold-off plus the settle's
+    /// own span from config (1 000 + 650 + 1 000 ms) and the bound before it is above the budget.
+    #[test]
+    fn the_av_gate_cut_is_the_settle_and_its_bound_sits_above_the_budget() {
+        assert_eq!(
+            Thresholds::default().resume_after_ms + PLAYOUT_SETTLE_SKIP_MS + PLAYOUT_SETTLE_MS,
+            2_650
+        );
+        const _: () = assert!(BUDGET_AV_PAIR_MAX_MS > BUDGET_AV_OFFSET_MS);
+        const _: () = assert!(BUDGET_AV_OFFSET_EXCLUDED_MS > BUDGET_AV_PAIR_MAX_MS);
+        assert_eq!(BUDGET_AV_PAIR_MAX_MS, 50, "the owner's middle point");
+        assert_eq!(BUDGET_AV_OFFSET_EXCLUDED_MS, 72, "main's pre-C4 max");
     }
 
     #[test]
@@ -453,6 +521,7 @@ mod tests {
             encoded_ring_span_ms: 3,
             reaper_kill_after_ms: 4,
             teardown_leak_after_ms: 5,
+            audio_bytes_per_ms: 6,
         });
         let want = 2 + TICK_WIDEST_MS + t.cef_load_timeout_ms + BUDGET_FRAME_TO_ENCODER_MS;
         assert_eq!(v["budget_gpu_death_reload_ms"].as_u64(), Some(want));
@@ -482,6 +551,7 @@ mod tests {
             encoded_ring_span_ms: 3,
             reaper_kill_after_ms: 4,
             teardown_leak_after_ms: 5,
+            audio_bytes_per_ms: 6,
         });
         assert_eq!(v["budget_blank_page_reload_ms"].as_u64(), Some(want));
         let (_, committed) = committed();

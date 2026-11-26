@@ -344,6 +344,16 @@ pub struct AvOffset {
     pub pairs: u64,
     /// Subtracted from each pair: the camera's own AAC delay ([`CAMERA_AAC_DELAY_MS`]).
     pub camera_codec_delay_ms: f64,
+    /// Each pair, by its onset's wall time (C4's gate, owner ruling 2026-11-25: a verdict judges the
+    /// pairs from a settled return on against the budget, and the earlier ones against their own
+    /// bound, so it needs when each pair was).
+    pub list: Vec<AvPair>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct AvPair {
+    pub at_ms: i64,
+    pub ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1043,7 +1053,7 @@ fn audio(segments: &[SegmentScan], datings: &[Dating], frames: &[Frame]) -> Audi
         .filter(|(c, _)| seen.insert(*c))
         .map(|(_, w)| w)
         .collect();
-    let mut offsets: Vec<i64> = onsets
+    let mut list: Vec<AvPair> = onsets
         .iter()
         .filter_map(|a| {
             bursts
@@ -1051,15 +1061,21 @@ fn audio(segments: &[SegmentScan], datings: &[Dating], frames: &[Frame]) -> Audi
                 .map(|v| a - v)
                 .filter(|d| d.abs() <= AV_PAIR_WITHIN_MS)
                 .min_by(|x, y| x.abs().total_cmp(&y.abs()))
+                .map(|d| AvPair {
+                    at_ms: round(*a),
+                    ms: round(d - CAMERA_AAC_DELAY_MS),
+                })
         })
-        .map(|d| round(d - CAMERA_AAC_DELAY_MS))
         .collect();
+    list.sort_by_key(|p| p.at_ms);
+    let mut offsets: Vec<i64> = list.iter().map(|p| p.ms).collect();
     offsets.sort_unstable();
     let av = AvOffset {
         p50: percentile(&offsets, 50),
         max_abs: offsets.iter().map(|o| o.abs()).max().unwrap_or(0),
         pairs: offsets.len() as u64,
         camera_codec_delay_ms: (CAMERA_AAC_DELAY_MS * 10.0).round() / 10.0,
+        list,
     };
     Audio {
         av_offset_ms: av,

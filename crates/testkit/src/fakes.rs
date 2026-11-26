@@ -374,7 +374,9 @@ pub enum PlaneCall {
     FetchStarted,
     Fetched,
     BeatStarted(HealthReport),
-    Beat(HealthReport, Measured),
+    /// The measured half boxed (C4: `Measured` gained `camera_playout`, past clippy's variant-size
+    /// limit; C2 boxed `ControlRequest::Heartbeat`'s the same way).
+    Beat(HealthReport, Box<Measured>),
     /// The sponsor airings a beat carried (R4 task SC1), recorded just before that beat's `Beat`, in
     /// one step with it; absent when the beat carried neither key (no line, nothing dropped).
     Airings(AiringBatch),
@@ -549,8 +551,10 @@ impl ControlPlane for ScriptedPlane {
         self.log.push(PlaneCall::BeatStarted(report.clone()));
         let (delay, result) = (locked(&self.script).reply)(report);
         thread::sleep(delay);
-        self.log
-            .push_beat(PlaneCall::Beat(report.clone(), measured.clone()), airings);
+        self.log.push_beat(
+            PlaneCall::Beat(report.clone(), Box::new(measured.clone())),
+            airings,
+        );
         result
     }
 

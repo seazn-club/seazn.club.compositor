@@ -18,6 +18,9 @@ fn main() {
             encoded_ring_span_ms: adapters::gst_output::ENCODED_RING_SPAN.as_millis() as u64,
             reaper_kill_after_ms: adapters::cef_graphics::REAPER_KILL_AFTER_MS,
             teardown_leak_after_ms: adapters::cef_graphics::TEARDOWN_LEAK_AFTER_MS,
+            audio_bytes_per_ms: u64::from(adapters::frame_store::AUDIO_RATE)
+                * adapters::frame_store::AUDIO_FRAME_BYTES as u64
+                / 1_000,
         })
     );
 }

@@ -28,7 +28,10 @@
 //! - **The camera frames no tick showed** (Owed 81 (i)): each beat's metrics sample that carries
 //!   `camera_frames_replaced` writes `camera frames replaced beat=<n> total=<n>`, where `beat` is the
 //!   rise since the last beat's sample (the final beat included). It stands in for a
-//!   beat field the contract does not have yet (Owed 90); a sample without it writes nothing.
+//!   beat field the contract does not have yet (Owed 90); a sample without it writes nothing. C4
+//!   (Owed 89): when the sample carries the camera's playout totals (`camera_playout`), the ticks
+//!   that repeated a frame on air follow, the same way: ` repeat_ticks=<beat> repeat_ticks_total=<n>`;
+//!   and the `input received` line gains the playout's audio and clock counts, each the beat's rise.
 //! - **The real output rate** (Owed 86): each beat's metrics sample that carries `fps` (the frames
 //!   that left the encoder over the beat window, a finite rate) writes `output fps beat=<fps>
 //!   floor=<floor>`, the floor being the session profile's (`OutputProfile::fps_floor`), and hands it
@@ -96,7 +99,8 @@ use domain::starvation::{Alarm, StarvationAlarm};
 use domain::supervisor::{Decision, Effect, Event, Refusal, Supervisor};
 
 use crate::ports::{
-    ControlRequest, Inbound, Measured, MemorySplit, Ports, SessionConfig, FINAL_BEAT_TIMEOUT_MS,
+    ControlRequest, Inbound, Measured, MemorySplit, PlayoutTotals, Ports, SessionConfig,
+    FINAL_BEAT_TIMEOUT_MS,
 };
 
 /// Ticks per second before the session gives a profile.
@@ -182,6 +186,8 @@ pub struct Driver {
     drops: Tally,
     /// The camera-frames-replaced total of the last beat's sample (Owed 81 (i)).
     replaced_at_beat: u64,
+    /// The camera playout's totals at the last beat's sample (C4).
+    playout_at_beat: PlayoutTotals,
     /// The real output rate's starvation alarm (Owed 86).
     starvation: StarvationAlarm,
     phase: ProgrammePhase,
@@ -215,6 +221,7 @@ impl Driver {
             skips: Tally::default(),
             drops: Tally::default(),
             replaced_at_beat: 0,
+            playout_at_beat: PlayoutTotals::default(),
             starvation: StarvationAlarm::default(),
             phase: ProgrammePhase::Waiting,
             phase_seq: 0,
@@ -496,15 +503,27 @@ impl Driver {
             Effect::StepDown(r) => p.programme.step_down(r),
             Effect::SendHeartbeat(h) => {
                 let m = p.metrics.sample();
+                // The playout's totals only grow too; each line writes the beat's rise.
+                let playout = m.camera_playout.map(|t| {
+                    let rise = t.since(&self.playout_at_beat);
+                    self.playout_at_beat = t;
+                    (rise, t)
+                });
                 if let Some(total) = m.camera_frames_replaced {
                     // The adapter's total only grows; a lower one (a fault) reads 0, and the next
                     // beat counts from it.
                     let beat = total.saturating_sub(self.replaced_at_beat);
                     self.replaced_at_beat = total;
-                    p.log
-                        .info(&format!("camera frames replaced beat={beat} total={total}"));
+                    let mut line = format!("camera frames replaced beat={beat} total={total}");
+                    if let Some((rise, t)) = playout {
+                        line.push_str(&format!(
+                            " repeat_ticks={} repeat_ticks_total={}",
+                            rise.repeat_ticks, t.repeat_ticks
+                        ));
+                    }
+                    p.log.info(&line);
                 }
-                if let Some(line) = received_line(&m) {
+                if let Some(line) = received_line(&m, playout.map(|(rise, _)| rise)) {
                     p.log.info(&line);
                 }
                 if self
@@ -684,11 +703,14 @@ fn phase_word(p: ProgrammePhase) -> &'static str {
 /// The camera as received (C2, S4), once a beat: `input received fps=<x.y> kbps=<n>`, each `-` when
 /// not measured (a non-finite rate is not a measurement), and no line when neither is. C3 (S5 item
 /// 1): the camera's loss totals follow, ` withheld_spans=<n> queue_overruns=<n>`, each `-` when not
-/// measured, and only when either is (so a beat without them writes C2's line as it was).
-fn received_line(m: &Measured) -> Option<String> {
+/// measured, and only when either is (so a beat without them writes C2's line as it was). C4 (S1):
+/// the camera playout's beat (`playout`, each total's rise since the last beat) follows, `
+/// audio_pad_bytes=<n> audio_overflow_bytes=<n> audio_late_bytes=<n> reanchors=<n>`, only when the
+/// sample carried it.
+fn received_line(m: &Measured, playout: Option<PlayoutTotals>) -> Option<String> {
     let fps = m.input_received_fps.filter(|f| f.is_finite() && *f >= 0.0);
     let loss = m.input_withheld_spans.is_some() || m.input_queue_overruns.is_some();
-    if fps.is_none() && m.input_received_kbps.is_none() && !loss {
+    if fps.is_none() && m.input_received_kbps.is_none() && !loss && playout.is_none() {
         return None;
     }
     let count = |n: Option<u64>| n.map_or("-".to_owned(), |k| k.to_string());
@@ -702,6 +724,12 @@ fn received_line(m: &Measured) -> Option<String> {
             " withheld_spans={} queue_overruns={}",
             count(m.input_withheld_spans),
             count(m.input_queue_overruns)
+        ));
+    }
+    if let Some(b) = playout {
+        line.push_str(&format!(
+            " audio_pad_bytes={} audio_overflow_bytes={} audio_late_bytes={} reanchors={}",
+            b.audio_pad_bytes, b.audio_overflow_bytes, b.audio_late_bytes, b.reanchors
         ));
     }
     Some(line)

@@ -7,7 +7,7 @@
 //! | `mem_mb` | the sum of `VmRSS` over the same tree (`/proc/<pid>/status`) |
 //! | `fps` | the programme's REAL output rate (Owed 86): the video frames that left the encoder since the last sample, over the wall time since it (`BeatRate`, fed `Stats::snapshot()`'s `encoded_frames`), never the profile's nominal rate; absent until a window has both ends |
 //! | `bitrate_kbps`, `egress_bytes`, `encoder_speed` | `Stats::snapshot()`, unchanged: a `None` there stays absent on the wire |
-//! | `camera_frames_replaced` | `Stats::snapshot()`, unchanged; logged by the driver, never on the wire (Owed 90) |
+//! | `camera_frames_replaced`, `camera_playout` | `Stats::snapshot()`, unchanged; logged by the driver, never on the wire (Owed 90) |
 //! | `input_received_fps` | the camera as the relay receives it (C2, S4): the decoded camera frames the input wrote into the programme's camera slot since the last sample (`FrameStore::camera_written`, which counts only an open gate's), over the wall time since it (`BeatRate`); absent until a window has both ends, and absent with no camera reader (`with_camera`) |
 //! | `input_received_kbps` | the bytes out of the camera pull's `srtsrc`, every build's, decoded or not (`ReceivedBytes`), since the last sample, over the wall time since it, × 8 / 1000, rounded (`BeatRate`); absent as above |
 //! | `input_withheld_spans`, `input_queue_overruns` | the camera's losses before the picture (C3, S5; `InputLoss`), process totals as the camera reader reads them, once a sample; absent with no camera reader |
@@ -284,6 +284,7 @@ impl Metrics for ProcMetrics {
             cpu_pct,
             mem_mb: mem_kb.map(|kb| kb / 1024),
             camera_frames_replaced: s.camera_frames_replaced,
+            camera_playout: s.camera_playout,
             input_received_fps,
             input_received_kbps,
             input_withheld_spans,

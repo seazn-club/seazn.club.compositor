@@ -5,7 +5,7 @@ use adapters::control_http::{
     programme_phase_wire,
 };
 use adapters::sponsor_line::{parse_sponsor_line, END_KEYS, SOURCE_WORDS, START_KEYS, STYLE_WORDS};
-use app::ports::{FetchError, Measured};
+use app::ports::{FetchError, Measured, PlayoutTotals};
 use domain::airings::{
     is_utc_instant, AiringBatch, AiringBuffer, AiringLine, AiringSource, AiringStyle, LineRefusal,
     AIRING_BREAK_KIND_MAX_UNITS, AIRING_BUFFER_CAP, AIRING_ID_MAX_UNITS,
@@ -180,6 +180,13 @@ fn full_measured() -> Measured {
         cpu_pct: Some(41.5),
         mem_mb: Some(812),
         camera_frames_replaced: Some(57),
+        camera_playout: Some(PlayoutTotals {
+            repeat_ticks: 11,
+            audio_pad_bytes: 12_800,
+            audio_overflow_bytes: 4,
+            audio_late_bytes: 6_400,
+            reanchors: 2,
+        }),
         input_received_fps: Some(29.9),
         input_received_kbps: Some(3_500),
         input_withheld_spans: Some(4),
@@ -460,6 +467,8 @@ fn a_measured_zero_is_sent_as_zero() {
         mem_mb: Some(0),
         // Measured, but not a contract key (Owed 90): `camera_frames_replaced_stays_off_the_wire…`.
         camera_frames_replaced: Some(0),
+        // Measured, logs only (C4): `camera_playout_stays_off_the_wire`.
+        camera_playout: Some(PlayoutTotals::default()),
         // Not on a default beat (C2, S4): `the_camera_keys_stay_off_a_default_beat…`.
         input_received_fps: Some(0.0),
         input_received_kbps: Some(0),
@@ -533,6 +542,50 @@ fn camera_frames_replaced_stays_off_the_wire_until_the_contract_declares_it() {
         checked += 1;
     }
     eprintln!("camera_frames_replaced counts kept off the wire: {checked}");
+    assert_eq!(checked, 3);
+}
+
+/// C4 (Owed 89): the camera playout's counts are logs only (the brief: no wire field; a new beat
+/// key needs web's task first, Owed 90). The contract declares none of them, and the beat is the
+/// same with them as without, at 0, at a mid value and at the largest.
+#[test]
+fn camera_playout_stays_off_the_wire() {
+    let hb = &contract()["$defs"]["heartbeat"];
+    let declared = hb["properties"].as_object().expect("the heartbeat's properties");
+    for key in [
+        "repeatTicks",
+        "cameraRepeatTicks",
+        "audioPadBytes",
+        "audioOverflowBytes",
+    ] {
+        assert!(declared.get(key).is_none(), "the contract declares {key} now");
+    }
+    let v = schema_def("heartbeat");
+    let without = heartbeat_wire(
+        &report(),
+        &Measured {
+            camera_playout: None,
+            ..full_measured()
+        },
+    );
+    let mut checked = 0;
+    for n in [0, 6_400, u64::MAX] {
+        let m = Measured {
+            camera_playout: Some(PlayoutTotals {
+                repeat_ticks: n,
+                audio_pad_bytes: n,
+                audio_overflow_bytes: n,
+                audio_late_bytes: n,
+                reanchors: n,
+            }),
+            ..full_measured()
+        };
+        let wire = heartbeat_wire(&report(), &m);
+        assert_eq!(wire, without, "{n}: the playout changes nothing on the wire");
+        assert!(violations(&v, &wire).is_empty(), "{wire}");
+        checked += 1;
+    }
+    eprintln!("camera playout totals kept off the wire: {checked}");
     assert_eq!(checked, 3);
 }
 

@@ -8,7 +8,8 @@
 //! | `bitrate_kbps` | bytes SENT by the current sink in the last complete 1 s window × 8 / 1000 | one complete window of the current sink's polls |
 //! | `egress_bytes` | bytes sent, cumulative across every sink generation | a poll that reads a total above 0 |
 //! | `encoder_speed` | encoded video PTS advance in the last complete 1 s window ÷ the window's wall time | 1 s of encoder output |
-//! | `camera_frames_replaced` | camera frames no tick put on air; a camera tick counts the frames written since the tick before, less the one it shows, a slate tick none (`ReplacedFrames`) | the first camera tick |
+//! | `camera_frames_replaced` | camera frames that left the playout without airing (`playout::Counts::unaired`), counted on camera ticks only, a slate tick's none (`CameraTally`) | the first camera tick |
+//! | `camera_playout` | the playout's other counts on camera ticks (C4, Owed 89): repeat ticks, audio filler, late and overflowed audio, re-anchors (`CameraTally`) | the first camera tick |
 //!
 //! "Bytes sent" is rtmp2sink's `out-bytes-total`, or the file's size for a `file://` target, never
 //! acknowledged bytes: CF Input B sends no RTMP acknowledgements (F-005; `docs/_INDEX.md` Owed 13).
@@ -25,7 +26,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use app::ports::PlayoutTotals;
 use domain::config::OUTPUT_FPS_MIN_WINDOW_MS;
+
+use crate::playout::Counts;
 
 /// The bytes the camera pull's `srtsrc` has put out since the process started, every build's,
 /// decoded or not (C2, S4: the camera as the relay receives it). Every `GstInput` the process builds
@@ -120,53 +124,55 @@ pub struct StatsSnapshot {
     pub bitrate_kbps: Option<u32>,
     pub egress_bytes: Option<u64>,
     pub encoder_speed: Option<f64>,
-    /// The session's total of `ReplacedFrames`. Not on the heartbeat (the contract is strict,
-    /// `docs/_INDEX.md` Owed 90): the driver logs it once a beat.
+    /// The session's camera frames that left the playout unaired (`CameraTally`). Not on the
+    /// heartbeat (the contract is strict, `docs/_INDEX.md` Owed 90): the driver logs it once a beat.
     pub camera_frames_replaced: Option<u64>,
+    /// The session's other playout counts (`CameraTally`; C4): logged once a beat, never on the wire.
+    pub camera_playout: Option<PlayoutTotals>,
 }
 
-/// Camera frames the camera slot replaced before any tick put them on air (the coordinator's
-/// recommendation, approved by the owner 2026-10-24; `docs/_INDEX.md` Owed 81 (i); PR #59's
-/// stage-by-stage finding). The slot holds only the newest frame (`FrameStore`), and each tick shows
-/// whatever it holds, so frames that arrive in a burst between two ticks are overwritten unseen and
-/// nothing else counts them: `fps` counts the frames out of the encoder (one a tick when the encoder
-/// keeps up, Owed 86) and `droppedFrames` the ladder's overruns.
+/// The camera's playout counts on camera ticks (Owed 81 (i), the owner's approval of 2026-10-24;
+/// C4, Owed 89). The playout (`playout.rs`) reports each tick's raw counts: the frames that left it
+/// without airing (`camera_frames_replaced`: before C4 the newest-frame slot's overwritten frames,
+/// PR #59's finding; now an underrun's late frames, a source faster than the programme, the cap's
+/// and a new generation's drops), the ticks that kept the last frame on air (#59's second count),
+/// the audio filler, the audio dropped late or past the ring's cap, and the clock's re-anchors. A
+/// tick that puts the camera on air (`Emit`, `Repeat`) adds them; a slate tick (`Waiting`,
+/// `Reconnecting`, `Final`) adds none (PR #60's slate rule: a slate is on air by the programme's own
+/// rule, and the phase already says so), though its frames still leave the queue. Frames the input
+/// never wrote (a gated build's, an appsink drop) are not the playout's, so not counted here.
 ///
-/// Fed once a tick with `written`, the frames the slot has taken so far. A tick that puts the camera
-/// on air (`Emit`, `Repeat`) shows the newest of the frames written since the tick before it and
-/// counts the rest; a slate tick (`Waiting`, `Reconnecting`, `Final`) counts none, because a slate is
-/// on air by the programme's own rule and the phase already says so. Frames the input never wrote
-/// (a gated build's, an appsink drop) are not in `written`, so they are not counted here.
-///
-/// **What it measures:** the frames above one a camera tick, which is input judder only for a source
-/// at the programme's rate. A steady source faster than the output reads as replaced too: a 60 fps
-/// camera on a 30 fps programme writes 2 a tick and reads 1 a tick, which is replacement, not
-/// judder. A slower one reads 0 while ticks repeat (a 25 fps camera: 1 tick in 6). A late tick
-/// thread raises it as well: the driver runs late ticks back to back, so a stall of `k` periods
-/// counts the `k − 1` frames that arrived in it, with no `ticks skipped` line below 1 s. Read it
-/// against the source's rate and the driver's lateness lines (Owed 89).
+/// **What it measures:** input judder past the playout's target, for a source at the programme's
+/// rate. A steady source faster than the output reads as replaced too (a 60 fps camera on a 30 fps
+/// programme drops one a tick), and a slower one repeats (a 25 fps camera: 1 tick in 6). A late tick
+/// thread airs the frames due over the stall at once and drops the older (the driver runs late
+/// ticks back to back). Read it against the source's rate and the driver's lateness lines (Owed 89).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReplacedFrames {
-    /// The highest `written` any tick has read.
-    read: u64,
+pub struct CameraTally {
     /// `None` until a tick has put the camera on air.
-    total: Option<u64>,
+    total: Option<Counts>,
 }
 
-impl ReplacedFrames {
-    /// One tick. `written` never falls (the slot only counts up); a lower one is not a newer frame,
-    /// so it counts nothing and leaves the mark where it was.
-    pub fn on_tick(&mut self, written: u64, camera_on_air: bool) {
-        let new = written.saturating_sub(self.read);
-        self.read = self.read.max(written);
+impl CameraTally {
+    /// One tick's playout counts; kept only when the tick put the camera on air.
+    pub fn on_tick(&mut self, counts: &Counts, camera_on_air: bool) {
         if camera_on_air {
-            // The newest of the new frames is the one on air; the rest were overwritten unseen.
-            *self.total.get_or_insert(0) += new.saturating_sub(1);
+            self.total.get_or_insert_default().add(counts);
         }
     }
 
-    pub fn total(&self) -> Option<u64> {
-        self.total
+    pub fn replaced(&self) -> Option<u64> {
+        self.total.map(|c| c.unaired)
+    }
+
+    pub fn playout(&self) -> Option<PlayoutTotals> {
+        self.total.map(|c| PlayoutTotals {
+            repeat_ticks: c.repeated,
+            audio_pad_bytes: c.audio_pad_bytes,
+            audio_overflow_bytes: c.audio_overflow_bytes,
+            audio_late_bytes: c.audio_late_bytes,
+            reanchors: c.reanchors,
+        })
     }
 }
 
@@ -192,7 +198,7 @@ struct Inner {
     egress_seen: bool,
     bitrate: Windowed,
     encoder: Windowed,
-    camera: ReplacedFrames,
+    camera: CameraTally,
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -239,10 +245,10 @@ impl Stats {
         *locked(&self.forced) = Some(s);
     }
 
-    /// One programme tick's camera slot: `written`, the frames the slot has taken so far, and whether
-    /// the tick put the camera on air (`ReplacedFrames::on_tick`).
-    pub fn on_camera_tick(&self, written: u64, camera_on_air: bool) {
-        locked(&self.inner).camera.on_tick(written, camera_on_air);
+    /// One programme tick's playout counts (its picture's and its audio periods'), and whether the
+    /// tick put the camera on air (`CameraTally::on_tick`).
+    pub fn on_camera_tick(&self, counts: &Counts, camera_on_air: bool) {
+        locked(&self.inner).camera.on_tick(counts, camera_on_air);
     }
 
     pub(crate) fn on_encoded_video_at(&self, now: Instant, pts: Duration) {
@@ -282,7 +288,8 @@ impl Stats {
                 .encoder
                 .last_complete(now)
                 .map(|advance| advance / STATS_WINDOW.as_secs_f64()),
-            camera_frames_replaced: s.camera.total(),
+            camera_frames_replaced: s.camera.replaced(),
+            camera_playout: s.camera.playout(),
         }
     }
 }
@@ -406,6 +413,7 @@ impl BeatRate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playout::Playout;
     use domain::config::{OutputProfile, Thresholds};
 
     // C3 (S5 item 1): the spans the decoder withheld, in sequence: a normal frame (units then a picture
@@ -665,7 +673,11 @@ mod tests {
         assert_eq!(s.snapshot_at(t0 + ms(3_000)).encoder_speed, Some(0.0));
     }
 
-    // ---- camera frames replaced (Owed 81 (i)) ----
+    // ---- camera frames replaced (Owed 81 (i)) and the playout's counts (C4) ----
+    //
+    // These drive the tally through the playout's UNSTAMPED path (the old newest-frame slot's rule,
+    // which `playout.rs` keeps for unstamped frames), so PR #60's schedules and counts carry over
+    // unchanged; the stamped queue's own schedules are `playout.rs`'s tests.
 
     /// Both output profiles (AGENTS.md §5, "the other mode"); the tick grid runs at each one's fps.
     /// Both are 30 fps today, so this is one grid swept twice, not two: the rule reads only write
@@ -721,12 +733,19 @@ mod tests {
                 .sum()
         }
 
-        /// The slot on the tick grid: each tick reads the frames written at or before its instant.
+        /// The unstamped playout on the tick grid: each tick gets the frames written at or before
+        /// its instant, and hands its counts to the tally.
         fn run(&self, fps: u32, on_air: impl Fn(u64) -> bool) -> Option<u64> {
             let s = Stats::default();
+            let mut p: Playout<u64> = Playout::default();
+            let mut next = 0;
             for i in 0..self.ticks {
-                let written = self.arrivals.partition_point(|&a| a <= due(fps, i)) as u64;
-                s.on_camera_tick(written, on_air(i));
+                while next < self.arrivals.len() && self.arrivals[next] <= due(fps, i) {
+                    p.push_video(None, None, next as u64);
+                    next += 1;
+                }
+                let t = p.tick(due(fps, i) * 1_000_000);
+                s.on_camera_tick(&t.counts, on_air(i));
             }
             s.snapshot_at(Instant::now()).camera_frames_replaced
         }
@@ -818,47 +837,147 @@ mod tests {
     }
 
     /// Empty inputs: nothing is measured until a tick puts the camera on air (absent, never 0), and
-    /// a camera tick with no frame at all is a measured 0.
+    /// a camera tick with nothing to count is a measured 0, for every count.
     #[test]
     fn camera_frames_replaced_is_absent_until_the_camera_is_on_air() {
         let s = Stats::default();
+        let fresh = s.snapshot_at(Instant::now());
         assert_eq!(
-            s.snapshot_at(Instant::now()).camera_frames_replaced,
-            None,
+            (fresh.camera_frames_replaced, fresh.camera_playout),
+            (None, None),
             "fresh"
         );
-        // Frames under a slate only: the waiting slate's frames are not a measurement.
-        for written in [0, 3, 9] {
-            s.on_camera_tick(written, false);
+        // Counts under a slate only: the waiting slate's are not a measurement.
+        for n in [0, 3, 9] {
+            s.on_camera_tick(&every_count(n), false);
         }
+        let slate = s.snapshot_at(Instant::now());
         assert_eq!(
-            s.snapshot_at(Instant::now()).camera_frames_replaced,
-            None,
+            (slate.camera_frames_replaced, slate.camera_playout),
+            (None, None),
             "slate only"
         );
         let empty = Stats::default();
-        empty.on_camera_tick(0, true);
+        empty.on_camera_tick(&Counts::default(), true);
+        let snap = empty.snapshot_at(Instant::now());
         assert_eq!(
-            empty.snapshot_at(Instant::now()).camera_frames_replaced,
+            snap.camera_frames_replaced,
             Some(0),
-            "a camera tick with no frame written replaced nothing"
+            "a camera tick that dropped nothing"
+        );
+        assert_eq!(
+            snap.camera_playout,
+            Some(PlayoutTotals::default()),
+            "and counted nothing else"
         );
     }
 
-    /// A second tick that finds nothing new changes nothing; a `written` lower than one already read
-    /// (the slot only counts up, so it cannot come from `FrameStore`) counts nothing and does not
-    /// lower the mark, so the next real count starts from the highest read.
+    /// Every count set to `n`.
+    fn every_count(n: u64) -> Counts {
+        Counts {
+            unaired: n,
+            repeated: n,
+            reanchors: n,
+            audio_pad_bytes: n,
+            audio_late_bytes: n,
+            audio_overflow_bytes: n,
+        }
+    }
+
+    /// A camera tick adds each of its counts to its own total; a slate tick between adds nothing;
+    /// a second camera tick adds again (the totals only grow). Each count lands in its own field:
+    /// the counts are distinct here, so a swapped pair reads wrong.
     #[test]
-    fn camera_frames_replaced_never_counts_twice_or_backwards() {
-        let mut r = ReplacedFrames::default();
-        r.on_tick(3, true);
-        assert_eq!(r.total(), Some(2), "three frames, one shown");
-        r.on_tick(3, true);
-        assert_eq!(r.total(), Some(2), "a repeat tick: nothing new");
-        r.on_tick(1, true);
-        assert_eq!(r.total(), Some(2), "a lower count is not a newer frame");
-        r.on_tick(6, true);
-        // From the mark 3, not from 1: three new frames, one shown (from 1 it would read 2 + 4).
-        assert_eq!(r.total(), Some(4));
+    fn the_tally_adds_a_camera_ticks_counts_field_by_field_and_a_slates_none() {
+        let mut t = CameraTally::default();
+        let c = Counts {
+            unaired: 1,
+            repeated: 2,
+            reanchors: 3,
+            audio_pad_bytes: 4,
+            audio_late_bytes: 5,
+            audio_overflow_bytes: 6,
+        };
+        t.on_tick(&c, true);
+        t.on_tick(&every_count(100), false);
+        t.on_tick(&c, true);
+        assert_eq!(t.replaced(), Some(2));
+        assert_eq!(
+            t.playout(),
+            Some(PlayoutTotals {
+                repeat_ticks: 4,
+                audio_pad_bytes: 8,
+                audio_overflow_bytes: 12,
+                audio_late_bytes: 10,
+                reanchors: 6,
+            })
+        );
+        // A tick with nothing changes nothing.
+        t.on_tick(&Counts::default(), true);
+        assert_eq!(t.replaced(), Some(2));
+    }
+
+    /// The repeat count (#59's second): a camera tick with no new frame and one on air counts one,
+    /// a slate tick none. The unstamped slot: 3 frames, then 4 ticks on air with nothing new, then
+    /// 2 under a slate, then 1 more on air: 5 repeats, 2 replaced.
+    #[test]
+    fn camera_repeat_ticks_count_only_on_air() {
+        let s = Stats::default();
+        let mut p: Playout<u64> = Playout::default();
+        for v in 0..3 {
+            p.push_video(None, None, v);
+        }
+        let on_air = [true, true, true, true, true, false, false, true];
+        for (i, &air) in on_air.iter().enumerate() {
+            s.on_camera_tick(&p.tick(i as u64).counts, air);
+        }
+        let snap = s.snapshot_at(Instant::now());
+        assert_eq!(snap.camera_frames_replaced, Some(2));
+        assert_eq!(snap.camera_playout.map(|t| t.repeat_ticks), Some(5));
+    }
+
+    /// The final slate with a non-empty stamped queue (the brief's sequence): the frames still
+    /// queued leave under the slate, and nothing the slate ticks see is counted, so the totals at
+    /// the last camera tick are the session's.
+    #[test]
+    fn the_final_slate_counts_nothing_the_queue_still_holds() {
+        let fps = 30u64;
+        let at = |i: u64| i * 1_000_000_000 / fps;
+        let mut checked = 0;
+        for profile in PROFILES {
+            assert_eq!(u64::from(profile.fps), fps, "both profiles are 30 fps");
+            let s = Stats::default();
+            let mut p: Playout<u64> = Playout::default();
+            // A camera 5 ms after each tick for 3 s; on air from tick 40; the final slate from 90.
+            let frames = 90u64;
+            let (mut next, mut held_at_final) = (0, 0);
+            let mut at_final = None;
+            for i in 0..frames + 30 {
+                while next < frames && at(next) + 5_000_000 <= at(i) {
+                    p.push_video(Some(1), Some(7_000_000_000 + at(next)), next);
+                    next += 1;
+                }
+                let t = p.tick(at(i));
+                if i == frames {
+                    held_at_final = p.queued();
+                    at_final = s.snapshot_at(Instant::now()).camera_playout;
+                }
+                s.on_camera_tick(&t.counts, (40..frames).contains(&i));
+                checked += 1;
+            }
+            assert!(
+                held_at_final > 0,
+                "the premise: frames still queued at the final slate"
+            );
+            assert_eq!(p.queued(), 0, "the slate ticks drained them");
+            let end = s.snapshot_at(Instant::now());
+            assert_eq!(
+                end.camera_playout, at_final,
+                "nothing counted under the final slate"
+            );
+            assert_eq!(end.camera_frames_replaced, Some(0));
+        }
+        eprintln!("final-slate ticks checked: {checked}");
+        assert!(checked > 0);
     }
 }

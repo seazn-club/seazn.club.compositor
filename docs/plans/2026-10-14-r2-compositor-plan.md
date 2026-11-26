@@ -65,6 +65,10 @@ These apply to every task. Values are copied from the spec and ADRs.
   compressed access units and is no longer leaky. A drop there loses a reference mid-GOP and freezes
   the picture to the next keyframe, so it blocks the source instead, bounded by
   `CAMERA_VIDEO_QUEUE_MS`; libsrt's own too-late drop is then the one loss on the input leg.)
+  (Amended 2026-11-25, C4, S1: the camera's decoded frames and its audio wait in one playout,
+  played on a clock slaved to the camera's PTS, `PLAYOUT_TARGET_MS` behind it. Both hold at most
+  `PLAYOUT_CAP_MS`, 500 ms, so the audio ring is 500 ms, not 400: a shorter ring would drop audio
+  the clock still owes. Still leaky, dropping the oldest, counted; F-039.)
 - **Memory and CPU:** 1 GB soft limit (alert), 2 GB hard. The OOM order kills CEF before the encoder.
   CEF is capped at about 600 MB and recycled every 2 h. CPU ≤70 % sustained.
 - **Machine:** Fly `performance-4x`, 8 GB, region `lhr`, restart `on-failure` with `max_retries: 2`,

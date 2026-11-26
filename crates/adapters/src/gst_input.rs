@@ -16,9 +16,10 @@
 //! **Events**, each tagged with the generation of the pipeline that sent it: the first decoded video
 //! sample sends `InputConnected { gen }` (F-002: "connected" is the first decoded frame, never the
 //! handshake); every video sample replaces the frame store's camera slot and sends `InputFrame { gen }`; every
-//! audio sample goes into the frame store's 400 ms ring; a bus error sends `InputError { gen, facts }`
-//! (Owed 108: the build's `BuildFacts`, below), a loss to the domain unless it reads Cloudflare's
-//! hold-end close in it, and the video branch's EOS `InputLost { gen, Eos }`, once a generation.
+//! audio sample goes into the frame store's playout (C4: its ring holds `PLAYOUT_CAP_MS`); a bus
+//! error sends `InputError { gen, facts }` (Owed 108: the build's `BuildFacts`, below), a loss to
+//! the domain unless it reads Cloudflare's hold-end close in it, and the video branch's EOS
+//! `InputLost { gen, Eos }`, once a generation.
 //! The build's first byte out of `srtsrc`, decoded or not, sends `InputMedia { gen }` (Owed 108 fix
 //! (b): the domain keeps a connect that carries bytes when web reports the phone live again).
 //! `InputFrame`, `InputConnected` and `InputMedia` are tried, never waited for, so a full inbound
@@ -105,7 +106,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use crate::frame_store::{FrameStore, AUDIO_CHANNELS, AUDIO_RATE};
+use crate::decoder_trace::DecoderTrace;
+use crate::frame_store::{media_time, FrameStore, AUDIO_CHANNELS, AUDIO_RATE};
 use crate::gst_output::LogFn;
 #[cfg(feature = "test-hooks")]
 pub use crate::input_threads::WorkerCounts;
@@ -193,18 +195,19 @@ impl Shared {
         (self.log)(&clean);
     }
 
-    /// Closes the gate if `build` is the open one, and empties the audio ring under the same lock:
-    /// what the build pushed and the programme has not played yet is the build's alone (the ring's
-    /// only writer is the open build), so none of it goes on air after the close (the PR #35
-    /// review's m1). `Some(bytes flushed)` when this call closed it: the generation's loss is decided
-    /// here, once, and nothing of that build reaches the slot, the ring or the loop afterwards.
+    /// Closes the gate if `build` is the open one, and empties the camera's queued frames and the
+    /// audio ring under the same lock (`FrameStore::flush_camera`): what the build pushed and the
+    /// programme has not played yet is the build's alone (the playout's only writer is the open
+    /// build), so none of it goes on air after the close (the PR #35 review's m1; its video since the
+    /// C4 review's m5). `Some(audio bytes flushed)` when this call closed it: the generation's loss is
+    /// decided here, once, and nothing of that build reaches the slot, the ring or the loop afterwards.
     fn close(&self, build: u64) -> Option<usize> {
         let mut open = locked(&self.gate);
         if *open != Some(build) {
             return None;
         }
         *open = None;
-        Some(self.frames.clear_audio())
+        Some(self.frames.flush_camera())
     }
 
     /// The domain gave `build` up (C10b): closes the gate as `close` does and, under the same lock,
@@ -218,7 +221,7 @@ impl Shared {
         }
         *open = None;
         *locked(&self.given_up) = Some(build);
-        Some(self.frames.clear_audio())
+        Some(self.frames.flush_camera())
     }
 
     /// The domain took `build` back (C3, S2): re-opens its gate when it is the build given up and the
@@ -247,14 +250,14 @@ impl Shared {
     }
 
     /// What a pipeline error of `build` is, decided once, on the posting thread: the open build's
-    /// loss (the gate closes and its audio is flushed, as `close` does), or the first error of the
+    /// loss (the gate closes and its queued media is flushed, as `close` does), or the first error of the
     /// build the domain gave up while it still runs (Owed 108). A retired build's error, and any
     /// later one, is nothing.
     fn error_of(&self, build: u64) -> Option<ErrorOf> {
         let mut open = locked(&self.gate);
         if *open == Some(build) {
             *open = None;
-            self.frames.clear_audio();
+            self.frames.flush_camera();
             return Some(ErrorOf::Loss);
         }
         let mut given_up = locked(&self.given_up);
@@ -722,16 +725,46 @@ impl GstInput {
         // video appsink's next picture closes it (`wire_video`).
         let withheld = Arc::new(Mutex::new(WithheldSpans::new(self.withheld_min)));
         let units = Arc::clone(&withheld);
+        // C4 fix round 3: each frame in and out of the decoder, paired, so a clamped run's frames are
+        // logged with the stamp each was taken in with (`DecoderTrace`).
+        let trace = Arc::new(Mutex::new(DecoderTrace::default()));
+        let taken = Arc::clone(&trace);
         vdec.static_pad("sink")
             .ok_or("avdec_h264 has no sink pad")?
             .add_probe(
                 gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
-                move |_, _| {
-                    locked(&units).on_unit(Instant::now());
+                move |_, info| {
+                    let now = Instant::now();
+                    locked(&units).on_unit(now);
+                    match &info.data {
+                        Some(gst::PadProbeData::Buffer(b)) => {
+                            locked(&taken).on_input(b.pts().map(gst::ClockTime::nseconds), now);
+                        }
+                        Some(gst::PadProbeData::BufferList(l)) => {
+                            for b in l.iter() {
+                                locked(&taken).on_input(b.pts().map(gst::ClockTime::nseconds), now);
+                            }
+                        }
+                        _ => {}
+                    }
                     gst::PadProbeReturn::Ok
                 },
             )
             .ok_or("the decoder's unit probe was refused")?;
+        let given = Arc::clone(&self.shared);
+        vdec.static_pad("src")
+            .ok_or("avdec_h264 has no src pad")?
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                    let line =
+                        locked(&trace).on_output(b.pts().map(gst::ClockTime::nseconds), Instant::now());
+                    if let Some(line) = line {
+                        given.log(&format!("gen={gen}: {line}"));
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or("the decoder's output probe was refused")?;
         // The owner's ruling, 2026-10-19 (Owed 48): a frame with damaged macroblocks is dropped, so
         // after a loss the slot holds the last good picture for a moment instead of airing smears.
         vdec.set_property("output-corrupt", false);
@@ -803,7 +836,7 @@ impl GstInput {
         self.link_demux(&demux, &vqueue, &aqueue, gen);
         let abandoned_at = Arc::new(Mutex::new(None));
         self.wire_video(&vsink, build, gen, Arc::clone(&abandoned_at), withheld);
-        self.wire_audio(&asink, build);
+        self.wire_audio(&asink, build, gen);
         let errored = Arc::new(Mutex::new(None));
         self.sync_handler(&pipeline, build, &errored)?;
         Ok(Live {
@@ -904,7 +937,7 @@ impl GstInput {
                         }
                         return Ok(gst::FlowSuccess::Ok);
                     }
-                    shared.frames.set_camera(sample);
+                    shared.frames.push_camera(gen, sample);
                     shared.last_frame_gen.store(gen, Ordering::SeqCst);
                     if !connected
                         && shared
@@ -928,13 +961,16 @@ impl GstInput {
     }
 
     /// Audio passes the same gate as the video, so a build the domain gave up (`abandon`) is off air
-    /// for its audio too (the C10 confirm pass's m2), and no rule of the domain's is read here.
-    fn wire_audio(&self, sink: &gst_app::AppSink, build: u64) {
+    /// for its audio too (the C10 confirm pass's m2), and no rule of the domain's is read here. It is
+    /// stamped with its media time and generation, so the programme plays it on the camera's playout
+    /// clock with the picture (C4).
+    fn wire_audio(&self, sink: &gst_app::AppSink, build: u64, gen: u64) {
         let shared = Arc::clone(&self.shared);
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |s| {
                     let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let pts = media_time(&sample);
                     let Some(buffer) = sample.buffer() else {
                         return Ok(gst::FlowSuccess::Ok);
                     };
@@ -946,7 +982,8 @@ impl GstInput {
                         shared.gate_dropped.fetch_add(1, Ordering::Relaxed);
                         return Ok(gst::FlowSuccess::Ok);
                     }
-                    shared.frames.push_audio(map.as_slice());
+                    shared.frames.note_audio_segment(&sample);
+                    shared.frames.push_audio_at(gen, pts, map.as_slice());
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -1108,10 +1145,11 @@ impl InputSource for GstInput {
             scrubber.add(&spec.passphrase);
         }
         self.retire_current();
-        // What the retired build left in the ring is its own: emptied, so none of it plays under the
-        // next camera (m1). The gate is shut, so nothing writes the ring until the new build opens
-        // it. `stop` and the drop leave the ring as it is: no camera follows them.
-        self.shared.frames.clear_audio();
+        // What the retired build left in the playout is its own: emptied, its queued frames and its
+        // ring, so none of it plays under the next camera (m1; C4's m5). The gate is shut, so nothing
+        // writes them until the new build opens it. `stop` and the drop leave them as they are: no
+        // camera follows them.
+        self.shared.frames.flush_camera();
         if let Err(why) = check_url(&spec.url) {
             self.shared.log(&format!("gen={gen}: {why}"));
             self.send_now(Event::InputLost {

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use adapters::frame_store::{FrameStore, AUDIO_RING_BYTES};
+use adapters::frame_store::{media_time, FrameStore, AUDIO_RING_BYTES};
 use adapters::gst_output::{
     ENCODED_RING_MAX_ENTRIES, ENCODED_RING_SPAN, OUTPUT_PROGRESS_POLL_MS, OUTPUT_QUEUE_BYTES,
 };
@@ -27,7 +27,7 @@ use crossbeam_channel::Receiver;
 use domain::config::{
     OutputProfile, Thresholds, CF_KEYFRAME_INTERVAL_MAX_MS, CF_KEYFRAME_INTERVAL_MIN_MS,
     ENCODER_SPEED_REALTIME_MIN, FIRST_GOP_CATCH_UP_MAX_MS, FORCED_KEYFRAME_MIN_INTERVAL_MS,
-    OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS, PROGRAMME_GOP_MS,
+    OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS, PLAYOUT_CAP_MS, PLAYOUT_TARGET_MS, PROGRAMME_GOP_MS,
 };
 use domain::ladder::Rung;
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -850,6 +850,118 @@ fn camera_frames_replaced_counts_the_frames_no_tick_showed() {
     assert_eq!(p.camera_missing(), 0, "every camera tick had a frame");
 }
 
+/// `sample` with its buffer stamped `pts_ms` (no segment: the playout reads the raw PTS).
+fn stamped(sample: &gst::Sample, pts_ms: u64) -> gst::Sample {
+    let mut buffer = sample.buffer().expect("a buffer").copy();
+    buffer
+        .get_mut()
+        .expect("a fresh copy")
+        .set_pts(gst::ClockTime::from_mseconds(pts_ms));
+    gst::Sample::builder()
+        .buffer(&buffer)
+        .caps(&sample.caps().expect("caps").to_owned())
+        .build()
+}
+
+/// C4, the seam: `FrameStore::push_camera` (what C10's input calls for every frame, stamped) through
+/// `push` and the encoder. Two stamped frames written together before tick 0, green then red 100 ms
+/// later on the camera's clock, air on the playout's clock: the clock anchors at tick 0 a target
+/// behind the newest (red), so green is due at `PLAYOUT_TARGET_MS − 100` and red at the target, and
+/// the ticks before green have no camera picture yet (the waiting slate's). The newest-frame slot
+/// would have put red on air at tick 0. The ticks after a frame airs with nothing new are repeats.
+#[test]
+fn stamped_camera_frames_air_on_the_playout_clock() {
+    let _s = serial();
+    let dir = Tmp::new("playout");
+    let (mut p, rx, frames, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    let at_ms = |i: u64| i * 1_000 / u64::from(P720.fps);
+    let first_at = |ms: u64| (0..).find(|&i| at_ms(i) >= ms).expect("a tick");
+    let (green_tick, red_tick) = (first_at(PLAYOUT_TARGET_MS - 100), first_at(PLAYOUT_TARGET_MS));
+    assert!(
+        0 < green_tick && green_tick + 1 < red_tick,
+        "the premise: {green_tick}, {red_tick}"
+    );
+    let green = solid(gst_video::VideoFormat::I420, 1_280, 720, [0, 255, 0, 255]);
+    let red = solid(gst_video::VideoFormat::I420, 1_280, 720, [255, 0, 0, 255]);
+    frames.push_camera(1, stamped(&green, 7_000));
+    frames.push_camera(1, stamped(&red, 7_100));
+    let ticks = 20;
+    pace(&mut p, 0..ticks, FrameChoice::Emit);
+    drain_and_wait(&mut p, &rx);
+    let d = decode(&dir.file("a.flv"));
+    assert_eq!(d.frames.len() as u64, ticks);
+    let mut checked = 0;
+    for (i, f) in d.frames.iter().enumerate() {
+        let i = i as u64;
+        if i < green_tick {
+            assert!(
+                !is_green(f.centre) && !is_red(f.centre),
+                "{i}: no camera yet: {:?}",
+                f.centre
+            );
+        } else if i < red_tick {
+            assert!(is_green(f.centre), "{i}: green on air: {:?}", f.centre);
+        } else {
+            assert!(is_red(f.centre), "{i}: red on air: {:?}", f.centre);
+        }
+        checked += 1;
+    }
+    eprintln!("playout frames checked: {checked}");
+    assert_eq!(
+        p.camera_missing(),
+        green_tick,
+        "the ticks before the first frame aired"
+    );
+    let snap = p.stats().snapshot();
+    assert_eq!(snap.camera_frames_replaced, Some(0), "both frames aired");
+    let repeats = (red_tick - green_tick - 1) + (ticks - red_tick - 1);
+    assert_eq!(snap.camera_playout.map(|t| t.repeat_ticks), Some(repeats));
+}
+
+/// C4 fix round 1 (the review's I2 and m3): `media_time` reads a sample's PTS as running time in
+/// its time segment, the time base the input's video and audio appsinks share (a segment starting at
+/// 10 s maps a PTS of 10.5 s to 0.5 s; its base adds on), a sample with no segment (the programme's
+/// tests) its raw PTS, and a PTS before its segment's start (no running time) as unstamped, never as
+/// the raw PTS of another time base. Each expected value is GStreamer's running-time rule
+/// (`base + pts − start`) worked by hand.
+#[test]
+fn media_time_is_the_running_time_in_the_samples_segment() {
+    gst::init().expect("gstreamer");
+    let buffer = |pts_ms: u64| {
+        let mut b = gst::Buffer::new();
+        b.get_mut()
+            .expect("a new buffer")
+            .set_pts(gst::ClockTime::from_mseconds(pts_ms));
+        b
+    };
+    let ms = |m: u64| Some(m * 1_000_000);
+    let mut checked = 0;
+    for (pts, start, base, want) in [
+        (10_500, 10_000, 0, ms(500)),
+        (10_500, 10_000, 2_000, ms(2_500)),
+        (10_000, 10_000, 0, ms(0)),
+        (9_000, 10_000, 0, None),
+    ] {
+        let mut seg = gst::FormattedSegment::<gst::ClockTime>::new();
+        seg.set_start(gst::ClockTime::from_mseconds(start));
+        seg.set_base(gst::ClockTime::from_mseconds(base));
+        let s = gst::Sample::builder().buffer(&buffer(pts)).segment(&seg).build();
+        assert_eq!(
+            media_time(&s),
+            want,
+            "PTS {pts} ms, segment from {start} ms, base {base} ms"
+        );
+        checked += 1;
+    }
+    let raw = gst::Sample::builder().buffer(&buffer(7_000)).build();
+    assert_eq!(media_time(&raw), ms(7_000), "no segment: the raw PTS");
+    let unstamped = gst::Sample::builder().buffer(&gst::Buffer::new()).build();
+    assert_eq!(media_time(&unstamped), None, "no PTS");
+    eprintln!("segments checked: {checked}");
+    assert_eq!(checked, 4);
+}
+
 #[test]
 fn camera_of_a_different_size_is_letterboxed_not_renegotiated() {
     let _s = serial();
@@ -1299,8 +1411,9 @@ fn stats_encoder_speed_tracks_real_time_and_drops_when_starved() {
     assert!(band.contains(&resumed), "resumed {resumed}");
 }
 
+/// The ring's cap is the playout's (C4: `PLAYOUT_CAP_MS`, 500 ms; the plan's 400 ms amended).
 #[test]
-fn audio_ring_is_bounded_at_400ms_and_pads_silence() {
+fn audio_ring_is_bounded_at_the_playout_cap_and_pads_silence() {
     let f = FrameStore::default();
     let second: Vec<u8> = (0..192_000u32).map(|i| (i % 251 + 1) as u8).collect();
     f.push_audio(&second);
@@ -1308,12 +1421,17 @@ fn audio_ring_is_bounded_at_400ms_and_pads_silence() {
     let got = f.take_audio(192_000);
     assert_eq!(got.len(), 192_000);
     let pad = 192_000 - AUDIO_RING_BYTES;
-    assert_eq!(pad, 115_200, "600 ms of 48 kHz stereo S16LE");
-    assert!(got[..pad].iter().all(|&b| b == 0), "the first 600 ms is silence");
+    let cap_bytes = PLAYOUT_CAP_MS as usize * 48 * 4;
+    assert_eq!(
+        pad,
+        192_000 - cap_bytes,
+        "the second less the cap, 48 kHz stereo S16LE"
+    );
+    assert!(got[..pad].iter().all(|&b| b == 0), "the oldest part is silence");
     assert_eq!(
         &got[pad..],
         &second[192_000 - AUDIO_RING_BYTES..],
-        "the newest 400 ms survive"
+        "the newest cap's worth survives"
     );
     assert_eq!(f.audio_level(), 0);
     // An empty ring gives n bytes of padding; a push that is not whole frames is refused.
@@ -3032,8 +3150,9 @@ fn a_refused_layer_push_is_counted_and_logged_once_a_run() {
     );
 }
 
-/// Owed 40's bound: the ring holds 400 ms of audio, so a 1 s gap fills its last 400 ms (12 periods at
-/// 30 fps) and keeps the rest as one hole, never a burst of a whole second of filler.
+/// Owed 40's bound: the ring holds the playout's cap of audio (C4: 500 ms, was 400), so a 1 s gap
+/// fills its last 500 ms (15 periods at 30 fps) and keeps the rest as one hole, never a burst of a
+/// whole second of filler.
 #[test]
 fn a_long_gap_fills_only_the_rings_span_of_audio() {
     let _s = serial();
@@ -3051,13 +3170,17 @@ fn a_long_gap_fills_only_the_rings_span_of_audio() {
         .map(|w| w[1] - w[0])
         .filter(|&dt| dt > 22)
         .collect();
-    // 30 periods missed, 12 filled (`AUDIO_RING_BYTES` over one period): an 18-period hole, 600 ms,
+    // 30 periods missed, 15 filled (`AUDIO_RING_BYTES` over one period): a 15-period hole, 500 ms,
     // seen as one jump of the hole plus one AAC frame.
     let period_ms = 1_000 / u64::from(P720.fps);
     let fill = (AUDIO_RING_BYTES / (48_000 / P720.fps as usize * 4)) as u64;
     let hole_ms = (30 - fill) * 1_000 / u64::from(P720.fps);
     eprintln!("audio frames checked {}, jumps {jumps:?}; filled {fill} periods, hole {hole_ms} ms ({period_ms} ms a period)", d.audio_pts_ms.len());
-    assert_eq!(fill, 12);
+    assert_eq!(
+        fill,
+        PLAYOUT_CAP_MS * u64::from(P720.fps) / 1_000,
+        "the cap's periods"
+    );
     assert_eq!(jumps.len(), 1, "{jumps:?}");
     assert!(
         jumps[0].abs_diff(hole_ms + 21) <= 22,

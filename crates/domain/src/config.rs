@@ -326,6 +326,119 @@ pub const FIRST_GOP_CATCH_UP_MAX_MS: Ms = {
     }
 };
 
+/// C4 (S1, Owed 89; `_FINDINGS.md` F-039): the camera's playout target, the delay the camera's
+/// decoded frames and audio wait behind their own clock before they air. Stg showed 17 to 50 camera
+/// frames replaced per 150-tick beat through real Cloudflare (2026-11-24; the improvement scan's §1),
+/// the newest-frame slot showing Cloudflare's late-then-burst delivery 1:1; F-029 measured the
+/// harness's own mux holding frames one to two periods. The programme plays the frame whose PTS is
+/// due on a clock slaved to the camera's PTS, this long behind the newest arrival when the clock
+/// anchors, so an arrival up to this late still airs on time. The brief's starting value (the
+/// scan's 100 to 200 ms): 4.5 frames at 30 fps. Every camera picture and its audio air this much
+/// later than before, so the overlay's score delay (ADR 0006; web's default was measured in-chain by
+/// F-002 before this queue existed) owes the same (Owed 114).
+pub const PLAYOUT_TARGET_MS: Ms = 150;
+
+/// C4 (S1): the playout's hard cap, the brief's 500 ms. The queue never holds camera frames spanning
+/// more than this (the oldest go first, counted), and the audio ring holds this much
+/// (`adapters::frame_store::AUDIO_RING_BYTES`; the plan's "audio 400 ms", amended by C4). The clock
+/// re-anchors, `PLAYOUT_TARGET_MS` behind the newest arrival, at an arrival more than this ahead of
+/// the clock or behind it (drift: the camera's clock against the tick grid, or a jump in its PTS)
+/// and at the first arrival after a gap longer than `PLAYOUT_REANCHOR_GAP_MS`. A new camera
+/// generation starts a fresh clock and drops what the old one queued.
+pub const PLAYOUT_CAP_MS: Ms = 500;
+
+/// C4 (S1): a gap with no camera media longer than this (programme time between the ticks that saw
+/// an arrival) re-anchors the clock at the next arrival, so a camera that comes back on a new
+/// delivery delay gets the whole target again. The cap: a gap longer than the queue can hold is one
+/// it cannot have smoothed (the brief: "a gap longer than the cap").
+pub const PLAYOUT_REANCHOR_GAP_MS: Ms = PLAYOUT_CAP_MS;
+
+/// The fastest camera source the playout queue is sized for: 60 fps (the C4 brief's fastest source;
+/// the capture app sends 30). With `PLAYOUT_CAP_MS` it bounds the queue's frame count
+/// (`PLAYOUT_MAX_FRAMES`), the backstop for frames whose PTS do not move.
+pub const CAMERA_MAX_FPS: Ms = 60;
+
+/// C4: the most decoded camera frames the playout queue holds: the cap's span at `CAMERA_MAX_FPS`,
+/// both ends included (31). At the programme's own size (the input scales to it, C10), 31 I420 1080p
+/// frames are about 96 MB, inside the plan's 1 GB soft limit (the plan's decoded queue was 1 s).
+pub const PLAYOUT_MAX_FRAMES: usize = (PLAYOUT_CAP_MS * CAMERA_MAX_FPS / 1_000 + 1) as usize;
+
+/// C4: how far the audio's play position may sit from the clock's due time before it is moved to it.
+/// Each period's take is a whole 1 600 samples (48 kHz on the 30 fps grid divides exactly) while the
+/// due time is floored to the sample each tick, so the two differ by a sample or two; 1 ms (48
+/// samples) covers that and is a 150th of the target, so a re-anchor always moves the audio with the
+/// picture. The same slack joins two audio chunks whose stamps differ by rounding.
+pub const PLAYOUT_AUDIO_SLACK_MS: Ms = 1;
+
+/// C4 fix round 1 (the review's C1 and I1): the most the camera's audio stamps may sit from its
+/// video's before the audio is re-based onto the video's (its stamps shifted by the difference,
+/// counted as a re-anchor). The clock anchors on the later-arriving of the two streams,
+/// `PLAYOUT_TARGET_MS` behind it, so the other waits the target plus the skew: past `PLAYOUT_CAP_MS`
+/// less the target it would wait past the cap its queue holds. PR #113's camera-flap leg (CI run
+/// 45575918709) showed the two disagreeing by about 5 s after a camera pause in one generation (one
+/// stream's stamps carried on across the pause while the other's jumped), which a shared stamp space
+/// turned into a queue restart on every other push.
+pub const PLAYOUT_STREAM_SKEW_MAX_MS: Ms = PLAYOUT_CAP_MS - PLAYOUT_TARGET_MS;
+
+/// C4 fix round 1 (the review's C2): a stream whose every arrival is past due for this long
+/// re-anchors the clock (counted). A camera that falls behind the clock by less than the cap (a
+/// delivery-delay step with no catch-up, a camera clock slower than the tick grid, audio reaching the
+/// store after its video) otherwise has every audio chunk dropped late for as long as it stays there,
+/// with nothing to recover it. The target: lateness that outlasts the margin the queue keeps is not
+/// jitter the margin absorbs. A hold is not lateness: no arrival is judged until the release, whose
+/// newest frame is on time.
+pub const PLAYOUT_LATE_REANCHOR_MS: Ms = PLAYOUT_TARGET_MS;
+
+/// C4 fix round 2 (the re-review's n2, a coordinator ruling): a skew re-base is provisional. An
+/// arrival skew (stamps right, one stream late) and a stamp skew (stamps off, both on time) look the
+/// same at the moment, so the re-base may have been wrong; once the audio's stamps agree with the
+/// video's again on the offset it replaced, to within this, it is undone (counted). Half the re-base
+/// threshold, so a skew wandering around the threshold cannot flip it back and forth.
+pub const PLAYOUT_SKEW_REVERT_MS: Ms = PLAYOUT_STREAM_SKEW_MAX_MS / 2;
+
+/// C4 fix round 2 (the re-review's n1, a coordinator ruling): the excess over `PLAYOUT_TARGET_MS`
+/// past which every live stream counts as early. A re-anchor taken while a stream is late (the
+/// lateness rule, a step) anchors on a lagging stamp; when the stream catches up, the picture's delay
+/// stays at the target plus the lag (a 400 ms hold with a slow catch-up read 200 → 400 ms for the
+/// rest of the run), and nothing short of the cap brought it back. Within the target the excess is
+/// the jitter the target exists to absorb (an anchor on an arrival up to the target late leaves at
+/// most that much); past it, it is a ratchet.
+pub const PLAYOUT_EARLY_MARGIN_MS: Ms = PLAYOUT_TARGET_MS;
+
+/// C4 fix round 2: how long every live stream must stay early (`PLAYOUT_EARLY_MARGIN_MS`) before the
+/// clock re-anchors forward to the target (counted; the skipped span airs as unaired frames and late
+/// audio, once). Twice the cap: a catch-up from a backlog the cap bounds, delivered at twice real
+/// time or faster, is over by then, so a catch-up in progress is not cut into several jumps.
+pub const PLAYOUT_EARLY_REANCHOR_MS: Ms = 2 * PLAYOUT_CAP_MS;
+
+/// C4 fix round 4 (the round-3 re-review, CI run 45627090221): how much of the audio after a re-base
+/// the settle skips before it reads the steady interleave. A return's first frames come out of an
+/// empty decoder close behind their audio and then fall back to the steady interleave, and on
+/// camera-flap's clamped returns the placed audio-minus-video gap read 10 to 40 ms high over the
+/// first 20 frames (about 0.6 s at 30 fps) against the rest of the run; the old settle read eight
+/// chunks 170 to 340 ms after the re-base, inside that, and put the whole window's A/V there (max
+/// 57 ms against the 40 ms budget). The cap plus the target (650 ms): what the queue can hold of
+/// the return's backlog, and the clock's own lead.
+pub const PLAYOUT_SETTLE_SKIP_MS: Ms = PLAYOUT_CAP_MS + PLAYOUT_TARGET_MS;
+
+/// C4 fix round 4: how much audio the settle then averages, past `PLAYOUT_SETTLE_SKIP_MS`. The
+/// readings are one a chunk, and a chunk's reading against the newest frame moves with their phase:
+/// the camera's AAC chunks (1 024 samples, 21.3 ms) and its frames (33.3 ms) coincide every 533 ms,
+/// so a mean over less than whole beats carries the beat's ripple (about +-20 ms in a single
+/// reading) into the level. Twice the cap, 1 s: nearly two beats and the re-review's "at least 1 s"
+/// (the ripple left in a mean over 1.875 beats is about 1.3 ms).
+pub const PLAYOUT_SETTLE_MS: Ms = 2 * PLAYOUT_CAP_MS;
+
+/// C4 fix round 5 (the round-4 re-review's Important): the stamps the playout measures a camera's
+/// frame period over, the most recent `PLAYOUT_STEP_WINDOW_MS` of single-frame increments. The decoded
+/// stamps of a stream's start run ~45 ms high and relax over ~37 frames (about 1.2 s at 30 fps; every
+/// run measured, 44 to 48 ms), so a mean over the stream's life carried the transient's short
+/// increments for good (33.18 ms for 33.33) and a clamped window, placed that step apart for the
+/// pause's 147 frames, drifted 22 ms and skipped a frame. Two seconds: past the transient, and
+/// still a hundred increments of mean to take the camera's own jitter out of (30.1 to 34.0 ms at
+/// 30 fps).
+pub const PLAYOUT_STEP_WINDOW_MS: Ms = 2_000;
+
 /// How often C09 reads the output's bytes-sent total (Owed 15, the choice recorded in `_FINDINGS.md`
 /// F-011): 250 ms. The totals prove a new sink Connected (`output_connected_after_ms`, Owed 38), and
 /// their flatness times the egress backstop (`output_egress_flat_ms`, Owed 94), which can see a total
@@ -1207,5 +1320,73 @@ mod tests {
             + u64::from(FRAME_UPLOAD_ATTEMPTS) * FRAME_UPLOAD_TIMEOUT_MS;
         assert_eq!(run, 13_000);
         assert!(run < FRAME_GRAB_MIN_GAP_MS, "{run} ms");
+    }
+
+    // C4 (S1): the brief's numbers, written here: a 150 ms target, a 500 ms cap, the gap that
+    // re-anchors the clock is the cap ("a gap longer than the cap"), and the queue holds a 60 fps
+    // source's cap with both ends (31 frames). The audio's slack is 1 ms.
+    #[test]
+    fn the_playout_numbers_are_the_c4_briefs() {
+        assert_eq!(PLAYOUT_TARGET_MS, 150, "the brief: start at 150 ms");
+        assert_eq!(PLAYOUT_CAP_MS, 500, "the brief: hard cap 500 ms");
+        assert_eq!(PLAYOUT_REANCHOR_GAP_MS, PLAYOUT_CAP_MS);
+        assert_eq!(CAMERA_MAX_FPS, 60);
+        assert_eq!(PLAYOUT_MAX_FRAMES, 31, "500 ms of 60 fps, both ends");
+        assert_eq!(PLAYOUT_AUDIO_SLACK_MS, 1);
+        // Fix round 1: the skew past which the audio is re-based (the cap less the target: 350 ms) and
+        // the lateness that re-anchors (the target).
+        assert_eq!(PLAYOUT_STREAM_SKEW_MAX_MS, 350);
+        assert_eq!(PLAYOUT_LATE_REANCHOR_MS, PLAYOUT_TARGET_MS);
+        // Fix round 2: the excess past which the clock is early (the target), and how long it must
+        // last (twice the cap); the early delay stays under the cap, so the early rule fires before
+        // the cap's.
+        assert_eq!(PLAYOUT_EARLY_MARGIN_MS, PLAYOUT_TARGET_MS);
+        assert_eq!(PLAYOUT_SKEW_REVERT_MS, 175);
+        assert_eq!(PLAYOUT_EARLY_REANCHOR_MS, 1_000);
+        // Fix round 4: the settle skips the return's transient (the cap and the target, 650 ms) and
+        // averages at least a second of audio after it.
+        assert_eq!(PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_CAP_MS + PLAYOUT_TARGET_MS);
+        assert_eq!(PLAYOUT_SETTLE_SKIP_MS, 650);
+        assert_eq!(PLAYOUT_SETTLE_MS, 1_000, "at least a second");
+        assert_eq!(PLAYOUT_STEP_WINDOW_MS, 2_000, "past the start-up transient");
+        const _: () = assert!(PLAYOUT_TARGET_MS + PLAYOUT_EARLY_MARGIN_MS < PLAYOUT_CAP_MS);
+        // Constant against constant: the compiler checks it. The target sits inside the cap with room
+        // for a burst, and the slack is far under the target.
+        const _: () =
+            assert!(PLAYOUT_TARGET_MS < PLAYOUT_CAP_MS && PLAYOUT_AUDIO_SLACK_MS * 100 < PLAYOUT_TARGET_MS);
+    }
+
+    // C4 (S1): the phase machine still reads decode time (the brief: `InputFrame` drives it), so the
+    // queue must be able to air a frame by the time the domain says Live from Waiting or
+    // Reconnecting: those wait for `resume_after_ms` of continuous frames, and the first of them is
+    // due a target (and one tick) after the clock anchors on it. From Frozen it does not wait (the
+    // C4 review's m4): the first fresh frame after a freeze puts the domain Live, while the playout
+    // re-anchors after the gap and holds the new frame a target, so the frozen frame stays on air
+    // under Emit for those ticks, counted as repeats (never a missing camera: it is the frame on
+    // air). The queue drains in a target, inside the freeze, and its cap is under the slate, so a
+    // held camera is frozen by the domain before the queue could hold it back.
+    #[test]
+    fn the_playout_airs_a_frame_before_the_domain_goes_live() {
+        use crate::programme::{Feed, ProgrammePhase, PROGRAMME_TABLE};
+        let t = Thresholds::default();
+        assert!(PLAYOUT_TARGET_MS + TICK_WIDEST_MS < t.resume_after_ms);
+        assert!(PLAYOUT_TARGET_MS < t.frozen_after_ms);
+        assert!(PLAYOUT_CAP_MS < t.slate_after_ms);
+        // The paths into Live this rests on: Waiting and Reconnecting need the continuous run;
+        // Frozen takes a fresh frame (the repeats above, not a missing camera).
+        let into_live: Vec<_> = PROGRAMME_TABLE
+            .iter()
+            .filter(|r| r.2 == ProgrammePhase::Live)
+            .map(|r| (r.0, r.1))
+            .collect();
+        assert_eq!(
+            into_live,
+            [
+                (ProgrammePhase::Waiting, Feed::Continuous),
+                (ProgrammePhase::Frozen, Feed::Fresh),
+                (ProgrammePhase::Frozen, Feed::Continuous),
+                (ProgrammePhase::Reconnecting, Feed::Continuous),
+            ]
+        );
     }
 }
