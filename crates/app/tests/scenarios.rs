@@ -3385,3 +3385,164 @@ fn a_failing_upload_logs_once_and_never_stalls_the_pipeline() {
     assert_eq!(checked, 4);
     drop(handle);
 }
+
+// ---------------------------------------------------------------------------------------------
+// C6 (F-041): the phone republishes after Cloudflare's hold; the picture's time from republish to live
+// ---------------------------------------------------------------------------------------------
+
+/// A connect to Cloudflare's SRT playback, first byte and first decoded frame, as F-032 measured
+/// readers started after the hold: the medians of 425 and 419 readers in `spike/owed108/results`
+/// (the probes and relay runs), 2 460 ms and 3 025 ms after the build.
+const CF_FIRST_BYTE_MS: u64 = 2_460;
+const CF_FIRST_FRAME_MS: u64 = 3_025;
+/// Web's reply to a beat, as modelled here: a scenario constant, not a product number.
+const WEB_REPLY_MS: u64 = 50;
+/// The frames' period at 30 fps, as the driver's own tick grid.
+const FRAME_MS: u64 = 33;
+
+/// What one run of the republish scenario read.
+#[derive(Debug)]
+struct Republish {
+    /// The first tick at or after the republish whose programme phase is Live, less the republish.
+    to_live: u64,
+    /// The beats the driver asked for from the republish to Live.
+    beats: usize,
+    /// The input builds in all.
+    builds: usize,
+}
+
+/// The camera runs 2 s, drops, and Cloudflare serves no reader a byte until the publisher is back at
+/// `republish` (the hold's end passed: a return 45 s after the drop is past F-032's 31.2 s hold, so a
+/// build made after it is served, and a reader attached before the publisher is never served: the
+/// model's worst, no lottery). Web's counter reads 0 until `republish`, 1 from it, on every beat's
+/// reply, through the real driver, supervisor and link: the beat's cadence decides when the relay
+/// learns the phone is back, which is what is measured.
+fn republish_run(t: Thresholds, session: SessionConfig, republish: u64) -> Republish {
+    let mut sim = Sim::new(t.clone(), session);
+    let drop_at = SESSION_AT + 2_000;
+    // (instant, message), delivered in order before the first tick after the instant.
+    let mut pending: Vec<(u64, Inbound)> = Vec::new();
+    // Each served stream: its generation and the instant its first frame is due.
+    let mut streams: Vec<(u64, u64)> = Vec::new();
+    // Gen 1 is the camera that runs until the drop.
+    pending.push((SESSION_AT + 1, ev(Event::InputConnected { gen: 1 })));
+    pending.extend(every(SESSION_AT + 1, drop_at, FRAME_MS, || frame(1)));
+    let mut seen = sim.log.len();
+    let mut live_at = None;
+    let end = republish + 3 * t.input_connect_timeout_ms;
+    while live_at.is_none() {
+        let tick_at = sim.d.next_tick_at();
+        assert!(tick_at < end, "no Live by {end} (republish {republish})");
+        pending.sort_by_key(|e| e.0);
+        while pending.first().is_some_and(|e| e.0 < tick_at) {
+            let (at, msg) = pending.remove(0);
+            sim.step(msg, at.max(sim.now));
+        }
+        // The streams a build made: frames on a 33 ms grid from the first frame's instant.
+        for (gen, first) in streams.iter_mut() {
+            while *first < tick_at {
+                pending.push((*first, frame(*gen)));
+                *first += FRAME_MS;
+            }
+        }
+        sim.tick(tick_at);
+        for call in sim.log.calls_from(seen) {
+            match call {
+                // A beat's reply carries web's counter: 0 until the republish, 1 from it.
+                Call::Control(ControlRequest::Heartbeat(..)) => {
+                    let count = u64::from(tick_at >= republish);
+                    pending.push((tick_at + WEB_REPLY_MS, edge(count)));
+                }
+                // A build made once the publisher is back is served; one before it never is.
+                Call::InputRebuild(gen, _) if gen > 1 && tick_at >= republish => {
+                    pending.push((tick_at + CF_FIRST_BYTE_MS, ev(Event::InputMedia { gen })));
+                    pending.push((tick_at + CF_FIRST_FRAME_MS, ev(Event::InputConnected { gen })));
+                    streams.push((gen, tick_at + CF_FIRST_FRAME_MS));
+                }
+                _ => {}
+            }
+        }
+        seen = sim.log.len();
+        if tick_at >= republish && sim.d.programme_phase() == ProgrammePhase::Live {
+            live_at = Some(tick_at);
+        }
+    }
+    let live = live_at.expect("the loop ends on Live");
+    let beats = sim
+        .times_of(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))))
+        .into_iter()
+        .filter(|&b| b >= republish && b <= live)
+        .count();
+    Republish {
+        to_live: live - republish,
+        beats,
+        builds: sim.log.count(|c| matches!(c, Call::InputRebuild(..))),
+    }
+}
+
+/// The picture's return after a republish past the hold, swept over the beat's phase (the republish at
+/// every 250 ms across one cadence, so the worst phase for each rule is among them): within the
+/// recovery gap, the web reply, the first frame and the return's hold-off, and a tick each side. The
+/// same sweep with the rule off (the window 0: today's cadence) must exceed that budget, or the
+/// scenario could not see the defect. Both profiles. Nothing here is typed from the code under test:
+/// the budget is the thresholds' and the scenario's own constants.
+#[test]
+fn a_republish_after_the_hold_is_live_within_one_recovery_beat_and_a_connect() {
+    let t = th();
+    let tick = 2 * OutputProfile::P720.frame_period_ms().ceil() as u64;
+    let budget =
+        t.input_recovery_beat_gap_ms() + WEB_REPLY_MS + CF_FIRST_FRAME_MS + t.resume_after_ms + 2 * tick;
+    let off = Thresholds {
+        input_recovery_beat_window_ms: 0,
+        ..t.clone()
+    };
+    let drop_at = SESSION_AT + 2_000;
+    let first = drop_at + 45_000;
+    let mut checked = 0;
+    for profile in [OutputProfile::P720, OutputProfile::P1080] {
+        let session = SessionConfig {
+            output: profile,
+            ..session_720p()
+        };
+        let (mut worst_on, mut worst_off) = (0, 0);
+        for k in 0..=(t.heartbeat_interval_ms / 250) {
+            let republish = first + k * 250;
+            let on = republish_run(t.clone(), session.clone(), republish);
+            let was = republish_run(off.clone(), session.clone(), republish);
+            eprintln!(
+                "{}p republish +{}: live after {} ms ({} beats, {} builds); rule off {} ms ({} beats)",
+                profile.height,
+                k * 250,
+                on.to_live,
+                on.beats,
+                on.builds,
+                was.to_live,
+                was.beats
+            );
+            assert!(
+                on.to_live >= CF_FIRST_FRAME_MS + t.resume_after_ms,
+                "live before a served frame: {on:?}"
+            );
+            assert!(on.builds >= 2, "a build after the camera's: {on:?}");
+            worst_on = worst_on.max(on.to_live);
+            worst_off = worst_off.max(was.to_live);
+            checked += 1;
+        }
+        eprintln!(
+            "{}p: worst with the rule {worst_on} ms, without {worst_off} ms, budget {budget} ms",
+            profile.height
+        );
+        assert!(
+            worst_on <= budget,
+            "{}p: {worst_on} ms over the budget {budget}",
+            profile.height
+        );
+        assert!(
+            worst_off > budget,
+            "{}p: the rule off ({worst_off}) fits the budget {budget}: the scenario is blind",
+            profile.height
+        );
+    }
+    eprintln!("republish runs checked: {checked}");
+    assert_eq!(checked, 2 * (t.heartbeat_interval_ms / 250 + 1) as usize);
+}

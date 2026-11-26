@@ -245,7 +245,12 @@ fn the_sweep_reaches_every_camera_phase() {
 /// beat, so no cadence beat comes between them, and the only beats are the boot's and the edges'.
 #[test]
 fn a_slates_entry_and_exit_each_beat_on_their_own_tick() {
-    let th = Thresholds::default();
+    // The edge beat in isolation: C6's recovery beat (a beat a gap once the camera has left Running, the
+    // stall's tick here) is its own rule, held in `recovery_beat.rs`, and is off for this walk.
+    let th = Thresholds {
+        input_recovery_beat_window_ms: 0,
+        ..Thresholds::default()
+    };
     let gap = th.phase_beat_gap_ms();
     let interval = th.heartbeat_interval_ms;
     // Frames from 1 s for 3 s: Live a return's length in, then Frozen and Reconnecting after the

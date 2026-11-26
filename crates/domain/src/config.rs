@@ -75,6 +75,18 @@ pub struct Thresholds {
     /// error fell between the drop + 10 s and the close, and the close came 27.9 to 29.2 s after the
     /// last frame, which leaves 8 s of margin.
     pub input_hold_end_after_ms: Ms,
+    /// C6 (2026-11-26, F-041; the stg session `c02f56a0`'s two slow returns): how long after the camera
+    /// leaves Running the relay beats at `input_recovery_beat_gap_ms` instead of every
+    /// `heartbeat_interval_ms`. Web reaches the relay only in a heartbeat's reply (`phoneLiveEdge`, F-032
+    /// fix (b)), so how soon the relay learns the phone is back is up to a whole beat away (5 s): the
+    /// largest term the relay itself owns in a return after Cloudflare's hold (F-041; the rest is the
+    /// hold and the connect's first frame). The window is one minute: the 11 outages of 15 s or more in
+    /// 30 days of stg beats ended 15 to 70 s after the frozen picture (F-041's query), and the hold's own
+    /// close comes 29.9 to 31.2 s after the drop (F-032, finding 1) with a connect after it. After the
+    /// window the plain cadence returns, so a dead input costs web 60 extra beats an outage, never a beat
+    /// a second for an hour. Zero turns it off. The window's edge is a C6 choice, not a measurement: the
+    /// owner's to move.
+    pub input_recovery_beat_window_ms: Ms,
     /// PDF failure table: "alert if it repeats > 3 times in 5 min" (alert when count EXCEEDS this).
     pub kick_alert_count: usize,
     /// PDF failure table: the "5 min" of "> 3 times in 5 min".
@@ -608,6 +620,15 @@ impl Thresholds {
     pub fn phase_beat_gap_ms(&self) -> Ms {
         self.resume_after_ms
     }
+
+    /// C6, derived: the least time between two beats while the camera is down inside
+    /// `input_recovery_beat_window_ms`. It is the phase beat's gap (`phase_beat_gap_ms`), so web already
+    /// carries "one beat a second at most" from a flapping programme phase (C2, S3) and this adds no
+    /// new rate: a recovery beat is the same worst case, for a bounded time. Pinned by
+    /// `the_recovery_beat_gap_is_the_phase_beat_gap_and_inside_the_cadence`.
+    pub fn input_recovery_beat_gap_ms(&self) -> Ms {
+        self.phase_beat_gap_ms()
+    }
 }
 
 impl Default for Thresholds {
@@ -626,6 +647,7 @@ impl Default for Thresholds {
             input_bytes_fresh_ms: input_srt_latency_ms,
             input_srt_latency_ms,
             input_hold_end_after_ms: 20_000,
+            input_recovery_beat_window_ms: 60_000,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
             output_backoff_base_ms,
@@ -963,6 +985,24 @@ mod tests {
     #[test]
     fn input_srt_latency_is_the_one_f002_measured() {
         assert_eq!(Thresholds::default().input_srt_latency_ms, 1_000);
+    }
+
+    // C6 (F-041), each number from its source, written here: the gap is the phase beat's (C2 S3, "one beat
+    // a second at most", `resume_after_ms`, the PDF's 1 s), so it is not a new rate for web and is shorter
+    // than the cadence; the window outlasts F-032's latest hold close (the drop + 31.18 s, finding 1)
+    // and a whole connect after it, and is short of a beat a second for the length of a session.
+    #[test]
+    fn the_recovery_beat_gap_is_the_phase_beat_gap_and_inside_the_cadence() {
+        let t = Thresholds::default();
+        let f032_latest_close = 31_180;
+        assert_eq!(t.input_recovery_beat_gap_ms(), t.phase_beat_gap_ms());
+        assert_eq!(t.input_recovery_beat_gap_ms(), 1_000, "the PDF's 1 s of frames");
+        assert!(t.input_recovery_beat_gap_ms() < t.heartbeat_interval_ms);
+        assert_eq!(t.input_recovery_beat_window_ms, 60_000, "C6's minute");
+        assert!(t.input_recovery_beat_window_ms > f032_latest_close + t.input_connect_timeout_ms);
+        // At most this many extra beats an outage; a number web can be told.
+        let extra = t.input_recovery_beat_window_ms / t.input_recovery_beat_gap_ms();
+        assert!(extra <= 60, "{extra} beats an outage");
     }
 
     // F-032 (Owed 108 fix (a)), each number from the finding, written here: the gate is 20 s; the
