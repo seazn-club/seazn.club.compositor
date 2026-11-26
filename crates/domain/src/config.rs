@@ -272,7 +272,7 @@ pub const OUTPUT_SINK_TIMEOUT_MS: Ms = 5_000;
 /// recommends "a GOP size of 2 - 4 seconds"; the troubleshooting page words the error as "less than
 /// 2 seconds or greater than 8" and gives no separate limit for LL-HLS. Only a 2023 blog post
 /// (open beta) recommends 1 s, a recommendation, not a documented floor, and the current docs
-/// contradict it. So 2 s is the floor for every input until Cloudflare measures otherwise (F-041).
+/// contradict it. So 2 s is the floor for every input until Cloudflare measures otherwise (F-042).
 ///
 /// **THE one constant for the programme's keyframe spacing** (C7): the programme's GOP
 /// (`PROGRAMME_GOP_MS`) and the forced keyframe's floor (`FORCED_KEYFRAME_MIN_INTERVAL_MS`) both read
@@ -287,7 +287,7 @@ pub const CF_KEYFRAME_INTERVAL_MAX_MS: Ms = 10_000;
 /// second's margin over that floor for two causes that are gone: x264's scene cut (off since F-036,
 /// `scenecut=0`) and Owed 84's forced keyframes (held to `FORCED_KEYFRAME_MIN_INTERVAL_MS`); the
 /// phone's own ±14 ms jitter at 2 s (F-036) is not measured on this encoder, which counts
-/// frames and stamps tick `i` at `i × 10⁹ / fps` ns (F-041 reads the shipped stream's intervals). Cloudflare cuts live HLS segments at
+/// frames and stamps tick `i` at `i × 10⁹ / fps` ns (F-042 reads the shipped stream's intervals). Cloudflare cuts live HLS segments at
 /// keyframes (stg: 3 to 3.33 s segments, TARGETDURATION 4, the viewer about two segments behind), so
 /// a shorter GOP shortens every segment. C09 sets x264enc's `key-int-max` to it in frames
 /// (`OutputProfile::gop_frames`) with x264's scene cut off (`scenecut=0`, which x264 honours and its
