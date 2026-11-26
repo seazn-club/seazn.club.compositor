@@ -11,6 +11,7 @@
 //! | `input_received_fps` | the camera as the relay receives it (C2, S4): the decoded camera frames the input wrote into the programme's camera slot since the last sample (`FrameStore::camera_written`, which counts only an open gate's), over the wall time since it (`BeatRate`); absent until a window has both ends, and absent with no camera reader (`with_camera`) |
 //! | `input_received_kbps` | the bytes out of the camera pull's `srtsrc`, every build's, decoded or not (`ReceivedBytes`), since the last sample, over the wall time since it, × 8 / 1000, rounded (`BeatRate`); absent as above |
 //! | `input_withheld_spans`, `input_queue_overruns` | the camera's losses before the picture (C3, S5; `InputLoss`), process totals as the camera reader reads them, once a sample; absent with no camera reader |
+//! | `input_picture` | the size of the camera's decoded picture (Task E; `InputPicture`): the last size the open build's decoder announced, before the input's scaler fits it into the programme's box, read once a sample; absent with no camera reader (`with_camera`) or while no build has one. The driver keeps it only on a beat whose input is connected |
 //! | `memory()` (not a `Measured` field) | the last sample's `/proc/<pid>/status` read of this process (`VmRSS`, `RssAnon`, `RssFile`, `RssShmem`, `Threads`: the read `mem_mb` already makes) and the CEF child poll's last PSS by kind (`with_cef`); logged by the driver once a minute, never on the wire (the soak's memory split) |
 //! | `measured_latency_ms` | never: it needs SEI (F-003), so it is omitted, never 0 |
 //!
@@ -26,7 +27,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use app::ports::{CefPoll, Measured, MemorySplit, Metrics, ProcStatus};
+use app::ports::{CefPoll, Measured, MemorySplit, Metrics, PictureSize, ProcStatus};
 
 use crate::stats::{BeatRate, Stats};
 
@@ -160,6 +161,9 @@ pub struct CameraTotals {
     pub withheld_spans: u64,
     /// The pre-decoder queue's overruns, every build's (C3, S5; `InputLoss`).
     pub queue_overruns: u64,
+    /// The size of the camera's decoded picture, as the open build's decoder announced it (Task E;
+    /// `InputPicture`); `None` while no build has one.
+    pub picture: Option<PictureSize>,
 }
 
 /// Reads the camera's totals (`with_camera`).
@@ -244,6 +248,8 @@ impl Metrics for ProcMetrics {
         // C3 (S5): totals, not rates: passed on as read, absent with no camera reader.
         let input_withheld_spans = camera.map(|c| c.withheld_spans);
         let input_queue_overruns = camera.map(|c| c.queue_overruns);
+        // Task E: the picture size as read, absent with no camera reader.
+        let input_picture = camera.and_then(|c| c.picture);
         let tree = process_tree(self.root);
         let ticks: BTreeMap<ProcKey, u64> = tree
             .iter()
@@ -289,6 +295,7 @@ impl Metrics for ProcMetrics {
             input_received_kbps,
             input_withheld_spans,
             input_queue_overruns,
+            input_picture,
         }
     }
 

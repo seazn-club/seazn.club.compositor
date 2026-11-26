@@ -90,7 +90,7 @@ use std::time::Duration;
 use domain::cef_health::CefHealth;
 use domain::config::Thresholds;
 use domain::graphics::HideReason;
-use domain::health::ExitDetail;
+use domain::health::{ExitDetail, LinkStatus};
 use domain::input_link::{GiveUpReason, InputState, NudgeView};
 use domain::lifecycle::{ExitReason, Lifecycle};
 use domain::output_link::SwapReason;
@@ -502,7 +502,13 @@ impl Driver {
             }
             Effect::StepDown(r) => p.programme.step_down(r),
             Effect::SendHeartbeat(h) => {
-                let m = p.metrics.sample();
+                let mut m = p.metrics.sample();
+                // Task E: the camera's picture size is the CONNECTED camera's. The adapter keeps the
+                // last size its decoder announced, so a beat sent while the input is connecting or
+                // backed off would carry an old camera's size as if it were there: the link decides.
+                if h.input != LinkStatus::Connected {
+                    m.input_picture = None;
+                }
                 // The playout's totals only grow too; each line writes the beat's rise.
                 let playout = m.camera_playout.map(|t| {
                     let rise = t.since(&self.playout_at_beat);

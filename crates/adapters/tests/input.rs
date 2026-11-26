@@ -20,8 +20,8 @@ use adapters::frame_store::{
 };
 use adapters::gst_input::{GstInput, InputThreads, StartHold};
 use adapters::gst_programme::GstProgramme;
-use adapters::stats::{InputLoss, ReceivedBytes};
-use app::ports::{Inbound, InputBytes, InputSource, InputSpec, ProgrammeOutput, TargetSpec};
+use adapters::stats::{InputLoss, InputPicture, ReceivedBytes};
+use app::ports::{Inbound, InputBytes, InputSource, InputSpec, PictureSize, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::{Receiver, Sender};
 use domain::config::{OutputProfile, Thresholds, PLAYOUT_STREAM_SKEW_MAX_MS};
 use domain::input_link::{BuildFacts, LossReason};
@@ -805,6 +805,77 @@ fn the_received_bytes_count_every_builds_source_bytes() {
     }
     eprintln!("builds checked: {checked}");
     assert_eq!(checked, 2);
+}
+
+/// Task E, the camera's own size: the picture size the decoder announces, recorded into the shared
+/// `InputPicture` (`with_picture`) once a build is connected, is the SENDER's (the listener's own
+/// `Cfg`), never the programme's 1280x720 that `videoconvertscale` letterboxes every frame into. Three
+/// builds on one port, each a different camera (landscape, full HD, portrait); none is the
+/// programme's size. Nothing before a build, and nothing again once the next build starts (it has
+/// announced none yet) or the input stops.
+#[test]
+fn the_cameras_own_picture_size_is_recorded_not_the_programmes() {
+    let _s = serial();
+    let port = free_port();
+    let picture = Arc::new(InputPicture::default());
+    let (fresh, rx, frames, _lines) = input(&P720);
+    let mut input = fresh.with_picture(Arc::clone(&picture));
+    assert_eq!(picture.size(), None, "nothing before a build");
+    let mut checked = 0;
+    for (gen, (w, h)) in [(1u64, (640, 360)), (2, (1920, 1080)), (3, (720, 1280))] {
+        assert_ne!(
+            (w, h),
+            (P720.width, P720.height),
+            "premise: not the programme's size"
+        );
+        let l = Listener::start(port, &cfg(w, h));
+        connect(&mut input, &rx, gen, &spec(port));
+        assert_eq!(
+            picture.size(),
+            Some(PictureSize { width: w, height: h }),
+            "gen {gen}: the camera's size"
+        );
+        // The camera slot holds the programme's box all the while: the size is read before the scaler.
+        assert_programme_shape(&frames, &P720, &format!("gen {gen}"));
+        l.stop();
+        events_until(&rx, LOSS_BUDGET, is_loss);
+        checked += 1;
+    }
+    // The next build has announced none yet: nothing listens, so it never connects.
+    input.rebuild(4, &spec(free_port()));
+    assert_eq!(picture.size(), None, "a new build starts with no size");
+    checked += 1;
+    input.stop();
+    assert_eq!(picture.size(), None, "a stopped input has none");
+    checked += 1;
+    eprintln!("picture sizes checked: {checked}");
+    assert_eq!(checked, 5);
+    finish(input);
+}
+
+/// Task E: a build the domain gave up before its first picture records no size. Its pipeline runs on
+/// and its decoder still announces one (the frames it decodes are dropped at the gate, counted), so
+/// the gate is what keeps the size out.
+#[test]
+fn a_build_given_up_before_its_first_picture_records_no_size() {
+    let _s = serial();
+    let picture = Arc::new(InputPicture::default());
+    let l = Listener::new(&cfg(1_920, 1_080));
+    let (fresh, rx, _frames, _lines) = input(&P720);
+    let mut input = fresh.with_picture(Arc::clone(&picture));
+    rebuild_past_the_handshake(&mut input, 1, &spec(l.port));
+    input.abandon(1);
+    let seen = events_for(&rx, Duration::from_millis(1_500));
+    assert!(
+        connects(&seen).is_empty() && frames_in(&seen) == 0,
+        "premise: given up before its first picture, nothing of it passed: {seen:?}"
+    );
+    assert!(
+        input.gate_dropped() > 0,
+        "premise: the build ran on and decoded, its frames dropped at the gate"
+    );
+    assert_eq!(picture.size(), None, "a gated build records no size");
+    finish(input);
 }
 
 /// Brief test 2 (Review Focus 1: "a different resolution or frame rate after reconnecting"):

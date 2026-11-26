@@ -26,6 +26,15 @@
 //! channel can never hold the camera slot still: a dropped frame is counted, and `InputConnected` and
 //! `InputMedia` are tried again on the next sample and the next buffer.
 //!
+//! **The camera's own size** (Task E). The appsink's caps are the programme's box, whatever the camera
+//! sends, so the size of the picture as the phone makes it is read one step earlier: a probe on the
+//! decoder's src pad takes each caps event (`avdec_h264`'s output, before `videoconvertscale`) and
+//! records its width and height into the shared `InputPicture` (`with_picture`), under the same open
+//! gate as a frame, so a build the domain gave up or retired records nothing. A retire (`rebuild`,
+//! `stop`, the drop) clears it, so a new build starts with none until its own decoder announces one.
+//! A loss or an abandon does not clear it: the beat's driver keeps the size only while the input link
+//! is connected.
+//!
 //! **Error or EOS is decided when the error is posted** (PR #30 review I1). On a peer close `srtsrc`
 //! posts an error and `basesrc` then pushes an EOS, which reaches the video appsink 1–7 ms later. The
 //! bus's sync handler, on the posting thread and before that EOS exists, closes the gate for the
@@ -115,7 +124,7 @@ pub use crate::input_threads::WorkerCounts;
 use crate::input_threads::{role_counts, task_counts};
 use crate::input_threads::{task_pool, TaskRole, BUILDS};
 use crate::redact::{percent_encoded, Scrubber};
-use crate::stats::{InputLoss, ReceivedBytes, WithheldSpans};
+use crate::stats::{InputLoss, InputPicture, ReceivedBytes, WithheldSpans};
 
 /// The queue before the video decoder holds at most `CAMERA_VIDEO_QUEUE_MS` of compressed video and
 /// then BLOCKS the source, never drops (C3, S5 item 2; the plan's "All leaky" amended 2026-11-24): a
@@ -339,6 +348,16 @@ fn srt_connected(src: &gst::Element) -> bool {
         .is_some_and(|s| s.has_field("rtt-ms"))
 }
 
+/// The width and height a caps names, 0 for a side it does not (a refused size to `InputPicture`).
+fn caps_size(caps: &gst::CapsRef) -> (i32, i32) {
+    let side = |name| {
+        caps.structure(0)
+            .and_then(|s| s.get::<i32>(name).ok())
+            .unwrap_or(0)
+    };
+    (side("width"), side("height"))
+}
+
 /// The live `InputSource` (C10).
 pub struct GstInput {
     shared: Arc<Shared>,
@@ -357,6 +376,9 @@ pub struct GstInput {
     received: Arc<ReceivedBytes>,
     /// The camera's losses before the picture (C3, S5; `with_loss_counts`).
     loss: Arc<InputLoss>,
+    /// The size of the camera's decoded picture, as the open build's decoder announced it (Task E;
+    /// `with_picture`).
+    picture: Arc<InputPicture>,
     /// A withheld span's least length: the programme's freeze (`Thresholds::frozen_after_ms`).
     withheld_min: Duration,
 }
@@ -420,6 +442,7 @@ impl GstInput {
             events_dropped: 0,
             received: Arc::new(ReceivedBytes::default()),
             loss: Arc::new(InputLoss::default()),
+            picture: Arc::new(InputPicture::default()),
             withheld_min: Duration::from_millis(t.frozen_after_ms),
         };
         input.preload();
@@ -437,6 +460,15 @@ impl GstInput {
     /// shared with the metrics (`ProcMetrics::with_camera`). Call it before the first `rebuild`.
     pub fn with_loss_counts(mut self, loss: Arc<InputLoss>) -> Self {
         self.loss = loss;
+        self
+    }
+
+    /// Records the size of the camera's decoded picture into `picture` (Task E), shared with the metrics
+    /// (`ProcMetrics::with_camera`): what the open build's decoder announced, before the scaler fits it
+    /// into the programme's box, and nothing once the build is retired. Call it before the first
+    /// `rebuild`.
+    pub fn with_picture(mut self, picture: Arc<InputPicture>) -> Self {
+        self.picture = picture;
         self
     }
 
@@ -646,6 +678,9 @@ impl GstInput {
     /// Closes the gate and tells the current build's thread to tear its pipeline down. Returns at once.
     fn retire_current(&mut self) {
         self.shared.shut();
+        // After the gate: a caps event of the retired build finds it shut and records nothing, so
+        // this forgets the size for good (Task E).
+        self.picture.clear();
         if let Some(live) = self.current.take() {
             if live.running {
                 // Counted before the flag is set: the build's thread counts down once it sees it.
@@ -765,6 +800,26 @@ impl GstInput {
                 gst::PadProbeReturn::Ok
             })
             .ok_or("the decoder's output probe was refused")?;
+        // Task E: the size the decoder announces, before `videoconvertscale` fits the picture into the
+        // programme's box (the appsink's own caps are the programme's, whatever the camera sends). One
+        // caps event opens the stream and another follows each change (a phone turned over, a
+        // transcode change). Recorded under the build's open gate, as a frame is, so a build the
+        // domain gave up or retired never writes it; the gate is held across the write, so a retire's
+        // shut-then-clear cannot fall between the check and the store.
+        let (picture, open) = (Arc::clone(&self.picture), Arc::clone(&self.shared));
+        vdec.static_pad("src")
+            .ok_or("avdec_h264 has no src pad")?
+            .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                if let Some(gst::EventView::Caps(caps)) = info.event().map(|e| e.view()) {
+                    let gate = locked(&open.gate);
+                    if *gate == Some(build) {
+                        let (w, h) = caps_size(caps.caps());
+                        picture.set(w, h);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or("the decoder's caps probe was refused")?;
         // The owner's ruling, 2026-10-19 (Owed 48): a frame with damaged macroblocks is dropped, so
         // after a loss the slot holds the last good picture for a moment instead of airing smears.
         vdec.set_property("output-corrupt", false);

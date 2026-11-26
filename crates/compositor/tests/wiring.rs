@@ -801,6 +801,42 @@ fn the_sponsor_airings_follow_relay_airings_and_say_so() {
     assert_eq!(checked, 3);
 }
 
+/// Task E, the seam between the input and the metrics: the totals the camera hands the sampler carry
+/// the picture size the input recorded through the handle `with_picture` takes, as the input writes it
+/// (a new size replaces the old, a refused one and a clear leave none), and none before one. The sizes
+/// are a camera's own, in both orientations, and neither is the programme's.
+#[test]
+fn the_cameras_totals_carry_the_picture_size_the_input_recorded() {
+    use app::ports::PictureSize;
+    use compositor::wiring::Camera;
+    let camera = Camera::new(FrameStore::default());
+    let handle = camera.picture();
+    assert_eq!(
+        camera.totals().picture,
+        None,
+        "nothing before a build recorded one"
+    );
+    let size = |width, height| Some(PictureSize { width, height });
+    let mut checked = 0;
+    for (w, h) in [(1_920, 1_080), (720, 1_280), (640, 360)] {
+        assert!(handle.set(w, h));
+        assert_eq!(camera.totals().picture, size(w as u32, h as u32), "{w}x{h}");
+        checked += 1;
+    }
+    assert!(!handle.set(0, 720), "a refused size");
+    assert_eq!(camera.totals().picture, None, "a refused size leaves none");
+    assert!(handle.set(1_280, 800));
+    handle.clear();
+    assert_eq!(camera.totals().picture, None, "a clear leaves none");
+    // The handle is the camera's own: a second one reads the same size.
+    assert!(camera.picture().set(800, 600));
+    assert_eq!(handle.size(), size(800, 600));
+    assert_eq!(camera.totals().picture, size(800, 600));
+    checked += 4;
+    eprintln!("picture totals checked: {checked}");
+    assert_eq!(checked, 7);
+}
+
 /// C2 (S4): the beats' camera keys follow `RELAY_INPUT_BEAT` (off unless `1`), and the start says
 /// which. `RELAY_AIRINGS` does not turn them on.
 #[test]

@@ -244,6 +244,18 @@ pub struct Measured {
     /// The times the queue before the camera's decoder was full and blocked the source, this process
     /// (C3, S5 item 1): `inputQueueOverruns`, as above.
     pub input_queue_overruns: Option<u64>,
+    /// The size of the camera's decoded picture, as its decoder makes it and before the input's scaler
+    /// fits it into the programme's (Task E: `inputWidth` and `inputHeight`, under `RELAY_INPUT_BEAT`).
+    /// The adapter reports the last size its open build's decoder announced; the DRIVER keeps it only
+    /// on a beat whose input link is connected, so a camera that is not there reports no size.
+    pub input_picture: Option<PictureSize>,
+}
+
+/// A picture's size in pixels. The two sides go together or not at all, so they are one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PictureSize {
+    pub width: u32,
+    pub height: u32,
 }
 
 /// The camera's playout over the session (C4, S1, Owed 89; the adapters' `playout.rs`), counted on
