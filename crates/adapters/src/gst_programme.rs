@@ -394,6 +394,12 @@ impl GstProgramme {
         self.shared.ring.len()
     }
 
+    /// Test hook: the entries the encoded ring dropped for its span or count, (video, audio).
+    #[cfg(feature = "test-hooks")]
+    pub fn ring_pruned(&self) -> (u64, u64) {
+        self.shared.ring.pruned()
+    }
+
     /// Test hook: the bytes queued in the current output's video and audio appsrcs.
     #[cfg(feature = "test-hooks")]
     pub fn output_queued_bytes(&self) -> Option<(u64, u64)> {

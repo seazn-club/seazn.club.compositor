@@ -153,6 +153,9 @@ struct RingState {
     /// keyframe as the output sees it, `X264_DELAY_MS` behind the one the encoder made last
     /// (`own_key_in_flight`).
     newest_key: Option<gst::ClockTime>,
+    /// The entries the ring dropped for its span or its count, per track (the test hooks read it).
+    #[cfg(feature = "test-hooks")]
+    pruned: Encoded,
 }
 
 /// The programme → output hand-off: bounded by span and by count, dropping the oldest.
@@ -186,7 +189,19 @@ impl EncodedRing {
             if !(over_count || over_span) {
                 break;
             }
-            r.entries.pop_front();
+            let gone = r.entries.pop_front();
+            #[cfg(feature = "test-hooks")]
+            {
+                if let Some(gone) = gone {
+                    if gone.video {
+                        r.pruned.video += 1;
+                    } else {
+                        r.pruned.audio += 1;
+                    }
+                }
+            }
+            #[cfg(not(feature = "test-hooks"))]
+            drop(gone);
         }
         drop(r);
         self.wake.notify_all();
@@ -201,6 +216,13 @@ impl EncodedRing {
     #[cfg(feature = "test-hooks")]
     pub(crate) fn len(&self) -> usize {
         locked(&self.state).entries.len()
+    }
+
+    /// The entries dropped for the ring's span or count so far, (video, audio) (the test hooks read it).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn pruned(&self) -> (u64, u64) {
+        let r = locked(&self.state);
+        (r.pruned.video, r.pruned.audio)
     }
 
     /// Drops the oldest entries as an overflowing ring does, up to the first video entry that is
