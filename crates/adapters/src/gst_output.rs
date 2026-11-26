@@ -1518,7 +1518,6 @@ mod tests {
         let mut asked_at_the_shipped_gop = 0u64;
         let shipped = domain::config::OutputProfile::P1080.gop_frames();
         for gop in [shipped, 90, 30] {
-            let gop = u32::try_from(gop).expect("frames");
             for since in 0..u64::from(gop) {
                 let lands_at = (since + delay).max(floor);
                 let want = lands_at < u64::from(gop);
