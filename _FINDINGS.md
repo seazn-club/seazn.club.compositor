@@ -3770,3 +3770,32 @@ encoder; 60 fps; a 3 h soak of any leg.
 **Teardown.** No Machines, no secrets, no Cloudflare or Bunny settings touched. Cancelled `soak.yml` run
 45681503668 (L2, it would have failed the same push). Runs and artifacts: `encoder-tune` 45687294402;
 `harness` 45681521215 (L2), 45681526242 (L4).
+
+### F-040, Phase B amendment (2026-11-26): what was built, and what the Fly legs read
+
+**Fly cost legs (performance-6x, p95 cores, C:snow / D:snow; run-to-run noise about ±0.6 to 1.0 core):**
+L1 4.582 / 3.640 (soak 45705376336), L2 4.013 / 3.458 (45711235914), L5 3.593 / 4.245 (45716773582). Owner,
+2026-11-25: size rule p95 ≤ 85 % of cores (5.1 of 6), a warning above 80 %, "Up to 80 - 85 % is fine"; L2 is
+the chosen leg. This closes Owed (1) for L1, L2, L5 (L3 and L4 were not run: not needed once L2 was chosen).
+
+**Built (PR #114).** L2 plus X1's `sync-lookahead=0` (770 ms against 801 ms, same VMAF), `threads=9` pinned so the
+delay does not follow the host's core count; `nal-hrd=cbr:filler=1` as today (L5 not adopted); no B-frames (they
+break the output's DTS rebase). Delay model, all in `config.rs`: `X264_DELAY_FRAMES` = look-ahead 15 + threads 9
+= 24, `X264_DELAY_MS` 800 (the measured 23 and 24 frames fit it).
+
+**The floor.** GstVideoEncoder checks a force-key request on the way in and notes the last key on the way out,
+so with a delay an unseen natural key lets a request through and cuts a GOP of 100 or 500 ms (F-040: 4 of 14
+under 2 s). No encoder property cures it. Fixed at the adapter: `gst_output::own_key_in_flight` (the last key
+the ring took plus `PROGRAMME_GOP_MS`, due after the newest video and within `X264_DELAY_MS` of it) and
+`ask_key` asks nothing then; that key serves the swap. Re-evaluated at every ring entry.
+
+**Budgets, derived.** `FORCED_KEYFRAME_ARRIVAL_MS` = floor 2200 + delay 800 = 3000; `OUTPUT_GAP_BUDGET_MS`
+15000 + 3000 = 18000 (was 17200); harness `BUDGET_OUTPUT_RECONNECT_MS` 5000 + 3000 = 8000 (was 7200);
+`output_egress_flat_ms` 9000 unmoved. `FIRST_GOP_CATCH_UP_MAX_MS` stays 1000: the delay is in both the backlog and
+the head outage, so half the floor is still the equal point. New assert: it plus the delay fits the encoded
+ring's 2 s, since the audio encoder (no delay) runs ahead of the video by the delay.
+
+**Owed.** (1) The CI results of PR #114 (adapters and the programme tests compile and run on CI only). (2) The
+cost legs on the PR head (C:snow, D:snow, performance-6x), p95 ≤ 5.1. (3) A Cloudflare stg run of High profile
+and look-ahead ingest, and the camera A/V offset with the 0.8 s video delay (Phase A Owed 3 and 4). (4) The
+80 % warning has no mechanism in `cost.jq` (pass or fail); not built.
