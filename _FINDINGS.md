@@ -3866,34 +3866,43 @@ beats at the gap all session: the bound there is the gap floor (never faster tha
 hour of flapping in `recovery_beat.rs`), which is the rate web's samples cap is already priced at (a beat a second
 for the 3 h hard cap), not a new one.
 
-**What it improves, and what it does not (PR #115 review, I1 and I3).** Measured through the real driver,
+**What it improves, and what it does not (PR #115 review, I1, I3 and N1).** Measured through the real driver,
 supervisor and link (`app/tests/scenarios.rs`), Cloudflare MODELLED at F-032's medians (a build made once the
 publisher is servable is served: first byte 2 460 ms, first frame 3 025 ms; one made earlier never is), the first
 edge swept over a beat's phase in 250 ms steps, 720p and 1080p (42 runs: 21 phases of one deterministic
 Cloudflare, not 42 samples of it). The counter is raised at the instant the plan says; web's webhook delivery,
 the phone's own beat and the handler's round trips are NOT in the numbers, only a 50 ms reply. Read them as
-design numbers, not as a stg result (Owed 129):
+design numbers, not as a stg result (Owed 129). The control is TODAY: the relay as it was before C6 (the 5 s
+cadence, the nudge's one discard an outage: `window 0, discards 1`), worst case over the phases:
 
-| Return | Rule off (today) | Rule on | Changed? |
+| Return | Today (worst) | After C6 (worst) | Phases later than today |
 |---|---|---|---|
-| Past the hold, one edge (`a_republish_after_the_hold_...`) | 4.1 to 8.9 s after the publisher is servable, worst 8.9 s | 4.1 to 4.9 s, worst 4.9 s (budget 5.2 s, derived) | **Yes: up to 4 s, the beat grid** |
-| Inside the hold, edge at drop + 10 s, close at + 31 s (`a_return_inside_the_hold_...`) | 5.07 s after the close, every phase | 5.07 s, every phase; builds equal | **No. Hold-bound, as case B was** |
-| Flapping, three edges 2 s apart (`a_flapping_publisher_...`) | 4.1 to 12.9 s, mean 9.5 s | 9.2 to 9.9 s, mean 9.5 s | **Worst 3 s better; later in 10 of 42 phases; mean 55 ms later; builds 6 or 7 against 7** |
+| Past the hold, one rise | 8.9 s | 4.9 s (budget 5.2 s, derived) | 0 of 42 |
+| Inside the hold, rise at drop + 10 s, close at + 31 s | 5.07 s after the close | 5.07 s | 0 of 42: **unchanged, hold-bound** |
+| Two rises 1.1 s apart, PHONE first (servable from the second) | 13.07 s | 5.03 s | 0 of 42 |
+| Two rises 1.1 s apart, CLOUDFLARE first (servable from the first) | 8.88 s | 6.13 s | 10 of 42 (the re-armed discard throws away a build that was about to be served; one more build) |
+| Flapping, three rises 2 s apart | 12.92 s | 4.88 s | 0 of 42 |
 
-So the 26 s stg case (a return inside the hold) is not improved, and the headline 8.9 to 4.9 s is the post-hold
+The 26 s stg case (a return inside the hold) is not improved, and the headline 8.9 to 4.9 s is the post-hold
 class only (5 of the 11 long outages in F-041's 30 days). The rule never makes the hold shorter.
 
-**The nudge's discard and the flapping row, plainly.** The discard of a connect with no byte is once an outage
-(Owed 108, owner-ruled) and a nudge acts at the first reply that carries a rise. With a beat a second, the FIRST
-edge is therefore sent alone, its discard lands on a build made before the publisher is servable, and the later
-edges (spent discard) wait for that connect's 9 s timeout. Today's 5 s grid coalesces edges 2 s apart into one
-nudge in about a fifth of the phases, which is lucky (4.1 to 4.9 s), and in the rest sends the first edge alone
-too (up to 12.9 s, because its reply lands later in the hold). So yes, spending the discard on the first edge
-loses something against today's lucky phases (the 10 of 42), and wins against the unlucky ones; the rule trades a
-lottery for a constant. Rebuilds are bounded by the counter, not by the back-off: each rise latches one nudge and
-one nudge is one build, so at most one extra build an edge (web raises the counter twice for one return by
-design). Re-arming the discard on each rise would fix the flapping row but changes the owner-ruled link rule for
-rule-off sessions too: left, and named (Owed 130).
+**Why each rise now brings its own discard (N1, Owed 130 closed here).** The first round kept Owed 108's one
+discard an outage. With a beat a second the FIRST rise is then sent alone, and if it lands before the publisher is
+servable (the phone's beat before Cloudflare's `connected`: stg `c02f56a0`'s RTMPS return had the phone first by
+1.1 s) the discard is spent on a build Cloudflare cannot serve, and the second rise waits out the 9 s connect
+timeout. Measured on that code: phone first, later than today in 32 of 42 phases and worst 12.8 s against 13.1 s;
+flapping, later in 10 of 42. So `InputLink::on_phone_live_edge` re-arms the discard on every rise, capped by
+`input_nudge_discards_per_outage` (3: the counter's two writers, Cloudflare's `connected` and the phone's
+`publishing` beat, and one flap). Web raises the counter on the phone's own beat reporting `publishing` after a
+not-live beat (`phone-live.ts` `stepPhoneLive`), not on the phone's log line, so the phone-first gap on stg is
+the beat's, not the log's: which order lands is open (Owed 129 measures it). Both are in the table.
+
+**The build bound under re-arming.** Each rise latches ONE nudge (several rises in one reply are one), one nudge is
+one build, and discards are capped per outage, so an outage costs at most the cap's builds more than today. A web
+that raised the counter on every reply for an hour of a flapping camera (`recovery_beat.rs`): 801 builds against
+today's 401 (200 outages, four builds an outage against two), under both the bound of today's plus the cap an
+outage and the structural one (a nudge's build is a reply apart, a gap; the schedule's a base wait). Per session
+that is a flat 1 per gap at the very worst, against a web that cannot do it.
 
 **What C6 does not change, and why.**
 

@@ -91,6 +91,14 @@ pub struct Thresholds {
     /// it off. The window's edge is a C6 choice, not a measurement: the
     /// owner's to move.
     pub input_recovery_beat_window_ms: Ms,
+    /// C6 (2026-11-26, F-041, Owed 130; the PR #115 re-review's N1): how many connects with no byte the
+    /// phone-live nudge may discard in one outage, one for each rise of web's counter. Three: web raises
+    /// the counter twice for one return by design (Cloudflare's `connected` and the phone's own
+    /// `publishing` beat, `live-notification.ts`, in either order, 1.1 s apart on stg `c02f56a0`'s RTMPS
+    /// return) and a third for one flap (case A had three Cloudflare `connected`s). Beyond it the rises
+    /// latch and act at the connect timeout as before, so a web that raised the counter every beat
+    /// costs three builds an outage, never one a second. One is Owed 108's once-an-outage rule.
+    pub input_nudge_discards_per_outage: usize,
     /// PDF failure table: "alert if it repeats > 3 times in 5 min" (alert when count EXCEEDS this).
     pub kick_alert_count: usize,
     /// PDF failure table: the "5 min" of "> 3 times in 5 min".
@@ -652,6 +660,7 @@ impl Default for Thresholds {
             input_srt_latency_ms,
             input_hold_end_after_ms: 20_000,
             input_recovery_beat_window_ms: 60_000,
+            input_nudge_discards_per_outage: 3,
             kick_alert_count: 3,
             kick_window_ms: 300_000,
             output_backoff_base_ms,
@@ -1007,6 +1016,18 @@ mod tests {
         // At most this many extra beats an outage; a number web can be told.
         let extra = t.input_recovery_beat_window_ms / t.input_recovery_beat_gap_ms();
         assert!(extra <= 60, "{extra} beats an outage");
+    }
+
+    // C6 (Owed 130): the discards an outage are the rises web makes for one return and one flap: the two
+    // writers of the counter (Cloudflare's `connected`, the phone's `publishing` beat) and one more.
+    #[test]
+    fn the_nudge_discards_cover_two_writers_and_a_flap() {
+        let writers = 2;
+        let flaps = 1;
+        assert_eq!(
+            Thresholds::default().input_nudge_discards_per_outage,
+            writers + flaps
+        );
     }
 
     // F-032 (Owed 108 fix (a)), each number from the finding, written here: the gate is 20 s; the

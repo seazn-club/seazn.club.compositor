@@ -2518,6 +2518,7 @@ mod tests {
             input_srt_latency_ms: 1_181,
             input_hold_end_after_ms: 20_021,
             input_recovery_beat_window_ms: 60_023,
+            input_nudge_discards_per_outage: 5,
             kick_alert_count: 3,
             kick_window_ms: 300_061,
             output_backoff_base_ms: 541,

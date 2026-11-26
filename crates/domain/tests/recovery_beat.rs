@@ -27,6 +27,10 @@ struct Run {
     now: Ms,
     step: Ms,
     beats: Vec<Ms>,
+    /// The instant of every input build.
+    builds: Vec<Ms>,
+    /// An adversarial web: its reply to every beat carries a counter one higher than the last.
+    rising: Option<u64>,
     /// Frames are sent on each tick while this holds, to the generation the link is on.
     camera: bool,
     connected: u64,
@@ -59,6 +63,8 @@ impl Run {
             now: 0,
             step,
             beats: Vec::new(),
+            builds: Vec::new(),
+            rising: None,
             camera: false,
             connected: 0,
         }
@@ -70,6 +76,12 @@ impl Run {
             Effect::SendHeartbeat(_) => Some(self.now),
             _ => None,
         }));
+        self.builds.extend(
+            d.effects
+                .iter()
+                .filter(|fx| matches!(fx, Effect::RebuildInput { .. }))
+                .map(|_| self.now),
+        );
         self.s = d.next;
     }
 
@@ -83,7 +95,12 @@ impl Run {
             }
             self.send(Event::InputFrame { gen });
         }
+        let beats = self.beats.len();
         self.send(Event::Tick);
+        if let Some(count) = self.rising.filter(|_| self.beats.len() > beats) {
+            self.rising = Some(count + 1);
+            self.send(Event::PhoneLiveEdge { count: count + 1 });
+        }
         self.now += self.step;
     }
 
@@ -447,4 +464,60 @@ fn a_flapping_camera_for_an_hour_never_beats_faster_than_the_gap() {
     }
     eprintln!("flapping hour: gaps checked {checked}, outages {outages_total}");
     assert!(checked >= 2_000 && outages_total >= 400);
+}
+
+/// The build bound under re-armed discards (C6, Owed 130, the PR #115 re-review): a web that raises the
+/// counter on EVERY reply, for an hour of a camera that flaps, against today's relay (the 5 s cadence,
+/// one discard an outage). Each outage can cost the cap's discards (`input_nudge_discards_per_outage`,
+/// one build each) more builds than today, and nothing more: the rises beyond the cap latch. Two bounds,
+/// both from the thresholds: the builds are at most today's plus the cap an outage, and, a build being a
+/// nudge's (one a reply, a gap apart) or the schedule's (a base wait apart), at most the hour over each.
+/// Anti-vacuity: the nudge acted (more builds than today's) and the hour held its outages.
+#[test]
+fn a_web_that_raises_the_counter_every_reply_cannot_storm_builds() {
+    let th = t();
+    let hour = 3_600_000;
+    let today = Thresholds {
+        input_recovery_beat_window_ms: 0,
+        input_nudge_discards_per_outage: 1,
+        ..t()
+    };
+    let mut outages_total = 0;
+    for step in [250, 1_000] {
+        let mut counts = Vec::new();
+        for cfg in [th.clone(), today.clone()] {
+            let mut r = Run::booted(step, cfg);
+            r.rising = Some(0);
+            let mut outages = 0;
+            while r.now < hour {
+                r.camera = true;
+                let up_to = r.now + 6_000;
+                r.run_to(up_to);
+                r.camera = false;
+                let to = r.now + 12_000;
+                r.run_to(to);
+                outages += 1;
+            }
+            // A build is a nudge's (one a reply, replies a gap apart) or the schedule's (a back-off of at
+            // least the base wait before it): so at most the hour over each, from the thresholds.
+            let ceiling =
+                (r.now / th.input_recovery_beat_gap_ms() + 1) + (r.now / th.input_backoff_base_ms + 1);
+            assert!(
+                r.builds.len() as u64 <= ceiling,
+                "step {step}: {} builds in an hour, over {ceiling}",
+                r.builds.len()
+            );
+            counts.push(r.builds.len());
+            outages_total = outages;
+        }
+        eprintln!(
+            "step {step}: builds an hour with the rule {}, today {} ({outages_total} outages)",
+            counts[0], counts[1]
+        );
+        assert!(
+            counts[0] > counts[1],
+            "step {step}: the nudge did not act more than today: the test is blind"
+        );
+    }
+    assert!(outages_total >= 150);
 }

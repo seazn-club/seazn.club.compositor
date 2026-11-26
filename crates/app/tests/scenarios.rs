@@ -2992,10 +2992,10 @@ fn a_nudge_in_backoff_logs_its_rebuild_once_just_before_it() {
 
 /// A nudge on a connect with no byte yet, through the real driver, over two outages: the first
 /// discards it, and its line names the discarded generation between that abandon and the rebuild; a
-/// second edge in the same outage finds the discard spent, is held (said once), and acts at the
-/// connect's timeout; the next outage, after a Running, gets its own discard and its own line.
+/// second rise in the same outage brings its own discard (C6, Owed 130: it was spent until the connect
+/// timeout, once an outage) and its own line; the next outage, after a Running, gets its own too.
 #[test]
-fn a_nudge_on_a_connect_with_no_byte_logs_the_discard_once_an_outage() {
+fn a_nudge_on_a_connect_with_no_byte_logs_each_rises_discard() {
     let t = th();
     let mut sim = Sim::new(t.clone(), session_720p());
     let step = OutputProfile::P720.frame_period_ms().round() as u64;
@@ -3032,14 +3032,12 @@ fn a_nudge_on_a_connect_with_no_byte_logs_the_discard_once_an_outage() {
             "input give up gen=2 reason=phone_live_discard".to_owned()
         ]
     );
-    // Outage 1, edge 2: the discard is spent, so the nudge waits for gen 3's connect timeout.
+    // Outage 1, edge 2: the rise re-arms the discard, so gen 3 is discarded and gen 4 built at once.
     sim.drive(r3 + 101, replies(r3 + 100, r3 + 101, 2));
-    let r4 = sim.tick_until(r3 + t.input_connect_timeout_ms + 1_000, rebuilt(4));
-    assert_eq!(
-        sim.times_of(abandoned(3)),
-        vec![sim.first_tick_at_or_after(r3 + t.input_connect_timeout_ms)]
-    );
-    // Gen 4 runs (the discard re-arms), then outage 2: gen 5 has no byte and edge 3 discards it.
+    let r4 = sim.tick_until(r3 + 1_000, rebuilt(4));
+    assert_eq!(r4, sim.first_tick_at_or_after(r3 + 100 + 1));
+    assert_eq!(sim.times_of(abandoned(3)), vec![r4]);
+    // Gen 4 runs, then outage 2: gen 5 has no byte and edge 3 discards it.
     let lose2 = r4 + 1_000;
     let mut events = vec![(r4 + 1, ev(Event::InputConnected { gen: 4 }))];
     events.extend(every(r4 + 1, lose2, step, || frame(4)));
@@ -3066,8 +3064,7 @@ fn a_nudge_on_a_connect_with_no_byte_logs_the_discard_once_an_outage() {
             "phone live edge from=0 to=1 nudge=latched",
             "phone live nudge rebuild gen=3 discarded=2",
             "phone live edge from=1 to=2 nudge=latched",
-            "phone live nudge held gen=3 input=connecting media=false discard=spent",
-            "phone live nudge rebuild gen=4 discarded=-",
+            "phone live nudge rebuild gen=4 discarded=3",
             "phone live edge from=2 to=3 nudge=latched",
             "phone live nudge rebuild gen=6 discarded=5",
         ]
@@ -3514,10 +3511,13 @@ fn plan_run(t: Thresholds, session: SessionConfig, plan: &Plan) -> Republish {
     }
 }
 
-/// The scenario's thresholds with the recovery rule off: today's cadence, the control.
-fn rule_off(t: &Thresholds) -> Thresholds {
+/// TODAY: the scenario's thresholds as the relay was before C6, the control. No recovery beats (the
+/// window 0: the 5 s cadence) and the nudge's one discard an outage (Owed 108: a cap of one), so each
+/// number is measured against the behaviour the relay had, not against a half of the new rule.
+fn today(t: &Thresholds) -> Thresholds {
     Thresholds {
         input_recovery_beat_window_ms: 0,
+        input_nudge_discards_per_outage: 1,
         ..t.clone()
     }
 }
@@ -3525,7 +3525,7 @@ fn rule_off(t: &Thresholds) -> Thresholds {
 /// A plan swept over the beat's phase (the first edge at every 250 ms across one cadence, so the worst
 /// phase for each rule is among them), both profiles, the rule on and off: each run's result, in order.
 fn sweep(t: &Thresholds, shape: impl Fn(u64) -> Plan) -> Vec<(u64, Republish, Republish)> {
-    let off = rule_off(t);
+    let off = today(t);
     let mut out = Vec::new();
     for profile in [OutputProfile::P720, OutputProfile::P1080] {
         let session = SessionConfig {
@@ -3552,7 +3552,7 @@ fn worst(runs: &[(u64, Republish, Republish)]) -> (u64, u64) {
 /// The picture's return after the phone is servable past the hold (45 s after the drop, F-032's hold is
 /// 31.2 s at most): within one recovery beat and a connect. Modelled: one deterministic Cloudflare at
 /// F-032's medians, the counter raised at the instant of the edge (the webhook's and handler's latency
-/// are NOT here), swept over the beat's phase. The same sweep with the rule off (the window 0: today's
+/// are NOT here), swept over the beat's phase. The same sweep as today (the window 0: today's
 /// cadence) must exceed the budget, or the scenario could not see the defect. The budget is from the
 /// thresholds and the scenario's own constants.
 #[test]
@@ -3569,7 +3569,7 @@ fn a_republish_after_the_hold_is_live_within_one_recovery_beat_and_a_connect() {
     });
     for (k, on, was) in &runs {
         eprintln!(
-            "post-hold, edge +{k}: live after {} ms ({} beats, {} builds); rule off {} ms ({} beats, {} builds)",
+            "post-hold, edge +{k}: live after {} ms ({} beats, {} builds); today {} ms ({} beats, {} builds)",
             on.to_live, on.beats, on.builds, was.to_live, was.beats, was.builds
         );
         assert!(
@@ -3586,7 +3586,7 @@ fn a_republish_after_the_hold_is_live_within_one_recovery_beat_and_a_connect() {
     assert!(on <= budget, "{on} ms over the budget {budget}");
     assert!(
         off > budget,
-        "the rule off ({off}) fits the budget {budget}: the scenario is blind"
+        "today ({off}) fits the budget {budget}: the scenario is blind"
     );
     assert_eq!(runs.len(), 2 * (t.heartbeat_interval_ms / 250 + 1) as usize);
 }
@@ -3609,7 +3609,7 @@ fn a_return_inside_the_hold_is_hold_bound_and_not_worse() {
     });
     for (k, on, was) in &runs {
         eprintln!(
-            "in-hold, edge +{k}: live {} ms after the close ({} builds); rule off {} ms ({} builds)",
+            "in-hold, edge +{k}: live {} ms after the close ({} builds); today {} ms ({} builds)",
             on.to_live, on.builds, was.to_live, was.builds
         );
         assert!(
@@ -3635,20 +3635,17 @@ fn a_return_inside_the_hold_is_hold_bound_and_not_worse() {
 
 /// A flapping publisher: web raises the counter three times inside one outage (Cloudflare's `connected`,
 /// the phone's `publishing` beat, a re-`connected` after a flap, the shape of stg case A), 2 s apart, and
-/// the publisher is servable only from the last. Measured against today's cadence, over the beat's phase:
+/// the publisher is servable only from the last. Measured against TODAY (the cadence of 5 s and the
+/// nudge's one discard an outage), over the beat's phase:
 ///
-/// - **Builds:** each edge latches ONE nudge and one nudge is one build, so the rule can add at most the
-///   edges' count to today's builds (the back-off's own schedule is unchanged). Observed: 7 against 6 or 7.
-/// - **Latency, honestly:** the discard of a connect with no byte is once an outage (Owed 108, owner-ruled),
-///   and a beat a second sends the FIRST edge alone, so its discard lands on a build made before the
-///   publisher is servable and the later edges wait out the 9 s connect timeout. Today's 5 s grid coalesces
-///   the edges inside a reply, which is lucky in about a fifth of the phases (4.1 to 4.9 s) and unlucky in
-///   the rest (up to 12.9 s). So the rule is NOT never-worse phase by phase here: it is a constant 9.2 to
-///   9.9 s where today is 4.1 to 12.9 s. What holds, and is asserted: its worst is no later than today's
-///   (9.9 against 12.9 s). The mean is a wash (9.5 s against 9.5 s, 55 ms later) and is printed, not
-///   asserted, and the phases it loses (10 of 42) are counted and printed.
+/// - **Builds:** each rise latches ONE nudge and one nudge is one build, so the relay builds at most the
+///   rises' count more than today (the back-off's own schedule is unchanged).
+/// - **Latency:** with each rise bringing its own discard (Owed 130) the last rise, the one that finds the
+///   publisher servable, discards the build made before it and builds the served one, so the worst is no
+///   later than today's. (Before Owed 130 the first rise spent the one discard on an unservable build and
+///   the rest waited out the 9 s connect timeout: later than today in 10 of 42 phases.)
 #[test]
-fn a_flapping_publisher_costs_one_build_an_edge_at_most_and_its_worst_is_not_later() {
+fn a_flapping_publisher_costs_one_build_a_rise_at_most_and_is_not_later() {
     let t = th();
     let drop_at = SESSION_AT + 2_000;
     let base = drop_at + 45_000;
@@ -3657,35 +3654,96 @@ fn a_flapping_publisher_costs_one_build_an_edge_at_most_and_its_worst_is_not_lat
         served_from: base + k + 4_000,
         hold_close: None,
     });
+    let rises = 3;
     let mut later = 0;
     for (k, on, was) in &runs {
         eprintln!(
-            "flap, first edge +{k}: live {} ms ({} builds); rule off {} ms ({} builds)",
+            "flap, first edge +{k}: live {} ms ({} builds); today {} ms ({} builds)",
             on.to_live, on.builds, was.to_live, was.builds
         );
         assert!(
-            on.builds <= was.builds + 3,
-            "more than one build an edge over today: {on:?} against {was:?}"
+            on.builds <= was.builds + rises,
+            "more than one build a rise over today: {on:?} against {was:?}"
         );
         later += usize::from(on.to_live > was.to_live);
     }
     let (worst_on, worst_off) = worst(&runs);
-    let (sum_on, sum_off): (u64, u64) = runs
-        .iter()
-        .fold((0, 0), |a, r| (a.0 + r.1.to_live, a.1 + r.2.to_live));
     eprintln!(
-        "flap: {} runs, later than today in {later}; worst {worst_on} ms against {worst_off}; mean {} against {} ms",
-        runs.len(),
-        sum_on / runs.len() as u64,
-        sum_off / runs.len() as u64
+        "flap: {} runs, later than today in {later}; worst {worst_on} ms against {worst_off}",
+        runs.len()
     );
     assert!(
         worst_on <= worst_off,
         "the rule's worst {worst_on} is later than today's {worst_off}"
     );
-    assert!(
-        later >= 1,
-        "the loss this test names was not seen: the shape is blind"
-    );
     assert_eq!(runs.len(), 2 * (t.heartbeat_interval_ms / 250 + 1) as usize);
+}
+
+/// Two rises for ONE return, in each order web can see them (it raises the counter on the phone's own
+/// `publishing` beat and on Cloudflare's pushed `connected`, `live-notification.ts`), `gap` apart where
+/// `gap` is the phase beat's 1.1 s of the stg evidence (RTMPS return `c02f56a0`: the phone first by
+/// 1.1 s): the publisher is servable from the SECOND rise in the phone-first order and from the FIRST
+/// in the Cloudflare-first one. Returns each run's `(phase, rule on, today)`.
+fn two_rise_sweep(t: &Thresholds, phone_first: bool) -> Vec<(u64, Republish, Republish)> {
+    let drop_at = SESSION_AT + 2_000;
+    let base = drop_at + 45_000;
+    let apart = 1_100;
+    sweep(t, |k| {
+        let at = base + k;
+        if phone_first {
+            // The phone's rise, then Cloudflare's `connected`: servable from the second.
+            Plan {
+                edges: vec![at, at + apart],
+                served_from: at + apart,
+                hold_close: None,
+            }
+        } else {
+            // Cloudflare's `connected` (servable at once), then the phone's beat.
+            Plan {
+                edges: vec![at, at + apart],
+                served_from: at,
+                hold_close: None,
+            }
+        }
+    })
+}
+
+/// One return, two rises, either order: the rule's worst is no later than today's worst, and no more
+/// builds than the rises ask for. Both orders are printed phase by phase against today. The
+/// expected values are the control's (the same plan as today), never typed.
+#[test]
+fn one_return_with_two_rises_is_no_worse_than_today_in_either_order() {
+    let t = th();
+    let mut checked = 0;
+    for phone_first in [true, false] {
+        let order = if phone_first {
+            "phone first"
+        } else {
+            "cloudflare first"
+        };
+        let runs = two_rise_sweep(&t, phone_first);
+        let mut later = 0;
+        for (k, on, was) in &runs {
+            eprintln!(
+                "{order}, +{k}: live {} ms ({} builds); today {} ms ({} builds)",
+                on.to_live, on.builds, was.to_live, was.builds
+            );
+            assert!(
+                on.builds <= was.builds + 2,
+                "{order}: more than a build a rise: {on:?} against {was:?}"
+            );
+            later += usize::from(on.to_live > was.to_live);
+        }
+        let (worst_on, worst_off) = worst(&runs);
+        eprintln!(
+            "{order}: {} runs, later than today in {later}; worst {worst_on} ms against {worst_off}",
+            runs.len()
+        );
+        assert!(
+            worst_on <= worst_off,
+            "{order}: the rule's worst {worst_on} is later than today's {worst_off}"
+        );
+        checked += runs.len();
+    }
+    assert_eq!(checked, 2 * 2 * (t.heartbeat_interval_ms / 250 + 1) as usize);
 }

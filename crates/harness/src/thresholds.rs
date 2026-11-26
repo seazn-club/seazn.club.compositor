@@ -163,6 +163,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         input_srt_latency_ms,
         input_hold_end_after_ms,
         input_recovery_beat_window_ms,
+        input_nudge_discards_per_outage,
         kick_alert_count,
         kick_window_ms,
         output_backoff_base_ms,
@@ -219,6 +220,10 @@ pub fn dump(adapters: AdapterConsts) -> Value {
     put(
         "input_recovery_beat_window_ms",
         json!(input_recovery_beat_window_ms),
+    );
+    put(
+        "input_nudge_discards_per_outage",
+        json!(input_nudge_discards_per_outage),
     );
     put("kick_alert_count", json!(kick_alert_count));
     put("kick_window_ms", json!(kick_window_ms));
