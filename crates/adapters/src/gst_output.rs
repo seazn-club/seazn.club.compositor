@@ -1624,6 +1624,47 @@ mod tests {
         );
     }
 
+    /// The C7 final review's I2: the audio history is bounded like the ring, by count and by span, and
+    /// each bound is read off the history's length after pushing past it (through the real
+    /// `RingState::push_entry`, as the encoders feed it). The bounds come from the ring's own
+    /// declarations (`ENCODED_RING_MAX_ENTRIES`, `ENCODED_RING_SPAN`), and video entries never enter it.
+    #[test]
+    fn the_audio_history_is_bounded_by_count_and_by_span() {
+        let span_ns = ENCODED_RING_SPAN.as_nanos() as u64;
+        let audio = |n: u64, ns: u64| Entry::new(n, false, false, gst::ClockTime::from_nseconds(ns));
+        let mut checked = 0;
+        // Count: more than the cap at one PTS (no span applies); the oldest go, the newest stay.
+        let mut ring = RingState::<u64>::default();
+        let extra = 7;
+        for i in 0..ENCODED_RING_MAX_ENTRIES as u64 + extra {
+            ring.push_entry(audio(i, 0));
+            checked += 1;
+        }
+        assert_eq!(ring.audio_history.len(), ENCODED_RING_MAX_ENTRIES, "count bound");
+        assert_eq!(
+            ring.audio_history.front().map(|e| e.sample),
+            Some(extra),
+            "the oldest entries went"
+        );
+        // Span: an entry exactly a span behind the newest stays, one nanosecond more goes.
+        let mut ring = RingState::<u64>::default();
+        ring.push_entry(audio(0, 0));
+        ring.push_entry(audio(1, span_ns));
+        assert_eq!(ring.audio_history.len(), 2, "a span behind stays");
+        ring.push_entry(audio(2, span_ns + 1));
+        assert_eq!(ring.audio_history.len(), 2, "a span and a ns behind goes");
+        assert_eq!(ring.audio_history.front().map(|e| e.sample), Some(1));
+        ring.push_entry(audio(3, 10 * span_ns));
+        assert_eq!(ring.audio_history.len(), 1, "everything older than a span goes");
+        checked += 5;
+        // Video never enters the history.
+        let mut ring = RingState::<u64>::default();
+        ring.push_entry(Entry::new(0, true, true, gst::ClockTime::from_nseconds(0)));
+        assert_eq!(ring.audio_history.len(), 0, "video is not audio");
+        checked += 1;
+        assert!(checked > 0, "nothing was pushed");
+    }
+
     #[test]
     fn with_no_keyframe_after_the_reconnect_point_nothing_is_sent() {
         let ring: Vec<_> = ring_with_an_old_keyframe()

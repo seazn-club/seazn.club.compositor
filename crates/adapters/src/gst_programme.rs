@@ -1183,10 +1183,28 @@ fn aac_delay() -> gst::ClockTime {
 /// frame with the time of the samples it was fed, but what it emits is those samples one delay
 /// late (its first frames hold the priming), and the container carries no word of it, so every
 /// player puts the sound a delay behind its picture. The frame is stamped a delay earlier, which
-/// puts the sound where it was fed. The stream's first frames, which hold only the priming, stamp
-/// at 0 (the time line starts there).
-fn without_aac_delay(stamp: gst::ClockTime) -> gst::ClockTime {
-    stamp.saturating_sub(aac_delay())
+/// puts the sound where it was fed.
+///
+/// `None` for a frame whose corrected stamp would fall below 0: the stream's first frames hold only
+/// the encoder's priming, not programme audio, so they are dropped (the standard handling of AAC
+/// priming; the C7 final review's I1). Saturating them at 0 stamped the first two frames (0 and
+/// 21.3 ms) both 0, a duplicate stamp into the mux. At 48 kHz that is the frames stamped under
+/// 33.3 ms: the first two (`dropped_priming_frames`).
+fn without_aac_delay(stamp: gst::ClockTime) -> Option<gst::ClockTime> {
+    stamp
+        .nseconds()
+        .checked_sub(aac_delay().nseconds())
+        .map(gst::ClockTime::from_nseconds)
+}
+
+/// An audio entry's PTS and DTS with the encoder's delay taken out, or `None` to drop the frame (a
+/// priming frame: `without_aac_delay`). A DTS that would fall below 0 on a frame that is kept is
+/// dropped from the buffer, the muxer then using its PTS.
+fn corrected_audio_stamps(
+    pts: gst::ClockTime,
+    dts: Option<gst::ClockTime>,
+) -> Option<(gst::ClockTime, Option<gst::ClockTime>)> {
+    Some((without_aac_delay(pts)?, dts.and_then(without_aac_delay)))
 }
 
 /// The encoded `sample` as a ring entry, its PTS and DTS converted to running time through its own
@@ -1200,7 +1218,7 @@ fn running_time_entry(sample: &gst::Sample, video: bool) -> Option<Entry> {
     let (pts, dts) = if video {
         (pts, dts)
     } else {
-        (without_aac_delay(pts), dts.map(without_aac_delay))
+        corrected_audio_stamps(pts, dts)?
     };
     let key = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
     let mut copy = buffer.copy();
@@ -1426,29 +1444,86 @@ impl PinkNoise {
 
 #[cfg(test)]
 mod tests {
-    use super::{without_aac_delay, PinkNoise};
+    use super::{corrected_audio_stamps, without_aac_delay, PinkNoise};
+    use crate::frame_store::AUDIO_RATE;
+    use domain::config::AAC_ENCODER_DELAY_SAMPLES;
     use gstreamer as gst;
 
     // C8 (Owed 122): the delay `voaacenc` adds is the library's declared 1 600 samples (ffmpeg's
     // wrapper of the same library: `#define ENC_DELAY 1600`), 33 333 333 ns at 48 kHz; a frame past
-    // it is stamped that much earlier, one before it stamps at 0 rather than before the time line.
+    // it is stamped that much earlier, and one that would fall before the time line is dropped (the
+    // C7 final review's I1: priming, not programme audio; saturating at 0 stamped two frames 0).
     #[test]
-    fn an_aac_frames_stamp_loses_the_encoders_delay_and_never_goes_below_zero() {
+    fn an_aac_frames_stamp_loses_the_encoders_delay_and_a_priming_frame_is_dropped() {
         // (stamp ns, expected ns): the delay is 1 600 / 48 000 s, 33 333 333 ns whole.
-        let cases: [(u64, u64); 6] = [
-            (1_000_000_000, 966_666_667),
-            (33_333_334, 1),
-            (33_333_333, 0),
-            (33_333_332, 0),
-            (21_333_333, 0),
-            (0, 0),
+        let cases: [(u64, Option<u64>); 6] = [
+            (1_000_000_000, Some(966_666_667)),
+            (33_333_334, Some(1)),
+            (33_333_333, Some(0)),
+            (33_333_332, None),
+            (21_333_333, None),
+            (0, None),
         ];
         for (stamp, want) in cases {
             let got = without_aac_delay(gst::ClockTime::from_nseconds(stamp));
-            assert_eq!(got.nseconds(), want, "a frame stamped {stamp} ns");
+            assert_eq!(
+                got.map(gst::ClockTime::nseconds),
+                want,
+                "a frame stamped {stamp} ns"
+            );
         }
         eprintln!("aac stamps checked: {}", cases.len());
         assert_eq!(cases.len(), 6, "anti-vacuity: six stamps");
+    }
+
+    // The C7 final review's I1: the AAC encoder's frames as it stamps them (1 024 samples each, from
+    // 0), through the rule the programme applies. The first one kept is the first whose corrected
+    // stamp is not below 0, worked out in SAMPLES from the declared delay (1 600) and the frame size
+    // (1 024), not from the rule's own nanosecond arithmetic: frame k holds samples from k x 1 024, so
+    // it is kept when k x 1 024 >= 1 600, i.e. from k = ceil(1 600 / 1 024) = 2. Every stamp that comes
+    // out is then at least 0 and strictly increasing, and exactly `first_kept` frames were dropped.
+    #[test]
+    fn the_first_aac_frames_that_would_stamp_below_zero_are_dropped_and_the_rest_never_repeat() {
+        const AAC_FRAME_SAMPLES: u64 = 1_024;
+        let rate = u64::from(AUDIO_RATE);
+        let first_kept = AAC_ENCODER_DELAY_SAMPLES.div_ceil(AAC_FRAME_SAMPLES);
+        assert_eq!(first_kept, 2, "setup: 1 600 samples span two 1 024-sample frames");
+        let (mut dropped, mut kept) = (0u64, Vec::new());
+        for k in 0..40u64 {
+            let stamp = gst::ClockTime::from_nseconds(k * AAC_FRAME_SAMPLES * 1_000_000_000 / rate);
+            match corrected_audio_stamps(stamp, Some(stamp)) {
+                None => {
+                    assert!(k < first_kept, "frame {k} was dropped past the priming");
+                    dropped += 1;
+                }
+                Some((pts, dts)) => {
+                    assert!(k >= first_kept, "priming frame {k} was kept, stamped {pts:?}");
+                    assert_eq!(dts, Some(pts), "frame {k}: DTS follows PTS");
+                    // The expected stamp, in samples: where the frame's own samples were fed.
+                    let fed = (k * AAC_FRAME_SAMPLES - AAC_ENCODER_DELAY_SAMPLES) * 1_000_000_000 / rate;
+                    assert!(
+                        pts.nseconds().abs_diff(fed) <= 1,
+                        "frame {k}: stamped {} ns, fed at {fed} ns",
+                        pts.nseconds()
+                    );
+                    kept.push(pts.nseconds());
+                }
+            }
+        }
+        assert_eq!(dropped, first_kept, "frames dropped");
+        assert_eq!(kept.len() as u64, 40 - first_kept, "frames kept");
+        assert!(
+            kept.windows(2).all(|w| w[1] > w[0]),
+            "a stamp repeats or runs backwards: {kept:?}"
+        );
+        // A kept frame whose DTS alone would fall below 0 keeps its PTS and loses the DTS.
+        let (pts, dts) = corrected_audio_stamps(
+            gst::ClockTime::from_nseconds(40_000_000),
+            Some(gst::ClockTime::from_nseconds(10_000_000)),
+        )
+        .expect("a frame past the delay");
+        assert!(pts.nseconds() > 0 && dts.is_none());
+        eprintln!("aac priming frames dropped {dropped}, kept {}", kept.len());
     }
 
     // F-004: the filler is ~−60 dBFS noise, never digital zero. Expected values from the finding, not

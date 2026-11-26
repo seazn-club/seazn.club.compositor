@@ -3991,7 +3991,7 @@ head: **5.576** (run 45825969361, avg 4.926, max 5.89, compositor 4.754 of it) a
 **3.731 (PASS)**. The control, `main` (3 s, with #115), D:snow, run 45832881352: **4.737 (PASS)**. F-040's L2 reads of the
 3 s encoder were C 4.013 and D 3.458 on another day (noise ±0.6 to 1.0 core). Two D reads over the rule against one
 under it. **The owner accepted the overshoot for the stg trial on 2026-11-26** ("ok let's go all in a one shot"): Owed
-133. The shipped 2.2 s GOP codes slightly fewer keyframes than the 2 s one; its own D:snow reads were dispatched after the
+132. The shipped 2.2 s GOP codes slightly fewer keyframes than the 2 s one; its own D:snow reads were dispatched after the
 review round (run ids in the PR).
 
 **Audio at a start (the review's I1 and N1, FIXED).** A sink started by a keyframe already in x264's delay (a swap up
@@ -4010,6 +4010,15 @@ N1; the unit sweep's fixture had the ring holding what the real feeder had alrea
 window and past it (261 starts in a local run, 94 440 audio frames: start within one AAC frame, 21 ms apart with no
 duplicate, none backwards, none missing); the adapters swap sweep and `assert_fresh_start` check the same on the real
 encoder (strictly increasing PTS).
+
+**AAC priming frames are dropped (the final review's I1).** With C8's delay correction (`without_aac_delay`), the AAC
+encoder's first two frames (stamped 0 and 21.3 ms, under the 33.3 ms delay) would stamp below 0; saturating them at 0
+stamped both 0, a duplicate stamp into the mux. They hold encoder priming, not programme audio, so
+`corrected_audio_stamps` now drops a frame whose corrected stamp would fall below 0 (`None`), and the first frame kept
+is the first whose samples were fed at or after 0: frame k = ceil(1 600 / 1 024) = 2, derived from the declared delay
+and frame size in the test, not from the rule's nanosecond arithmetic. The audio history's count and span bounds are
+read off its length after pushing past each (`the_audio_history_is_bounded_by_count_and_by_span`; each loop mutated
+once).
 
 **Owed.** (1) A Cloudflare stg run of the 2.2 s programme GOP: segment length, TARGETDURATION and camera-to-viewer
 delay (24.5 s before), no `ERR_GOP_OUT_OF_RANGE`, and the encoder's CPU under real sessions (Owed 132). (2) VMAF and the
