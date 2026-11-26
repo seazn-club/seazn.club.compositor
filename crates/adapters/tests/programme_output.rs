@@ -1872,6 +1872,115 @@ fn live_audio_passes_through_and_an_underrun_neither_silences_nor_gaps_the_track
 }
 
 // ---------------------------------------------------------------------------------------------
+// C8 (Owed 122): the sound lands on the picture it belongs to
+
+/// One tick of 48 kHz stereo audio carrying a 1 kHz tone at 0.8 of full scale.
+fn burst_tick() -> Vec<u8> {
+    let mut out = Vec::with_capacity(TICK_AUDIO_BYTES);
+    for n in 0..TICK_AUDIO_BYTES / 4 {
+        let v = (0.8
+            * f64::from(i16::MAX)
+            * (2.0 * std::f64::consts::PI * 1_000.0 * n as f64 / 48_000.0).sin()) as i16;
+        let [lo, hi] = v.to_le_bytes();
+        out.extend_from_slice(&[lo, hi, lo, hi]);
+    }
+    out
+}
+
+/// Where each tone starts, in ms on the output's own time line: the first sample over a quarter of
+/// full scale after at least 20 ms under it (the checker's own rule). A sample's time is its AAC
+/// frame's stamp plus its place in the frame, which is how a player that follows the frames' stamps
+/// places it (every frame decodes to 1 024 samples).
+fn tone_onsets_ms(d: &Decoded) -> Vec<f64> {
+    let (over, quiet_min) = (i16::MAX / 4, 20 * 48);
+    let mut onsets = Vec::new();
+    let mut quiet = quiet_min;
+    for (i, pair) in d.pcm.chunks_exact(2).enumerate() {
+        if pair[0].abs() > over {
+            if quiet >= quiet_min {
+                let frame = i / 1_024;
+                let stamp = *d
+                    .audio_pts_ms
+                    .get(frame)
+                    .expect("an AAC frame for every decoded sample");
+                onsets.push(stamp as f64 + (i % 1_024) as f64 / 48.0);
+            }
+            quiet = 0;
+        } else {
+            quiet += 1;
+        }
+    }
+    onsets
+}
+
+/// C8 (Owed 122: camera-burst's A/V offset reads 20 to 50 ms and differs from run to run). The
+/// programme's own AAC encoder (`voaacenc`) emits its first output `AAC_ENCODER_DELAY_SAMPLES`
+/// (1 600 samples, 33.3 ms) late and says nothing of it, so a tone fed on the tick of a flash came out
+/// 33 ms after the flash. The recording carries it as a constant on every pair; the picture's own
+/// tick quantisation (up to half a tick either way) then moved a run between 17 and 50 ms. The tone
+/// must come out on the flash's stamp whatever the encoder's delay is, and both flashes (a second
+/// call: the offset is a constant of the stream, not of its start) read the same.
+///
+/// One profile: the delay is the audio encoder's (a count of samples), which neither the picture's
+/// size nor its frame rate (30 fps in both profiles, ADR 0005) enters.
+#[test]
+fn a_tone_fed_on_a_flash_tick_comes_out_on_the_flash_in_the_encoded_output() {
+    let _s = serial();
+    let dir = Tmp::new("av-sync");
+    let (mut p, rx, frames, _l) = programme();
+    p.swap_sink(1, &file_target(&dir.file("a.flv")));
+    let flashes = [30u64, 75];
+    let black = solid(gst_video::VideoFormat::I420, 1_280, 720, [0, 0, 0, 255]);
+    let white = solid(gst_video::VideoFormat::I420, 1_280, 720, [255, 255, 255, 255]);
+    frames.set_camera(black.clone());
+    let (tone, quiet) = (burst_tick(), vec![0u8; TICK_AUDIO_BYTES]);
+    pace_with(
+        &mut p,
+        0..110,
+        |_| FrameChoice::Emit,
+        |i| {
+            if flashes.contains(&i) {
+                frames.set_camera(white.clone());
+            } else if i.checked_sub(1).is_some_and(|b| flashes.contains(&b)) {
+                frames.set_camera(black.clone());
+            }
+            frames.push_audio(if flashes.contains(&i) { &tone } else { &quiet });
+        },
+    );
+    drain_and_wait(&mut p, &rx);
+    let d = decode(&dir.file("a.flv"));
+    let flash_ms: Vec<u64> = d
+        .frames
+        .iter()
+        .zip(&d.video_pts_ms)
+        .filter(|(f, _)| f.centre.iter().all(|&c| c > 200))
+        .map(|(_, &t)| t)
+        .collect();
+    let onsets = tone_onsets_ms(&d);
+    eprintln!("flashes at {flash_ms:?} ms, tones at {onsets:?} ms");
+    assert_eq!(flash_ms.len(), flashes.len(), "setup: one white frame a flash");
+    assert_eq!(onsets.len(), flashes.len(), "setup: one tone onset a flash");
+    let offsets: Vec<f64> = onsets
+        .iter()
+        .zip(&flash_ms)
+        .map(|(&a, &v)| a - v as f64)
+        .collect();
+    eprintln!("audio less picture, per flash: {offsets:?} ms (the encoder alone delays it by 33.3 ms)");
+    // A tone onset is read to within the encoder's own pre-echo and the stamps' ms rounding: well
+    // under half the delay it must remove.
+    for (n, o) in offsets.iter().enumerate() {
+        assert!(
+            o.abs() <= 10.0,
+            "flash {n}: the tone is {o:.1} ms after its flash"
+        );
+    }
+    assert!(
+        (offsets[0] - offsets[1]).abs() <= 3.0,
+        "the offset moved between flashes: {offsets:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Sequences: a second call, an empty input, after an interruption, the other mode
 
 /// Three sinks in turn. Each swap comes a few ticks after a GOP's own keyframe (C7: none is asked, the
