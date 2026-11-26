@@ -1154,7 +1154,7 @@ mod tests {
             // 30 fps (ADR 0005): 24 frames, 800 ms. A bound, not a measurement: under a GOP, and
             // under the encoded ring's 2 s (`gst_output::ENCODED_RING_SPAN`).
             assert_eq!(held_ms, 800, "{p:?}");
-            assert!(X264_DELAY_MS < PROGRAMME_GOP_MS, "{p:?}");
+            const { assert!(X264_DELAY_MS < PROGRAMME_GOP_MS) };
             checked += 1;
         }
         assert_eq!(checked, 2, "profiles checked: {checked}");
