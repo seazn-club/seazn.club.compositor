@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use app::ports::{Inbound, TargetSpec};
 use crossbeam_channel::Sender;
-use domain::config::{FIRST_GOP_CATCH_UP_MAX_MS, OUTPUT_SINK_TIMEOUT_MS};
+use domain::config::{FIRST_GOP_CATCH_UP_MAX_MS, OUTPUT_SINK_TIMEOUT_MS, PROGRAMME_GOP_MS, X264_DELAY_MS};
 use domain::output_link::Encoded;
 use domain::supervisor::Event;
 use gstreamer as gst;
@@ -78,8 +78,11 @@ const _: () = assert!(
 
 /// The encoded ring's span (plan, Global Constraints: "Encoded ring buffer 2 s, dropping the oldest").
 pub const ENCODED_RING_SPAN: Duration = Duration::from_secs(2);
-// Owed 112: the first-GOP backlog a sink starts from is one the ring can still hold.
-const _: () = assert!((FIRST_GOP_CATCH_UP_MAX_MS as u128) < ENCODED_RING_SPAN.as_millis());
+// Owed 112: the first-GOP backlog a sink starts from is one the ring can still hold. F-040: the ring
+// spans PTS, and the audio encoder has no delay, so with the video encoder's (`X264_DELAY_MS`) the
+// newest entry runs that far ahead of the newest video: the first keyframe is dropped by span when the
+// backlog and the lead reach it, so both fit.
+const _: () = assert!(((FIRST_GOP_CATCH_UP_MAX_MS + X264_DELAY_MS) as u128) < ENCODED_RING_SPAN.as_millis());
 /// A hard cap on the ring's entries beside its span, so that samples with no PTS cannot grow it:
 /// 2 s holds 60 video frames at 30 fps and about 94 AAC frames at 48 kHz (1 024 samples each), 154 in
 /// all; twice that is the cap.
@@ -146,6 +149,10 @@ struct RingState {
     /// The running time of the newest video entry ever pushed, dropped ones included (F-036): a
     /// keyframe after it was encoded after any reconnect point taken now.
     newest_video: Option<gst::ClockTime>,
+    /// The running time of the newest video KEYFRAME the ring has taken (F-040): the encoder's last
+    /// keyframe as the output sees it, `X264_DELAY_MS` behind the one the encoder made last
+    /// (`own_key_in_flight`).
+    newest_key: Option<gst::ClockTime>,
 }
 
 /// The programme → output hand-off: bounded by span and by count, dropping the oldest.
@@ -163,6 +170,9 @@ impl EncodedRing {
         if e.video {
             r.encoded.video += 1;
             r.newest_video = Some(r.newest_video.map_or(e.pts, |n| n.max(e.pts)));
+            if e.key {
+                r.newest_key = Some(r.newest_key.map_or(e.pts, |n| n.max(e.pts)));
+            }
         } else {
             r.encoded.audio += 1;
         }
@@ -668,6 +678,9 @@ struct KeyAsk {
     taken: bool,
     /// `ask_key` has said that nothing is asked (no video yet): said once, at its first call.
     said_none: bool,
+    /// `ask_key` has said that nothing is asked because the GOP's own keyframe is in the encoder
+    /// (F-040, `own_key_in_flight`): said once.
+    said_in_flight: bool,
 }
 
 impl Feeder {
@@ -741,6 +754,24 @@ impl Feeder {
             return;
         };
         if ask.taken {
+            return;
+        }
+        // F-040: the GOP's own keyframe is in the encoder's delay, due within `X264_DELAY_MS`, and
+        // serves this swap (it is after `serves_from`): a request would be matched on a frame this
+        // side of it, a GOP of the frames between under Cloudflare's floor. Read live, at every
+        // entry: a keyframe that does not come (the model wrong) lets the request through.
+        let due = {
+            let r = locked(&self.ring.state);
+            own_key_in_flight(r.newest_key, r.newest_video)
+        };
+        if let Some(due) = due {
+            if !std::mem::replace(&mut ask.said_in_flight, true) {
+                self.shared.log(&format!(
+                    "output gen={}: the keyframe is not asked: the GOP's own keyframe, due at running \
+                     time {due}, is in the encoder's delay and serves this sink",
+                    self.gen
+                ));
+            }
             return;
         }
         ask.tries += 1;
@@ -967,6 +998,29 @@ impl<S> Picker<S> {
             send(&e, base);
         }
     }
+}
+
+/// F-040: the running time of the GOP's own keyframe when the encoder has made it but not yet handed
+/// it out, which then serves any swap's keyframe request and makes asking for one unsafe; `None` when
+/// none is in the encoder's delay. A frame delay (`X264_DELAY_MS`) separates the two ends of
+/// GstVideoEncoder's floor: it notes its last keyframe when x264 hands it out and checks a request
+/// when a frame goes in, so a keyframe still inside x264 is invisible to the throttle, and a request
+/// matched in that window cuts a GOP of the frames between. The keyframe is predicted, not seen:
+/// x264 (`key-int-max` = `PROGRAMME_GOP_MS`, scene cut off) makes the next one exactly a GOP after
+/// the last it handed out, unless a forced one comes first (and a forced one in the delay is
+/// throttled against by the encoder itself, input to input). In the delay means due after the newest
+/// video the ring has taken and no later than that plus the delay: earlier it would have been taken
+/// (and is `newest_key`), later it is a frame the encoder has not received, which a request made now
+/// precedes, and resets. The window is the most the delay can be, so a wrong guess errs towards
+/// waiting for a keyframe at most `X264_DELAY_MS` away.
+pub(crate) fn own_key_in_flight(
+    newest_key: Option<gst::ClockTime>,
+    newest_video: Option<gst::ClockTime>,
+) -> Option<gst::ClockTime> {
+    let (key, newest) = (newest_key?, newest_video?);
+    let due = key.saturating_add(gst::ClockTime::from_mseconds(PROGRAMME_GOP_MS));
+    let latest = newest.saturating_add(gst::ClockTime::from_mseconds(X264_DELAY_MS));
+    (due > newest && due <= latest).then_some(due)
 }
 
 /// Owed 112: whether a sink that can send only now starts from the encoder's first keyframe rather
@@ -1305,6 +1359,60 @@ mod tests {
         }
         eprintln!("first-GOP backlogs taken {taken}, dropped {dropped}");
         assert_eq!((taken, dropped), (bound + 1, 2));
+    }
+
+    /// F-040: the GOP's own keyframe is in the encoder's delay exactly while the newest frame the ring
+    /// holds is one of the `X264_DELAY_FRAMES` before it (frames `gop - delay ..= gop - 1` of a GOP
+    /// whose keyframe was frame 0), in both profiles. The expectation is counted in frames from
+    /// `config`'s GOP and delay, not read from the rule's own millisecond arithmetic; the sweep
+    /// checks every frame of two GOPs and reports how many were in flight (a rule that never says yes
+    /// is a failure, as is one that always does).
+    #[test]
+    fn the_gops_own_keyframe_is_in_flight_for_exactly_the_delay_before_it() {
+        let (mut checked, mut in_flight) = (0u64, 0u64);
+        for profile in [
+            domain::config::OutputProfile::P720,
+            domain::config::OutputProfile::P1080,
+        ] {
+            let fps = u64::from(profile.fps);
+            let gop = u64::from(profile.gop_frames());
+            let delay = u64::from(domain::config::X264_DELAY_FRAMES);
+            let at = |n: u64| gst::ClockTime::from_nseconds(n * 1_000_000_000 / fps);
+            let key = Some(at(0));
+            let mut yes = Vec::new();
+            for n in 0..2 * gop {
+                let got = own_key_in_flight(key, Some(at(n)));
+                let want = n < gop && n + delay >= gop;
+                assert_eq!(got.is_some(), want, "{}p, newest frame {n}", profile.height);
+                if let Some(due) = got {
+                    assert_eq!(
+                        due,
+                        at(gop),
+                        "{}p, newest frame {n}: the keyframe's own time",
+                        profile.height
+                    );
+                    yes.push(n);
+                }
+                checked += 1;
+            }
+            assert_eq!(yes.len() as u64, delay, "{}p: {yes:?}", profile.height);
+            in_flight += yes.len() as u64;
+        }
+        eprintln!("keyframe-in-flight sweep: checked {checked}, in flight {in_flight}");
+        assert!(checked > 0 && in_flight > 0 && in_flight < checked);
+    }
+
+    /// F-040: no keyframe taken yet, or no video, is nothing to predict from: asked as before (the
+    /// feeder's `None` branch covers an empty ring).
+    #[test]
+    fn nothing_is_predicted_before_a_keyframe_and_video_are_taken() {
+        let t = |ms| Some(gst::ClockTime::from_mseconds(ms));
+        assert_eq!(own_key_in_flight(None, t(2_500)), None);
+        assert_eq!(own_key_in_flight(t(0), None), None);
+        assert_eq!(own_key_in_flight(None, None), None);
+        // Control: the same newest frame with a keyframe at 0 is in flight, so the three refusals above
+        // are the missing input and nothing else.
+        assert!(own_key_in_flight(t(0), t(2_500)).is_some());
     }
 
     /// Owed 112's rule is the encoder's FIRST frames only: no video (fact 8's path), a video frame the

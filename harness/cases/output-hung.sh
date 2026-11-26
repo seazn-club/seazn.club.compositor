@@ -18,8 +18,8 @@
 # the first swap after the plant is sink 2, its reason `egress_stalled`, no error line of sink 1
 # before it, inside the domain's window on the process's own clock; the beats from the backstop's firing until sink 2 could have earned
 # Connected read `stalled`, never `playing` over the dead output (`beat_stalled`); the viewer's gap
-# is inside the output gap budget (output_gap_budget_ms: the owner's 15 s target and F-036's
-# forced-keyframe floor, 17.2 s; `gap_in_budget`); no outage outside it;
+# is inside the output gap budget (output_gap_budget_ms: the owner's 15 s target and the forced
+# keyframe's arrival, F-036's floor and F-040's encoder delay, 18 s; `gap_in_budget`); no outage outside it;
 # sink 2 is the last swap (`one_swap`); and once sink 2 could have earned Connected the beats read
 # `playing` again (`beat_playing_again`). Every number comes from harness/thresholds.json but the
 # drive's own schedule (OUTPUT_HUNG_AFTER_MS, CASE_LIVE_S), as in every case.

@@ -3,8 +3,8 @@
 # reconnect cycle's phase the variant names (none: a connect pending; `backoff`: after one failed);
 # 80 s live.
 #
-# The output returns within BUDGET_OUTPUT_RECONNECT_MS of the clear (spec §6's 5 s and F-036's
-# forced-keyframe floor); the programme lost per outage
+# The output returns within BUDGET_OUTPUT_RECONNECT_MS of the clear (spec §6's 5 s and the
+# forced keyframe's arrival: F-036's floor, F-040's encoder delay); the programme lost per outage
 # (the counter gap across it, in camera time, less its wall span: `output_outages[].lost_ms`) is at
 # most BUDGET_OUTPUT_LOST_MAX_MS; the input leg is untouched (every beat reads input connected) and
 # no pipeline is rebuilt. Anti-vacuity: the netem qdisc dropped packets, and an outage spans the cut.

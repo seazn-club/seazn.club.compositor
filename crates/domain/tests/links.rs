@@ -1,12 +1,12 @@
 //! Sweeps over C04's links: every (state, event) pair against a matrix written from the brief, both
 //! links over generated schedules against facts the harness tracks for itself, and the output's
-//! recovery paths against the output gap budget (F-004's 15 s and F-036's forced-keyframe floor).
+//! recovery paths against the output gap budget (F-004's 15 s and the forced keyframe's arrival: F-036's floor and F-040's delay).
 //! They live here, not inline, because the
 //! domain's crate root forbids `clippy::print_stderr`, and a sweep must print the count it checked
 //! (AGENTS.md §5).
 use domain::config::{
-    OutputProfile, Thresholds, FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_GAP_BUDGET_MS,
-    OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS, TICK_WIDEST_MS,
+    OutputProfile, Thresholds, FORCED_KEYFRAME_ARRIVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS,
+    OUTPUT_SINK_TIMEOUT_MS, TICK_WIDEST_MS,
 };
 use domain::input_link::{BuildFacts, InputAction, InputLink, InputState, LossReason, KICK_HISTORY_CAP};
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -1278,9 +1278,9 @@ struct Recovery {
     /// The sink's error; for a hung output, the backstop's back-off.
     fault_at: Ms,
     /// The picture back: the new sink's first bytes and then the keyframe its swap asked for, which
-    /// the encoder holds to `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last one (F-036), so up to
-    /// that long after them (the C1 review's I2(b)). The domain sees the first bytes; the floor is
-    /// the encoder's, outside it, and added here as its worst case.
+    /// the encoder holds to F-036's floor after its last one and then in its look-ahead (F-040), so
+    /// up to `FORCED_KEYFRAME_ARRIVAL_MS` after them (the C1 review's I2(b)). The domain sees the
+    /// first bytes; the arrival is the encoder's, outside it, and added here as its worst case.
     recovered_at: Ms,
 }
 
@@ -1290,7 +1290,7 @@ struct Recovery {
 /// (Owed 38), well before the fault. Every poll also reads the encoders, delivering throughout (Owed
 /// 94), and the polls stop at the sink's error (C09's watch reads a failed sink no more). The first `failed` sinks built after the fault hang (no bytes
 /// and no error, so the domain's connect timeout ends each one). The next one sends its first bytes
-/// `connect_ms` after it was built, and the recovery ends a forced keyframe's floor after that
+/// `connect_ms` after it was built, and the recovery ends a forced keyframe's arrival after that
 /// (`Recovery::recovered_at`): the output's bytes flow again and its picture is back, and the gap the
 /// broadcast sees is over, though that sink earns Connected only later.
 fn recover(
@@ -1355,7 +1355,7 @@ fn recover(
                 return Recovery {
                     last_progress,
                     fault_at: fault_at.expect("a fault happened"),
-                    recovered_at: now + FORCED_KEYFRAME_MIN_INTERVAL_MS,
+                    recovered_at: now + FORCED_KEYFRAME_ARRIVAL_MS,
                 };
             }
         }
@@ -1392,13 +1392,13 @@ fn recover(
 
 /// The worst case, written from the thresholds alone. From the error: the waits before each of the
 /// k + 1 builds, k connects that use their whole timeout, a connect whose first bytes come 1 ms
-/// before its own timeout would end it, then the keyframe held to F-036's floor after them.
+/// before its own timeout would end it, then the keyframe, up to F-036's floor and F-040's delay after them.
 fn worst_from_error(t: &Thresholds, k: u32) -> Ms {
     let timeout = t.output_connect_timeout_ms;
     (0..=k).map(|j| out_wait(t, j)).sum::<Ms>()
         + Ms::from(k) * timeout
         + (timeout - 1)
-        + FORCED_KEYFRAME_MIN_INTERVAL_MS
+        + FORCED_KEYFRAME_ARRIVAL_MS
 }
 
 const SHOWN: u32 = 3;
