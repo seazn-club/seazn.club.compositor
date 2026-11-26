@@ -508,6 +508,11 @@ def key_episode(Gst, GstVideo, leg, feed, offset_s):
             skipped = refusal
             if refusal == "first_frame":
                 serves_from = 0
+            else:
+                # The product's `serves_from`: just after the newest video the ring has TAKEN (the
+                # output side, the delay behind the frame being pushed), so the GOP's own key in the
+                # delay, between the two, serves. Timed against the push time it would be missed.
+                serves_from = max(o[1] for o in r.snapshot() if o[1] is not None) + 1
             t_send = time.monotonic()
         elif n == n_req:
             ev = GstVideo.video_event_new_upstream_force_key_unit(req_rt, True, 0)
