@@ -10,7 +10,7 @@ sees the reload, so no beat says it happened); no drop; one kill 2 s after the m
 compositor's own log of it (flylog.py's shape, the compositor's `ts=`): `cef crashed gen=1` 0.4 s
 after the kill, `graphics restart gen=2`, `cef ready gen=2` 4 s after it; a boundary every 6 s,
 each one moment (100 in 10 minutes); eight stills of eight asked. cpu6-at-max and cpu6-over are the
-same leg on 6 CPUs (performance-6x), its 40 hottest samples at 4.5 and 4.6 cores.
+same leg on 6 CPUs (performance-6x), its 40 hottest samples at 5.1 and 5.2 cores.
 
 Each mutation changes one thing:
   cpu-over, cpu-at-max, cpu6-over, cpu6-at-max, few-samples, ncpu   the samples
@@ -38,7 +38,7 @@ def w(name, rows):
 
 six = "cpu6-over" in muts or "cpu6-at-max" in muts
 hot = 40 if "cpu-over" in muts or "cpu-at-max" in muts or six else 20
-hot_at = {"cpu-over": 3.1, "cpu-at-max": 3.0, "cpu6-over": 4.6, "cpu6-at-max": 4.5}
+hot_at = {"cpu-over": 3.5, "cpu-at-max": 3.4, "cpu6-over": 5.2, "cpu6-at-max": 5.1}
 hot_v = next((v for m, v in hot_at.items() if m in muts), 1.9)
 ncpu = 8 if "ncpu" in muts else 6 if six else 4
 samples = []

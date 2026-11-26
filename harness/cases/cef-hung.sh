@@ -21,6 +21,10 @@
 # brief's one bound, strip − alive ≤ cef_hang_after_ms + one frame period, left the strip's dating no
 # slack: PR run 40065135366 read the log at 10 031 (on the rule) and the strip at 10 037 (a false
 # premise row; the round-1 review's m1 rested on one sample).
+# C5 (F-040): the strip is the destination's recording, AFTER the encoder, and the log is before it. With
+# x264's look-ahead and frame threads the first frame made without the overlay comes out
+# X264_DELAY_MS after the line that hid it (CI run 45737841032: 758 ms), so the strip may lag the log
+# by `budget_strip_after_log_ms` (spec §6's 150 plus the delay), and lead it by the 150 alone.
 # Anti-vacuity: the page's own hang line, at least 2 alive lines before it and none after.
 
 CASE_LIVE_S=60
@@ -61,10 +65,11 @@ case_verdict() {
       scheduled_meanwhile: ([scheduled[] | select(.due_ms > $h.at_ms and .due_ms < $gap.from_ms)] | length)}'
   require detect_ms "$HUNG"' | ($hid.at_ms - $alive.at_ms) as $log
     | $log >= ($t.cef_hang_after_ms - $t.frame_period_ms) and $log <= ($t.cef_hang_after_ms + 2 * $t.frame_period_ms)
-    and (($gap.from_ms - $hid.at_ms) | abs) <= $t.budget_frame_to_encoder_ms' \
+    and ($gap.from_ms - $hid.at_ms) >= (0 - $t.budget_frame_to_encoder_ms)
+    and ($gap.from_ms - $hid.at_ms) <= $t.budget_strip_after_log_ms' \
     "$HUNG"' | {log_from_last_alive_ms: less($hid.at_ms; $alive.at_ms), strip_from_log_ms: less($gap.from_ms; $hid.at_ms),
       log_bounds: [($t.cef_hang_after_ms - $t.frame_period_ms), ($t.cef_hang_after_ms + 2 * $t.frame_period_ms)],
-      strip_budget: $t.budget_frame_to_encoder_ms}'
+      strip_budget: $t.budget_strip_after_log_ms, strip_early_budget: $t.budget_frame_to_encoder_ms}'
   # Back after the new generation's ready, and held for resume_after_ms (lib.jq's on_air_for).
   require overlay_back "$HUNG"' | ([.overlay.runs[] | select(.from_ms >= $gap.to_ms and .index != null)] | first | .from_ms) as $b
     | $ready != null and $gap.to_ms >= $ready.at_ms and $b != null and on_air_for($b; $t.resume_after_ms)' \

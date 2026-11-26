@@ -1,0 +1,172 @@
+name: encoder-tune
+# C5 (compositor-c5-brief.md, scan finding 6): the encoder's tune and profile, MEASURED, never shipped
+# from here. Two jobs on the runner, in parallel: `quality` (x264enc offline per leg, libvmaf against
+# the uncompressed source: F-033's method and clips) and `paced` (a 30 fps real-time feed: this
+# process's CPU, the encode latency the settings add, and forced keyframes asked the way
+# gst_programme.rs asks). The CPU the 4.5-core rule judges is NOT here: it is the cost legs
+# (soak.yml, legs=C:snow,D:snow on performance-6x) on a spike branch per leg; this job's cores are a
+# same-host ratio between legs, like F-033's one-host table.
+#
+# Trigger: a push to the feature branch that touches harness/encoder-tune or this file (a new workflow
+# file cannot be dispatched from a branch until it is on main), or workflow_dispatch. A head commit
+# whose message holds `[smoke]` runs the plumbing on a synthetic clip in a few minutes.
+#
+# No secrets. Nothing here reaches stg, prod, Fly or Cloudflare.
+on:
+  push:
+    branches: [feat/relay-encoder-tune]
+    paths:
+      - "harness/encoder-tune/**"
+      - ".github/workflows/encoder-tune.yml"
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: "true: the plumbing on a synthetic clip"
+        required: false
+        default: "false"
+permissions: { contents: read }
+concurrency:
+  group: encoder-tune-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run: { shell: bash }
+env:
+  # Xiph's derf collection, F-033's two clips (touchdown_pass: players on grass; rush_field_cuts: a
+  # crowd on a field, the hard case). The first FRAMES frames of each, as raw I420.
+  CLIPS_URL: https://media.xiph.org/video/derf/y4m
+  FRAMES: "220"
+  SMOKE: ${{ (inputs.smoke == 'true' || contains(github.event.head_commit.message, '[smoke]')) && 'true' || 'false' }}
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          scripts/apt-install.sh gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly python3-gi gir1.2-gstreamer-1.0 \
+            gir1.2-gst-plugins-base-1.0 ffmpeg
+      - name: What the runner has
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)'
+          gst-launch-1.0 --version | head -1
+          dpkg -s libx264-164 | grep -E '^Version'
+          ffmpeg -hide_banner -version | head -1
+          gst-inspect-1.0 x264enc | sed -n '/Element Properties/,$p' | grep -E '^  (tune|speed-preset|rc-lookahead|sync-lookahead|sliced-threads|threads|bframes|b-adapt|min-force-key-unit-interval|option-string|vbv-buf-capacity|key-int-max)\b' -A3 | cut -c1-160
+      - name: libvmaf 3.2.0 (F-033's version), built from its pinned tag; Ubuntu's ffmpeg has no libvmaf
+        run: |
+          scripts/apt-install.sh meson ninja-build nasm
+          git clone --quiet --branch v3.2.0 --depth 1 https://github.com/Netflix/vmaf.git "$RUNNER_TEMP/vmaf"
+          test "$(git -C "$RUNNER_TEMP/vmaf" rev-parse HEAD)" = 3f9e02af258a5c0e30124fc585a3c3af90126dee
+          cd "$RUNNER_TEMP/vmaf/libvmaf"
+          meson setup build --buildtype=release -Dbuilt_in_models=true -Denable_tests=false -Denable_docs=false
+          ninja -C build
+          echo "VMAF_BIN=$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" --version
+      - name: Self-test
+        run: /usr/bin/python3 -I harness/encoder-tune/measure.py selftest
+      - name: Which option turns x264enc's filler off (the SEI is the witness)
+        run: |
+          for opt in "nal-hrd=cbr:filler=1" "nal-hrd=cbr:filler=0" "nal-hrd=vbr" "scenecut=0"; do
+            gst-launch-1.0 -q videotestsrc pattern=ball num-buffers=20 ! video/x-raw,width=1920,height=1080,framerate=30/1 \
+              ! x264enc speed-preset=medium bitrate=6000 vbv-buf-capacity=1000 tune=zerolatency option-string="$opt" \
+              ! h264parse ! filesink location="$RUNNER_TEMP/probe.h264"
+            echo "option-string=$opt ->" "$({ strings "$RUNNER_TEMP/probe.h264" | grep -F 'x264 - core' | tr ' ' '\n' | grep -E '^(nal_hrd|filler|vbv_maxrate|vbv_bufsize)=' | tr '\n' ' '; } || true)"
+          done
+      - name: The options each leg gets (x264's own SEI), and its automatic thread count
+        run: |
+          set -x
+          for tune in "tune=zerolatency" "sliced-threads=false rc-lookahead=15"; do
+            gst-launch-1.0 -q videotestsrc num-buffers=20 ! video/x-raw,width=1920,height=1080,framerate=30/1 \
+              ! x264enc speed-preset=medium bitrate=6000 $tune ! h264parse ! filesink location="$RUNNER_TEMP/probe.h264"
+            { strings "$RUNNER_TEMP/probe.h264" | grep -F 'x264 - core' | tr ' ' '\n' \
+              | grep -E '^(threads|sliced_threads|lookahead_threads|sync_lookahead|rc_lookahead|bframes|mbtree)=' || true; }
+          done
+      - name: Clips
+        run: |
+          mkdir -p "$RUNNER_TEMP/clips"
+          if [ "$SMOKE" = true ]; then
+            /usr/bin/python3 -I harness/encoder-tune/measure.py synth --out "$RUNNER_TEMP/clips/synth.yuv" --frames 30
+          else
+            for c in touchdown_pass_1080p rush_field_cuts_1080p; do
+              /usr/bin/python3 -I harness/encoder-tune/measure.py clip \
+                --url "$CLIPS_URL/$c.y4m" --out "$RUNNER_TEMP/clips/$c.yuv" --frames "$FRAMES"
+            done
+          fi
+          # An easy picture (F-005's "ball" camera is the easy case): what filler does when the picture
+          # needs fewer bits than the CBR target, the encoder's side of scan D2.
+          # snow is the cost legs' picture (per-pixel noise), here for the encoder's CPU seconds only.
+          if [ "$SMOKE" != true ]; then
+            for pat in ball snow; do
+              gst-launch-1.0 -q videotestsrc pattern="$pat" num-buffers="$FRAMES" \
+                ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 \
+                ! filesink location="$RUNNER_TEMP/clips/$pat.yuv"
+            done
+          fi
+          ls -l "$RUNNER_TEMP/clips"
+      - name: Quality (x264enc offline, libvmaf)
+        run: |
+          mkdir -p out
+          args=()
+          for f in "$RUNNER_TEMP"/clips/*.yuv; do
+            n=$(basename "$f" .yuv)
+            args+=(--clip "${n}=${f}")
+          done
+          /usr/bin/python3 -I harness/encoder-tune/measure.py quality "${args[@]}" --out out/quality.json
+      - name: Table
+        run: |
+          /usr/bin/python3 -I harness/encoder-tune/measure.py table --quality out/quality.json --out out/quality.md
+          cat out/quality.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: quality
+          path: out/
+
+  paced:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          scripts/apt-install.sh gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly python3-gi gir1.2-gstreamer-1.0 \
+            gir1.2-gst-plugins-base-1.0 ffmpeg
+      - name: What the runner has
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)'
+          dpkg -s libx264-164 | grep -E '^Version'
+      - name: Clip
+        run: |
+          mkdir -p "$RUNNER_TEMP/clips"
+          if [ "$SMOKE" = true ]; then
+            /usr/bin/python3 -I harness/encoder-tune/measure.py synth --out "$RUNNER_TEMP/clips/rush.yuv" --frames 30
+          else
+            # The paced run needs a picture the 4-vCPU runner encodes in real time (the first full run
+            # fed rush_field_cuts: every leg fell behind 30 fps, and its latency was queueing). The
+            # added latency is frames in the encoder, not a property of the picture.
+            gst-launch-1.0 -q videotestsrc pattern=ball num-buffers="$FRAMES" \
+              ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 \
+              ! filesink location="$RUNNER_TEMP/clips/rush.yuv"
+          fi
+      - name: Paced run
+        run: |
+          mkdir -p out
+          if [ "$SMOKE" = true ]; then
+            extra=(--seconds 8 --rounds 1 --reps 1 --offsets 0.5,2.6,3.2)
+          else
+            extra=()
+          fi
+          /usr/bin/python3 -I harness/encoder-tune/measure.py paced --clip "$RUNNER_TEMP/clips/rush.yuv" \
+            --out out/paced.json "${extra[@]}"
+      - name: Table
+        run: |
+          /usr/bin/python3 -I harness/encoder-tune/measure.py table --paced out/paced.json --out out/paced.md
+          cat out/paced.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: paced
+          path: out/

@@ -34,7 +34,10 @@ use std::time::Instant;
 
 use app::ports::{Inbound, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Sender;
-use domain::config::{OutputProfile, FORCED_KEYFRAME_MIN_INTERVAL_MS};
+use domain::config::{
+    OutputProfile, FORCED_KEYFRAME_MIN_INTERVAL_MS, X264_RC_LOOKAHEAD_FRAMES, X264_SYNC_LOOKAHEAD_FRAMES,
+    X264_THREADS,
+};
 use domain::health::ExitDetail;
 use domain::ladder::Rung;
 use domain::programme::FrameChoice;
@@ -59,21 +62,26 @@ const APPSRC_TICKS: u64 = 3;
 /// stereo).
 const AAC_BITRATE: i32 = 128_000;
 /// x264's preset (owner ruling 2026-10-27 on F-033: 1080p `medium` on 6 CPUs, which keeps every 1080p
-/// leg within the 75 % size rule). F-033: `fast` and `medium` score within 0.5 VMAF of `faster`,
+/// leg within the size rule: 75 % of the cores then, 85 % since the owner's ruling of 2026-11-25). F-033: `fast` and `medium` score within 0.5 VMAF of `faster`,
 /// `slow` within 0.8. Every 1080p `medium` cost leg ran real time with 0 drops (4 CPUs: D:noise;
 /// 6 CPUs: C:noise, D:noise, D:snow; C:snow's beats unfetched). Only the one-host sweep, on raw
 /// per-pixel noise, fell behind (48.3 to 50.4 s for 45 s of frames), its cause not settled. It drives
 /// 720p too. A 3 h soak of 1080p `medium` on 6 CPUs passed (F-033). The rest are the settings C00
-/// measured real time (F-005): `zerolatency`, no B-frames (F-004), a 1 000 ms VBV and CBR with
-/// filler (POC values). C00 measured a 2 s keyframe interval with x264's scene cut on; F-036 made it
+/// measured real time (F-005): no B-frames (F-004), a 1 000 ms VBV and CBR with filler (POC values).
+/// C5 (F-040; the owner's ruling of 2026-11-25, "L2 is the chosen leg") dropped `zerolatency` for
+/// x264's look-ahead (`X264_RC_LOOKAHEAD_FRAMES`), frame threads (`X264_THREADS`) and High profile:
+/// +1.4 to +4.2 VMAF at 6 Mbps for 0.8 s of frame delay (`domain::config::X264_DELAY_MS`) and 0 to 14 %
+/// more encoder CPU. B-frames stay off: they bought nothing and the output's rebase cannot carry them. C00 measured a 2 s keyframe interval with x264's scene cut on; F-036 made it
 /// a fixed 3 s GOP (`OutputProfile::gop_frames`) with the scene cut off (`X264_NO_SCENE_CUT`), which
 /// codes fewer keyframes, never more.
 const X264_SPEED_PRESET: &str = "medium";
-const X264_TUNE: &str = "zerolatency";
 // The VBV lives in `config` (`X264_VBV_MS`), since the first-GOP bound reads it (Owed 112); the
 // property takes a u32 of ms, and a value it cannot carry is a compile error.
 const X264_VBV_PROPERTY_MS: u32 = domain::config::X264_VBV_MS as u32;
 const _: () = assert!(domain::config::X264_VBV_MS <= u32::MAX as u64);
+// F-040: the look-ahead lives in `config` too (the frame delay reads it); the property is an i32.
+const X264_RC_LOOKAHEAD: i32 = X264_RC_LOOKAHEAD_FRAMES as i32;
+const _: () = assert!(X264_RC_LOOKAHEAD_FRAMES <= i32::MAX as u32);
 const X264_OPTIONS: &str = "nal-hrd=cbr:filler=1";
 /// F-036: x264's scene cut off, so a hard cut in the picture (the slate to the camera, a camera
 /// returning) never starts a GOP early: Cloudflare errored the programme input for GOPs under 2 s
@@ -103,8 +111,8 @@ pub enum SinkStall {
     Hang,
 }
 
-/// How long a planted hang holds: twice F-004's 15 s, past the backstop and a whole recovery (17.2 s
-/// with F-036's floor). The kept gap, not the output's budget, so F-036 left case 18's hold at 30 s.
+/// How long a planted hang holds: twice F-004's 15 s, past the backstop and a whole recovery (18 s
+/// with F-036's floor and F-040's encoder delay). The kept gap, not the output's budget, so F-036 left case 18's hold at 30 s.
 #[cfg(feature = "test-hooks")]
 pub const SINK_HANG_HOLD: Duration = Duration::from_millis(2 * domain::config::YOUTUBE_KEPT_GAP_MS);
 
@@ -386,6 +394,12 @@ impl GstProgramme {
         self.shared.ring.len()
     }
 
+    /// Test hook: the entries the encoded ring dropped for its span or count, (video, audio).
+    #[cfg(feature = "test-hooks")]
+    pub fn ring_pruned(&self) -> (u64, u64) {
+        self.shared.ring.pruned()
+    }
+
     /// Test hook: the bytes queued in the current output's video and audio appsrcs.
     #[cfg(feature = "test-hooks")]
     pub fn output_queued_bytes(&self) -> Option<(u64, u64)> {
@@ -577,22 +591,33 @@ impl GstProgramme {
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
         let encoder = make("x264enc")?;
-        encoder.set_property_from_str("tune", X264_TUNE);
+        // No `tune`: `zerolatency` is sliced threads with no look-ahead (F-040). The delay these
+        // settings add is declared in `config` (`X264_DELAY_MS`), and the keyframe the output's swap
+        // asks for is made safe against it in `gst_output::own_key_in_flight`.
         encoder.set_property_from_str("speed-preset", X264_SPEED_PRESET);
+        encoder.set_property("sliced-threads", false);
+        encoder.set_property("threads", X264_THREADS);
+        encoder.set_property("rc-lookahead", X264_RC_LOOKAHEAD);
+        encoder.set_property("sync-lookahead", X264_SYNC_LOOKAHEAD_FRAMES);
         encoder.set_property("bitrate", profile.video_kbps);
         encoder.set_property("key-int-max", profile.gop_frames());
+        self.shared.ring.set_gop_frames(profile.gop_frames());
         encoder.set_property("bframes", 0u32);
         encoder.set_property("vbv-buf-capacity", X264_VBV_PROPERTY_MS);
         encoder.set_property("option-string", format!("{X264_OPTIONS}:{X264_NO_SCENE_CUT}"));
         // F-036: a keyframe an output swap forces (Owed 84) never cuts a GOP under Cloudflare's
         // floor. GstVideoEncoder holds a request that comes within this of its last keyframe, natural
         // or forced, and makes it on the first frame that far on, in running time; never dropped.
-        // It depends on x264 having NO frame delay (the C1 review's I3): the encoder notes its last
-        // keyframe when x264 hands it out (`finish_frame`) and checks a request when a frame goes in
-        // (`chain`), so the two agree only because `zerolatency` turns on sliced threads with no
-        // lookahead. Frame threads (`sliced-threads=false`), `rc-lookahead` or `sync-lookahead` would
-        // hold the GOP's own keyframe inside x264 while a request passes unthrottled, and a GOP of a
-        // frame or two would reach the output again
+        // F-040: that holds only with NO frame delay. The encoder notes its last keyframe when x264
+        // hands it out (`finish_frame`) and checks a request when a frame goes in (`chain`), so with
+        // a look-ahead and frame threads (`X264_DELAY_MS`, 0.8 s) a GOP's own keyframe is still inside
+        // x264 while a request passes unthrottled: asked 0.1 s after one, a GOP of 100 ms reached the
+        // output (4 of 14 requests under 2 s, F-040; the C1 review's I3 predicted it). No value of this
+        // property cures it, since the encoder never sees the natural keyframe it would be throttled
+        // by. The adapter does: it asks nothing while the GOP's own keyframe is due within the delay
+        // (`gst_output::own_key_in_flight`; the keyframe in the look-ahead serves the swap), and
+        // otherwise the request's throttle sees every keyframe it can collide with. This property still
+        // holds a request off a keyframe the encoder HAS handed out, and one request off another
         // (`a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor`).
         encoder.set_property(
             "min-force-key-unit-interval",
@@ -600,7 +625,7 @@ impl GstProgramme {
         );
         let profile_caps = capsfilter(
             gst::Caps::builder("video/x-h264")
-                .field("profile", "main")
+                .field("profile", "high")
                 .build(),
         )?;
         let parser = make("h264parse")?;

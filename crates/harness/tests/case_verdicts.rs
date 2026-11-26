@@ -4725,13 +4725,36 @@ fn cef_hung_hides_and_restarts_graphics_and_reds_when_the_hang_is_never_seen() {
         hang_after + 31,
         "hung-ci-pr: {shown}"
     );
+    // C5 (F-040): the strip is the recording after the encoder, so it lags the log by x264's frame delay
+    // on top of spec §6's budget. CI run 45737841032 read the log on the rule and the strip 758 ms after
+    // it (the old bound, the 150 alone, redded it); both edges of the new bound pass on the log's rule.
+    let (budget, lag) = (
+        w.ms("budget_frame_to_encoder_ms"),
+        w.ms("budget_strip_after_log_ms"),
+    );
+    assert!(
+        lag > budget,
+        "the strip's lag budget {lag} is not past the early one {budget}"
+    );
+    for (tag, strip_ms) in [
+        ("hung-ci-delay", 758),
+        // The strip reads a gap at the first frame on or after it (CI run 45743066857 read a gap
+        // placed at 950 as 955), so the edge case sits one frame period (plus the integer
+        // truncation of 33.3) inside the budget: its read lands on or under the bound.
+        ("hung-strip-at-lag-budget", lag - (w.ms("frame_period_ms") + 1)),
+        ("hung-strip-at-early-budget", -budget),
+    ] {
+        assert_pass(
+            &judge(&cef_hung_at(hang_after + 12, strip_ms), "cef-hung", "", tag),
+            tag,
+        );
+    }
     // Each side of the log's window, by more than its tick (a beat late is 2 000 ms), and the strip
-    // off the logged hide by more than spec §6's frame-to-encoder budget, either way.
-    let budget = w.ms("budget_frame_to_encoder_ms");
+    // off the logged hide by more than its budget, either way (late: the lag budget; early: spec §6's).
     for (tag, log_ms, strip_ms) in [
         ("hung-late", hang_after + (3.0 * period).ceil() as i64, 6),
         ("hung-early", hang_after - (2.0 * period).ceil() as i64, 6),
-        ("hung-strip-late", hang_after + 12, budget + 40),
+        ("hung-strip-late", hang_after + 12, lag + 40),
         ("hung-strip-early", hang_after + 12, -(budget + 40)),
     ] {
         assert_fails(

@@ -185,7 +185,7 @@ from `thresholds.json`, `soak.json`, the drive or that memory.
 | 1 memory | Part 3's median `memMb` within ±40 % of part 1's (`memory_drift_max`; owner, 2026-10-25: "Up to 20% grew is fine", then "Machine is solely for relay so 40% is fine"; it was ±10 %). A drift exactly at the bound passes. |
 | 1.projection | The drive's `memMb` fitted against time by least squares (hours since the start action), projected to `memory_projection.session_cap_min` (300: a livestream's 5 h cap), is within `memory_budget_fraction` (half) of the smaller of the Machine's memory and the production guest's (`memory_projection.production_guest`, web's `RUNNER_DEFAULT_GUEST`), so a soak on a bigger guest never loosens the budget (owner ruling A, 2026-10-25; the guest, the coordinator's decision the same day). The projection is judged as reported, to 0.1 MB: exactly at the budget passes. It reports the slope in MB/h, the intercept, the projection, the budget, both memories and the beats fitted. Fewer memMb beats than `5.beats`'s floor, none, no spread in time, or a `production_guest` that `compositor_guest` lacks fail. |
 | 1.split | Schedules `dropouts` and `none` only (the memory experiment; the soak's page=real log may be withheld). The compositor log's `memory split` lines in the drive carry the compositor's RSS and a CEF poll; the poll advances from line to line; a CEF child's PSS was read; no kind was listed with none of its children read; and at least one instant's step was measured from the lines and one from the beats' windows. Zero read fails. |
-| 2 | Every output outage overlaps a disconnect and ends within `budget_output_reconnect_ms` of it (spec §6's 5 s and F-036's forced-keyframe floor, 7.2 s). `pts_gaps` is empty. |
+| 2 | Every output outage overlaps a disconnect and ends within `budget_output_reconnect_ms` of it (spec §6's 5 s and the forced keyframe's arrival, F-036's floor and F-040's encoder delay, 8 s). `pts_gaps` is empty. |
 | 3 | Exactly 1 session GET (reason "programme rebuilt"). |
 | 4 | The final `droppedFrames` is under 0.1 % of drive × fps. |
 | `5.beats`, `5.dropouts`, `5.disconnects` | The anti-vacuity counts, scaled to the drive. A disconnect needs dropped packets and an outage it caused. |
@@ -402,7 +402,7 @@ unless its kill can land inside the verdict's window (`cost_kill_late_max_s`, 10
 |---|---|
 | `run` | One start and one end; the drive at least `leg_min_drive_min`. |
 | `samples` | From +`cost_sample_from_s` (15 s) to the end, at least `cost_samples_min_ratio` of a sample a second, each reading the guest's CPU count (so a leg on the wrong size fails). |
-| `cpu` | The Machine's CPU p95 (nearest rank) at most `cost_cpu_p95_max_share` (75 %: owner ruling 2026-10-27, F-033 (PR #102); it was Owed 20's 50 %) of the guest's cores. |
+| `cpu` | The Machine's CPU p95 (nearest rank) at most `cost_cpu_p95_max_share` (85 %: owner ruling 2026-11-25, C5, "Up to 80 - 85 % is fine"; it was 75 % from 2026-10-27, F-033 (PR #102), and Owed 20's 50 % before; no warning level at 80 %: the check is pass or fail) of the guest's cores. |
 | `rung` | Every beat's rung is `full`, the reload included. |
 | `drops` | The final `droppedFrames` is 0. |
 | `moments` | At least `cost_moments_min_per_min` (1) moment a minute over the drive (a mean; see finding 15), by the page's own feed. A feed that answered for none of the events fails. |

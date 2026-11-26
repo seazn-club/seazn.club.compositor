@@ -28,6 +28,7 @@ use domain::config::{
     OutputProfile, Thresholds, CF_KEYFRAME_INTERVAL_MAX_MS, CF_KEYFRAME_INTERVAL_MIN_MS,
     ENCODER_SPEED_REALTIME_MIN, FIRST_GOP_CATCH_UP_MAX_MS, FORCED_KEYFRAME_MIN_INTERVAL_MS,
     OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS, PLAYOUT_CAP_MS, PLAYOUT_TARGET_MS, PROGRAMME_GOP_MS,
+    X264_DELAY_FRAMES, X264_DELAY_MS,
 };
 use domain::ladder::Rung;
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -1063,11 +1064,15 @@ fn swap_sink_starts_new_file_at_keyframe_without_rebuilding_programme() {
     assert!(b.first_is_key(), "b starts at a keyframe");
     assert_eq!(b.video_pts_ms.first(), Some(&0), "b's PTS is rebased to 0");
     let a = decode(&dir.file("a.flv"));
+    // F-040: the swap is at the output, so the frames still in x264's delay when it lands (the last
+    // `delay_ticks()` pushed) come out after it, to sink b: a holds the frames that had left the
+    // encoder, and the margin of the encoder's own pipeline beyond them.
     assert!(
-        a.frames.len() as u64 + OWED84_MARGIN_TICKS >= swap,
+        a.frames.len() as u64 + delay_ticks() + OWED84_MARGIN_TICKS >= swap,
         "a frames {}",
         a.frames.len()
     );
+    assert!(a.frames.len() as u64 <= swap, "a frames {}", a.frames.len());
     assert!(a.first_is_key());
     assert_eq!(p.builds(), 1);
 }
@@ -1901,8 +1906,11 @@ fn swapping_twice_starts_each_sink_at_a_keyframe_and_drains_once() {
     let mut sinks = 0;
     for name in ["a.flv", "b.flv", "c.flv"] {
         let d = decode(&dir.file(name));
+        // F-040: a sink swapped away from loses the frames still in x264's delay to its successor
+        // (the swap is at the output); the last sink is flushed by the drain and loses none.
+        let in_the_delay = if name == "c.flv" { 0 } else { delay_ticks() };
         assert!(
-            d.frames.len() as u64 + OWED84_MARGIN_TICKS >= each,
+            d.frames.len() as u64 + in_the_delay + OWED84_MARGIN_TICKS >= each,
             "{name}: {}",
             d.frames.len()
         );
@@ -2006,61 +2014,53 @@ fn a_late_first_sink_starts_at_the_keyframe_after_its_swap_not_inside_the_ring()
     assert!(checked > 0);
 }
 
-/// F-036 (the C1 review's I1): the request carries the running time from which a keyframe serves the
-/// swap (just after the newest video in the ring), so a keyframe the encoder has made at or after it
-/// serves the swap, and none is forced a floor later. The encoder's next output is held
-/// (`hang_encoder`) and the GOP's own keyframe pushed into it: GstVideoEncoder has noted that keyframe
-/// but the ring has not got it when the sink can send, so the reconnect point comes before it. The
-/// stream starts there, and the file's next keyframe is the GOP's, a GOP on. One mutant shows: an
-/// unstamped request (any running time) is held to the floor after that keyframe and then forced, so
-/// the file's second keyframe comes a floor in and cuts a GOP of the floor.
+/// F-036 (the C1 review's I1) and F-040: a keyframe the encoder has made after the reconnect point
+/// serves the swap, and none is forced a floor later. The request carries the running time from which
+/// a keyframe serves (just after the newest video in the ring), and since C5 the feeder asks for none
+/// at all while the GOP's own keyframe is in the encoder's delay (`gst_output::own_key_in_flight`):
+/// x264 holds the frames for `X264_DELAY_MS`, and GstVideoEncoder notes a keyframe only when x264 hands
+/// it out, so a request in that window would be matched on a frame this side of it. No hook is needed
+/// to put the keyframe there (the C1 review's test held the encoder's output to): the swap comes a few
+/// frames after the GOP's keyframe went in, and the ring has not got it. The stream starts at that
+/// keyframe, and the file's next keyframe is the GOP's, a GOP on. One mutant shows: the feeder asking
+/// anyway (`own_key_in_flight` returning `None`) forces a keyframe a few frames after the GOP's own,
+/// a GOP of those frames (`a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor` reads every
+/// interval).
 #[test]
 fn a_keyframe_made_after_the_reconnect_point_serves_the_swap_and_none_is_forced_a_floor_on() {
     let _s = serial();
     let dir = Tmp::new("stamped-ask");
     let (mut p, rx, _f, lines) = programme();
-    let stats = p.stats();
     let gop = gop_ticks();
     let slate = FrameChoice::Slate(SlateKind::Waiting);
-    let hold = Duration::from_secs(2);
-    pace(&mut p, 0..gop, slate);
-    thread::sleep(OWED84_ENCODED_SETTLE);
+    let swap = gop + 4;
     assert_eq!(
-        stats.snapshot().encoded_frames,
-        Some(gop),
-        "setup: the GOP's frames reached the ring"
+        key_start(swap),
+        gop,
+        "setup: the GOP's own keyframe is in the delay at the swap"
     );
-    assert!(p.hang_encoder(hold), "the encoder hook");
-    let hung = Instant::now();
-    p.push(gop, slate);
+    pace(&mut p, 0..swap, slate);
     thread::sleep(OWED84_ENCODED_SETTLE);
     swap_when_asked(&mut p, &lines, 1, &file_target(&dir.file("a.flv")));
-    let asked = hung.elapsed();
-    eprintln!("stamped ask: taken {asked:?} into the encoder's {hold:?} hold");
     assert_eq!(
-        stats.snapshot().encoded_frames,
-        Some(gop),
-        "setup: the GOP's keyframe reached the ring before the ask ({asked:?})"
+        logged(&lines, &format!("output gen=1: {KEY_IN_FLIGHT_LINE}")),
+        1,
+        "the feeder asked for a keyframe the GOP's own was due to serve"
     );
-    assert!(
-        asked + OWED84_ENCODED_SETTLE < hold,
-        "setup: the ask came {asked:?} into the {hold:?} hold"
-    );
-    thread::sleep(hold.saturating_sub(hung.elapsed()) + OWED84_ENCODED_SETTLE);
     assert_eq!(
-        stats.snapshot().encoded_frames,
-        Some(gop + 1),
-        "setup: the hold ended"
+        logged(&lines, "output gen=1: the keyframe request was taken"),
+        0,
+        "a keyframe was asked"
     );
     let end = 2 * gop + OWED84_MARGIN_TICKS;
-    pace(&mut p, gop + 1..end, slate);
+    pace(&mut p, swap..end, slate);
     drain_and_wait(&mut p, &rx);
     let d = decode(&dir.file("a.flv"));
     assert!(d.first_is_key(), "keys {:?}", &d.keys[..d.keys.len().min(5)]);
     let n = d.frames.len() as u64;
     let owed = end - gop;
     eprintln!(
-        "stamped ask: {n} frames for the {owed} from the GOP's keyframe; keyframes at {:?}",
+        "in the delay: {n} frames for the {owed} from the GOP's keyframe; keyframes at {:?}",
         key_indexes(&d)
     );
     assert!(
@@ -2075,45 +2075,76 @@ fn a_keyframe_made_after_the_reconnect_point_serves_the_swap_and_none_is_forced_
     );
 }
 
-/// F-036 (the C1 review's I3): a swap whose ask reaches the encoder one or two frames after the GOP's
-/// own keyframe went into the ring. The keyframe asked for is held to the floor after it, so the file
-/// starts at `key_due`, its keyframes are a GOP apart, and no interval in it is under the floor. This
-/// holds because x264 has no frame delay (the encoder's comment in `gst_programme.rs`): with frame
-/// threads (`sliced-threads=false`) the GOP's keyframe is still inside x264 when the ask comes, the
-/// request is not throttled, and the file starts at the GOP's keyframe with a GOP of one or two
-/// frames after it (predicted; the mutant runs only where GStreamer does). Both modes.
+/// F-036 (the C1 review's I3) and F-040: a swap made frames after a GOP's own keyframe never cuts a
+/// GOP under the floor, in both modes, at every distance from the keyframe across the encoder's delay.
+/// Up to the delay (`X264_DELAY_FRAMES`) after it the keyframe is still in x264: the feeder asks for
+/// none, the keyframe serves the swap, and the file starts there (the C1 review's one and two frames
+/// are the first two cases). Past the delay the encoder has handed it out and the keyframe asked for
+/// is held to the floor after it (`key_due`). Before C5 the first group was safe because x264 had no
+/// delay; with a look-ahead the request passes GstVideoEncoder's throttle unseen and the file starts
+/// at the GOP's keyframe with a GOP of one or two frames after it, and, asked 0.1 s after one, F-040
+/// measured 4 of 14 requests under 2 s. The file's keyframes are a GOP apart and no interval in it is
+/// under the floor, whichever group the swap is in; the sweep reports how many of each it ran.
 #[test]
 fn a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor() {
     let _s = serial();
-    let (mut cases, mut intervals) = (0, 0);
+    let delay = delay_ticks();
+    // Each distance after the GOP's keyframe is a swap at `gop + after`, `after - 1` ticks after the
+    // newest frame pushed's keyframe: one group inside the delay window, one past it, each clear of
+    // the window's edge.
+    let inside = [1, 2, delay / 3, delay - WINDOW_EDGE_TICKS - 1];
+    let past = [delay + WINDOW_EDGE_TICKS + 4];
+    let (mut cases, mut intervals, mut served, mut held) = (0, 0, 0, 0);
     for profile in [P720, OutputProfile::P1080] {
         let gop = u64::from(profile.gop_frames());
-        let floor = u64::from(profile.forced_keyframe_min_frames());
-        for after in [1, 2] {
+        for after in inside.into_iter().chain(past) {
             let case = format!("{}p, asked {after} after the GOP's keyframe", profile.height);
             let dir = Tmp::new("ask-after-key");
             let (mut p, rx, _f, lines) = programme_with(&profile);
             let slate = FrameChoice::Slate(SlateKind::Waiting);
             let swap = gop + after;
-            let due = key_due(swap, last_natural_key(swap));
-            assert_eq!(due, gop + floor, "{case}: setup: held to the floor");
+            let start = key_start(swap);
+            let in_the_delay = key_in_the_delay(swap);
+            assert_eq!(
+                in_the_delay,
+                after - 1 < delay,
+                "{case}: setup: inside the delay window by the table"
+            );
+            assert_eq!(
+                start,
+                if in_the_delay {
+                    gop
+                } else {
+                    gop + u64::from(profile.forced_keyframe_min_frames())
+                },
+                "{case}: setup: where the stream starts"
+            );
             pace(&mut p, 0..swap, slate);
             thread::sleep(OWED84_ENCODED_SETTLE);
             swap_when_asked(&mut p, &lines, 1, &file_target(&dir.file("a.flv")));
-            let end = due + gop + OWED84_MARGIN_TICKS;
+            let (taken, not_asked) = (
+                logged(&lines, "output gen=1: the keyframe request was taken"),
+                logged(&lines, &format!("output gen=1: {KEY_IN_FLIGHT_LINE}")),
+            );
+            assert_eq!(
+                (taken, not_asked),
+                if in_the_delay { (0, 1) } else { (1, 0) },
+                "{case}: asked (taken, not asked)"
+            );
+            let end = start + gop + OWED84_MARGIN_TICKS;
             pace(&mut p, swap..end, slate);
             drain_and_wait(&mut p, &rx);
             let d = decode(&dir.file("a.flv"));
             assert!(d.first_is_key(), "{case}");
             let n = d.frames.len() as u64;
-            let owed = end - due;
+            let owed = end - start;
             eprintln!(
-                "{case}: {n} frames for the {owed} from the floor; keyframes at {:?}",
+                "{case}: {n} frames for the {owed} from {start}; keyframes at {:?}",
                 key_indexes(&d)
             );
             assert!(
                 n <= owed,
-                "{case}: {n} frames for the {owed} from the floor: it started before the floor"
+                "{case}: {n} frames for the {owed} from {start}: it started before its keyframe"
             );
             assert!(
                 n + OWED84_KEY_WAIT_TICKS >= owed,
@@ -2129,11 +2160,20 @@ fn a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor() {
                 );
                 intervals += 1;
             }
+            if in_the_delay {
+                served += 1;
+            } else {
+                held += 1;
+            }
             cases += 1;
         }
     }
-    eprintln!("asked after the GOP's keyframe: cases {cases}, key intervals checked {intervals}");
-    assert_eq!(cases, 4);
+    eprintln!(
+        "asked after the GOP's keyframe: cases {cases} ({served} served by the GOP's own, {held} held to \
+         the floor), key intervals checked {intervals}"
+    );
+    assert_eq!(cases, 2 * (inside.len() + past.len()));
+    assert_eq!((served, held), (2 * inside.len(), 2 * past.len()));
     assert!(intervals >= cases, "intervals checked: {intervals}");
 }
 
@@ -2386,21 +2426,63 @@ fn an_encoder_that_stalls_reports_encoder_overrun_and_the_programme_carries_on()
     let dir = Tmp::new("overrun");
     let (mut p, rx, _f, _l) = programme();
     p.swap_sink(1, &file_target(&dir.file("a.flv")));
-    pace(&mut p, 0..15, FrameChoice::Slate(SlateKind::Waiting));
+    // F-040: the hook takes the encoder's NEXT output, and x264 holds `delay_ticks()` frames before
+    // its first, so the stall is armed once 15 frames are out (the stream is up), not after 15 in.
+    let (armed, total) = (15 + delay_ticks(), 120 + delay_ticks());
+    pace(&mut p, 0..armed, FrameChoice::Slate(SlateKind::Waiting));
     assert!(p.hang_encoder(Duration::from_millis(2_000)), "the encoder hook");
-    pace(&mut p, 15..120, FrameChoice::Slate(SlateKind::Waiting));
+    pace(&mut p, armed..total, FrameChoice::Slate(SlateKind::Waiting));
     let seen = drain_and_wait(&mut p, &rx);
     let overruns = seen.iter().filter(|e| **e == Event::EncoderOverrun).count();
     eprintln!("encoder overruns read: {overruns}");
     assert!(overruns >= 1, "{seen:?}");
     let d = decode(&dir.file("a.flv"));
-    eprintln!("frames after a 2 s encoder stall: {} of 120", d.frames.len());
+    eprintln!("frames after a 2 s encoder stall: {} of {total}", d.frames.len());
+    // Where each frame went: the stretches of continuous picture, and which frames are keyframes.
+    let mut runs: Vec<(u64, u64, usize)> = Vec::new();
+    for &t in &d.video_pts_ms {
+        match runs.last_mut() {
+            Some(run) if t.saturating_sub(run.1) <= 100 => {
+                run.1 = t;
+                run.2 += 1;
+            }
+            _ => runs.push((t, t, 1)),
+        }
+    }
+    let keys: Vec<usize> = d
+        .keys
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k)
+        .map(|(i, _)| i)
+        .collect();
+    eprintln!("stall accounting: pictures (from ms, to ms, frames) {runs:?}");
+    eprintln!(
+        "stall accounting: keyframes at {keys:?}; ring pruned {:?}",
+        p.ring_pruned()
+    );
     // The leaky queue dropped what the stalled encoder could not take; the programme went on.
     assert!(
-        d.frames.len() < 120,
+        (d.frames.len() as u64) < total,
         "nothing was dropped, so the stall was not real"
     );
-    assert!(d.frames.len() >= 60, "{}", d.frames.len());
+    // F-040: every frame the leaky queue did not drop comes out. Each drop is one overrun, so the
+    // frames out and the overruns account for every frame pushed, within the pipeline's own depth
+    // (`OWED84_MARGIN_TICKS`' note: the appsrcs hold at most 3 ticks). Not a typed floor: the
+    // delayed encoder's in-flight frames come out after the stall, behind audio that never stalled,
+    // and one of them dropped by the ring's span made the output wait for the next keyframe, a GOP
+    // away: 59 of 144 came out (check run 45750515672), 55 on the run before.
+    let in_the_pipeline = 3;
+    assert!(
+        d.frames.len() as u64 + overruns as u64 + in_the_pipeline >= total,
+        "{} frames out, {overruns} dropped at the queue, of {total}",
+        d.frames.len()
+    );
+    assert_eq!(
+        p.ring_pruned().0,
+        0,
+        "the ring dropped a picture for the audio ahead of it"
+    );
     assert_eq!(p.builds(), 1);
 }
 
@@ -2483,9 +2565,12 @@ fn a_held_sink_reads_flat_while_the_encoders_deliver_and_the_link_backs_it_off()
         }
     };
     let fps = u64::from(P720.fps);
+    // F-040: a second of frames is out of the encoder `delay_ticks()` later, and the sink has to be
+    // sending (its total grown) before it is held, so the hold comes after the delay as well.
+    let held_from = fps + delay_ticks();
     pace_with(
         &mut p,
-        0..fps,
+        0..held_from,
         |_| FrameChoice::Slate(SlateKind::Waiting),
         |_| take(&mut readings),
     );
@@ -2493,7 +2578,7 @@ fn a_held_sink_reads_flat_while_the_encoders_deliver_and_the_link_backs_it_off()
     let held_at = t0.elapsed().as_millis() as Ms;
     pace_with(
         &mut p,
-        fps..3 * fps,
+        held_from..held_from + 2 * fps,
         |_| FrameChoice::Slate(SlateKind::Waiting),
         |_| take(&mut readings),
     );
@@ -2555,19 +2640,23 @@ fn a_swap_away_from_a_hung_sink_does_not_wait_for_its_teardown() {
     let dir = Tmp::new("swap-hung");
     let (mut p, rx, _f, _l) = programme();
     p.swap_sink(1, &file_target(&dir.file("a.flv")));
-    pace(&mut p, 0..15, FrameChoice::Slate(SlateKind::Waiting));
+    // F-040: the sink's next write is armed once 15 frames are out of the encoder (it is up and
+    // writing), which is `delay_ticks()` frames later than 15 frames in.
+    let (armed, swap) = (15 + delay_ticks(), 20 + delay_ticks());
+    pace(&mut p, 0..armed, FrameChoice::Slate(SlateKind::Waiting));
     assert!(p.hang_sink(Duration::from_secs(3)), "the sink hook");
-    pace(&mut p, 15..20, FrameChoice::Slate(SlateKind::Waiting));
+    pace(&mut p, armed..swap, FrameChoice::Slate(SlateKind::Waiting));
     thread::sleep(Duration::from_millis(300));
     let teardowns = p.teardown_counter();
     let t = Instant::now();
     p.swap_sink(2, &file_target(&dir.file("b.flv")));
     let took = t.elapsed();
     let in_flight = teardowns.load(Ordering::SeqCst);
-    // Sink 2's keyframe is held to the floor after frame 0's (F-036); 45 ticks on from it.
+    // Sink 2's keyframe is held to the floor after frame 0's (F-036), or is the GOP's own in the
+    // delay (`key_start`); it comes out `delay_ticks()` after it is made (F-040); 45 ticks on from it.
     pace(
         &mut p,
-        20..key_due(20, 0) + 45,
+        swap..key_start(swap) + delay_ticks() + 45,
         FrameChoice::Slate(SlateKind::Waiting),
     );
     let grown = progress_of(&events_for(&rx, Duration::from_millis(600)), 2);
@@ -2738,6 +2827,18 @@ fn egress_and_bitrate_survive_a_swap_just_before_the_old_poll() {
         ms(first_polls),
         ms(each_polls)
     );
+    // F-040: a new sink's keyframe comes out `X264_DELAY_MS` after its swap (forced at the swap, or
+    // the GOP's own in the delay), so it sends from then and its first full 1 s window of sending is
+    // read that much later than the 1.6 s that served a zero-delay encoder (the first poll's 250 ms,
+    // one window, and a margin). The read has to land inside the sink's own life, after the poll that
+    // completes that window (`first poll + 1 s + the delay`, on the poll grid).
+    let read_at = Duration::from_millis(1_600 + X264_DELAY_MS);
+    assert!(
+        read_at < Duration::from_millis(ms(each_polls))
+            && read_at >= Duration::from_millis(poll_ms + 1_000 + X264_DELAY_MS),
+        "setup: the read at {read_at:?} is not inside a sink's {} ms life, after its window",
+        ms(each_polls)
+    );
     swap_before_the_first_frame(&mut p, &lines, 1, &file_target(&dir.file("g1.flv")));
     let mut built = Instant::now();
     let t0 = Instant::now();
@@ -2773,12 +2874,13 @@ fn egress_and_bitrate_survive_a_swap_just_before_the_old_poll() {
         push_until(&mut p, built + Duration::from_millis(120), &mut i);
         let egress = stats.snapshot().egress_bytes.unwrap_or(0);
         let disk = on_disk(gen);
-        // 1.6 s on, the new sink's first window (from its first poll at 250 ms) is complete.
-        push_until(&mut p, built + Duration::from_millis(1_600), &mut i);
+        // 1.6 s on (F-040: and the delay), the new sink's first window of sending (from its first
+        // poll at 250 ms) is complete.
+        push_until(&mut p, built + read_at, &mut i);
         let later = stats.snapshot();
         let disk_later = on_disk(gen);
         eprintln!(
-            "gen {gen}: +120 ms egress {egress} on disk {disk}; +1.6 s egress {:?} on disk {disk_later}, bitrate {:?}",
+            "gen {gen}: +120 ms egress {egress} on disk {disk}; +{read_at:?} egress {:?} on disk {disk_later}, bitrate {:?}",
             later.egress_bytes, later.bitrate_kbps
         );
         assert!(
@@ -2959,9 +3061,11 @@ fn each_output_rebases_its_first_timestamps_to_zero() {
     let second = floor_ticks();
     pace(&mut p, 0..second, FrameChoice::Slate(SlateKind::Waiting));
     p.swap_sink(2, &file_target(&dir.file("b.flv")));
+    // F-040: the keyframe the swap asks for is made at its swap and comes out a frame delay later,
+    // and the output's first PTS is read when it has.
     pace(
         &mut p,
-        second..second + 30,
+        second..second + 30 + delay_ticks(),
         FrameChoice::Slate(SlateKind::Waiting),
     );
     let (video, audio) = p.output_first_pts().expect("an output");
@@ -3249,8 +3353,11 @@ fn skipped_ticks_leave_no_hole_in_the_audio() {
 // camera (red) from then on, so a frame from before that margin is told by its picture.
 
 /// Camera ticks before the reconnect point. A frame the programme had not yet encoded when the sink
-/// could send is not stale (the encoder's own pipeline: the appsrcs hold at most 3 ticks, and
-/// zerolatency x264 adds none), so the slate stops 10 ticks (333 ms) before the reconnect.
+/// could send is not stale (the encoder's own pipeline: the appsrcs hold at most 3 ticks), so the
+/// slate stops 10 ticks (333 ms) before the reconnect. F-040: x264's delay (`X264_DELAY_FRAMES`) is
+/// not in it: the stream starts at a keyframe made at or after the reconnect point, on a frame pushed
+/// after it, except where the GOP's own keyframe is in the delay (`key_in_the_delay`), whose tests
+/// run on slate throughout.
 const OWED84_MARGIN_TICKS: u64 = 10;
 /// The keyframe asked for at the reconnect point comes within this many ticks (6, 200 ms). The
 /// encoder's own next keyframe could be a whole GOP away (F-036's 3 s, `OutputProfile::gop_frames`),
@@ -3319,21 +3426,93 @@ fn last_natural_key(tick: u64) -> u64 {
     tick / gop_ticks() * gop_ticks()
 }
 
+/// F-040: the encoder's frame delay in ticks (`X264_DELAY_FRAMES`, a bound: the shipped settings hold
+/// 23 frames and the declared 24 is L2's). Both profiles run 30 fps, so a tick is a frame.
+fn delay_ticks() -> u64 {
+    u64::from(X264_DELAY_FRAMES)
+}
+
+/// F-040: how far from the edge of the delay window a test places its swap. The window's edge is the
+/// encoder's real delay (23 frames shipped, 24 declared), a coin toss at the tick; a swap this many
+/// ticks either side is not.
+const WINDOW_EDGE_TICKS: u64 = 3;
+
+/// F-040: whether the GOP's own keyframe is still in the encoder's delay when a sink swapped in at
+/// `swap` (frames `0..swap` pushed) can send. Then it serves the swap, and the feeder asks for none
+/// (`gst_output::own_key_in_flight`): the newest natural keyframe pushed is fewer than the delay's
+/// frames behind the newest frame pushed. Before the first output (`swap` within the delay) the
+/// keyframe is frame 0, the encoder's first. Refuses a swap within `WINDOW_EDGE_TICKS` of the edge.
+fn key_in_the_delay(swap: u64) -> bool {
+    let newest = swap - 1;
+    let since = newest - last_natural_key(newest);
+    let delay = delay_ticks();
+    assert!(
+        since + WINDOW_EDGE_TICKS <= delay || since >= delay + WINDOW_EDGE_TICKS,
+        "setup: a swap at tick {swap} is {since} ticks after a keyframe, on the edge of the {delay}-tick delay"
+    );
+    since < delay
+}
+
+/// F-040: the tick the stream of a sink swapped in at `swap` starts at: the GOP's own keyframe when
+/// it is in the encoder's delay (`key_in_the_delay`), else the keyframe asked for, `key_due`. In a
+/// programme no swap has forced a keyframe in.
+fn key_start(swap: u64) -> u64 {
+    let recent = last_natural_key(swap - 1);
+    if key_in_the_delay(swap) {
+        recent
+    } else {
+        key_due(swap, recent)
+    }
+}
+
+/// The first tick at or after `tick` that `key_in_the_delay` answers without refusing: a swap placed
+/// by a loop is moved past the window of any natural keyframe it lands in (F-040).
+fn clear_of_the_delay_window(tick: u64) -> u64 {
+    let mut t = tick;
+    loop {
+        let newest = t - 1;
+        let since = newest - last_natural_key(newest);
+        let delay = delay_ticks();
+        if since + WINDOW_EDGE_TICKS <= delay || since >= delay + WINDOW_EDGE_TICKS {
+            return t;
+        }
+        t += 1;
+    }
+}
+
 /// Swaps in sink `gen` and waits for its feeder's line that the encoder took the keyframe request
 /// (Owed 84), which it logs after the ask (the C1 review's m4), so the ask has reached the encoder
 /// before the next push. F-036's floor makes the order count: an ask that reaches the encoder after
 /// a keyframe has gone into the ring is held to the floor after it, which moves every keyframe after.
 fn swap_when_asked(p: &mut GstProgramme, lines: &Lines, gen: u64, target: &TargetSpec) {
     p.swap_sink(gen, target);
-    assert!(
-        wait_for_line(
+    // F-040: either the feeder asked the encoder (logged after the ask), or the GOP's own keyframe is
+    // in the encoder's delay and it asked none (`KEY_IN_FLIGHT_LINE`): the swap is placed by
+    // `key_start`, which says which.
+    let end = Instant::now() + Duration::from_secs(3);
+    let settled = loop {
+        if logged(
             lines,
             &format!("output gen={gen}: the keyframe request was taken"),
-            Duration::from_secs(3)
-        ),
-        "gen {gen}: the keyframe request was never taken"
+        ) > 0
+            || logged(lines, &format!("output gen={gen}: {KEY_IN_FLIGHT_LINE}")) > 0
+        {
+            break true;
+        }
+        if Instant::now() >= end {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        settled,
+        "gen {gen}: the keyframe request was never taken, nor refused as in flight"
     );
 }
+
+/// The feeder's line when it asks for no keyframe because the GOP's own is in the encoder's delay
+/// (F-040, `gst_output::own_key_in_flight`).
+const KEY_IN_FLIGHT_LINE: &str = "the keyframe is not asked: the GOP's own keyframe";
 
 /// Swaps in sink `gen` before the programme's first frame and waits for its feeder's line that it
 /// asked for no keyframe (CI on PR #109): the ring holds no video, so the encoder's first frame, a
@@ -3380,8 +3559,20 @@ fn assert_all_camera(case: &str, d: &Decoded) -> usize {
 /// and the audio starts with the picture, never ahead of it. `paced` is the ticks pushed after the
 /// reconnect point, and `wait` the ticks from it to the keyframe's due tick (`key_due`, F-036): a
 /// keyframe held to the floor starts the stream there, and nothing from before it is sent. Returns
-/// the frames checked.
-fn assert_fresh_start(case: &str, server: &FakeRtmp, dir: &Tmp, paced: u64, wait: u64) -> usize {
+/// the frames checked. F-040: `drain_at` is when the drain began. The drain's EOS flushes the
+/// frames x264 still holds (up to `X264_DELAY_MS` of programme) at once, so a message received after
+/// it may run that much further ahead than the burst bound; before it, the bound is the slack alone.
+/// That is what these scenarios show, not a product guarantee: nothing after the encoder paces its
+/// output, so an encoder stall or a CPU catch-up releases the same frames at once mid-stream, which
+/// no test bounds (Owed 123).
+fn assert_fresh_start(
+    case: &str,
+    server: &FakeRtmp,
+    dir: &Tmp,
+    paced: u64,
+    wait: u64,
+    drain_at: Instant,
+) -> usize {
     let n = server.settle(Duration::from_millis(400), Duration::from_secs(8));
     let path = dir.file(&format!("{case}.flv"));
     let tags = server.write_flv(&path);
@@ -3417,15 +3608,29 @@ fn assert_fresh_start(case: &str, server: &FakeRtmp, dir: &Tmp, paced: u64, wait
         first_video.ts_ms
     );
     let (anchor_ts, anchor_at) = (frames[0].ts_ms, frames[0].at);
-    let (mut ahead_most, mut back) = (i128::MIN, 0);
+    let (mut ahead_most, mut back, mut live, mut flushed) = (i128::MIN, 0, 0, 0);
     for (i, m) in frames.iter().enumerate() {
         let ahead =
             i128::from(m.ts_ms - anchor_ts.min(m.ts_ms)) - m.at.duration_since(anchor_at).as_millis() as i128;
         ahead_most = ahead_most.max(ahead);
+        let in_the_flush = m.at >= drain_at;
+        let bound = OWED84_BURST_SLACK_MS as i128
+            + if in_the_flush {
+                i128::from(X264_DELAY_MS)
+            } else {
+                0
+            };
+        if in_the_flush {
+            flushed += 1;
+        } else {
+            live += 1;
+        }
         assert!(
-            ahead <= OWED84_BURST_SLACK_MS as i128,
-            "{case}: message {i} (ts {} ms) arrived {ahead} ms ahead of real time: a burst",
-            m.ts_ms
+            ahead <= bound,
+            "{case}: message {i} (ts {} ms) arrived {ahead} ms ahead of real time: a burst (bound {bound} ms, \
+             {})",
+            m.ts_ms,
+            if in_the_flush { "in the drain's flush" } else { "before the drain" }
         );
         if i > 0 && m.ts_ms < frames[i - 1].ts_ms {
             back += 1;
@@ -3437,6 +3642,11 @@ fn assert_fresh_start(case: &str, server: &FakeRtmp, dir: &Tmp, paced: u64, wait
         );
     }
     assert_eq!(back, 0, "{case}: {back} messages arrived out of timestamp order");
+    eprintln!("{case}: burst bound checked on {live} messages before the drain and {flushed} in its flush");
+    assert!(
+        live > 0,
+        "{case}: no message arrived before the drain, so the burst bound checked nothing"
+    );
     drop(rec);
     let d = decode(&path);
     assert!(
@@ -3507,6 +3717,7 @@ fn a_sink_whose_connect_is_pending_when_the_destination_returns_sends_nothing_qu
     let clear = 120 + OWED84_MARGIN_TICKS;
     server.release();
     pace(&mut p, clear..clear + 90, FrameChoice::Emit);
+    let drain_at = Instant::now();
     let seen = drain_and_wait(&mut p, &rx);
     assert!(
         !seen.iter().any(|e| matches!(e, Event::OutputError { .. })),
@@ -3519,7 +3730,7 @@ fn a_sink_whose_connect_is_pending_when_the_destination_returns_sends_nothing_qu
         wait > OWED84_KEY_WAIT_TICKS,
         "setup: the keyframe is held, {wait}"
     );
-    assert_fresh_start("pending", &server, &dir, 90, wait);
+    assert_fresh_start("pending", &server, &dir, 90, wait, drain_at);
 }
 
 /// C14's green phase: the pending connect fails first (in C14 at rtmp2sink's 5 s socket timeout;
@@ -3556,15 +3767,19 @@ fn after_a_connect_that_failed_the_next_sink_sends_nothing_queued() {
     }
     // Never on the GOP's own keyframe (F-036): there the connect and that keyframe race, and the
     // stream would start at it or at the floor after it as the race goes.
+    // F-040: nor in the delay after it, where the GOP's own keyframe would serve the swap instead
+    // (`key_in_the_delay`); `clear_of_the_delay_window` moves the swap past the window of any.
     let swap = if (tick + OWED84_MARGIN_TICKS).is_multiple_of(gop_ticks()) {
         tick + 2 * OWED84_MARGIN_TICKS
     } else {
         tick + OWED84_MARGIN_TICKS
     };
+    let swap = clear_of_the_delay_window(swap);
     pace(&mut p, tick..swap, FrameChoice::Emit);
     let second = FakeRtmp::prompt();
     p.swap_sink(2, &rtmp_target(&second));
     pace(&mut p, swap..swap + 90, FrameChoice::Emit);
+    let drain_at = Instant::now();
     drain_and_wait(&mut p, &rx);
     eprintln!("failed: gen 1 errored by tick {tick}; queue samples while it connected {samples}");
     assert!(
@@ -3572,8 +3787,8 @@ fn after_a_connect_that_failed_the_next_sink_sends_nothing_queued() {
         "the first connect was pending only {samples} samples"
     );
     // Sink 1 never could send, so it asked for nothing: the last keyframe is the GOP's.
-    let wait = key_due(swap, last_natural_key(swap)) - swap;
-    assert_fresh_start("failed", &second, &dir, 90, wait);
+    let wait = key_start(swap) - swap;
+    assert_fresh_start("failed", &second, &dir, 90, wait, drain_at);
 }
 
 /// The drain ends with the encoders while the sink is still connecting: nothing is owed to a sink
@@ -3622,16 +3837,31 @@ const FIRST_GOP_OVER_QUEUE: &str = "output gen=1: the encoder's first frames hol
 
 /// What one Owed 112 leg's destination received, and what its feeder logged.
 struct LatePublish {
+    /// The video frames the ring held when the publish landed (F-040: not the frames pushed, which
+    /// run a frame delay ahead of them).
+    late: u64,
+    /// The ticks pushed when it landed: the reconnect point, in ticks.
+    pushed: u64,
     d: Decoded,
     lines: Lines,
-    /// The most a received message ran ahead of real time, from the first one received (F-023).
+    /// The most a message received before the drain began ran ahead of real time, from the first one
+    /// received (F-023).
     ahead_most_ms: i128,
+    /// The same for a message received after it: the drain's EOS flushes the frames x264 still holds
+    /// (F-040), up to `X264_DELAY_MS` of programme, at once.
+    flush_ahead_ms: i128,
+    /// How many messages each of the two measures read.
+    live_messages: usize,
+    flushed_messages: usize,
     /// The first AAC message's timestamp, as the destination received it.
     first_audio_ts_ms: Option<u32>,
 }
 
 /// One Owed 112 leg: sink 1 is swapped in before the programme's first frame, and its publish is
 /// held until `late` camera frames are in the ring, then accepted; `total` ticks are paced in all.
+/// F-040: x264 holds `X264_DELAY_FRAMES` frames, so the ring holds `late` after `late` plus the delay
+/// are pushed; the count the ring really held (within a frame of `late`: the shipped delay is a frame
+/// under the declared one) is `LatePublish::late`, and every expectation reads that.
 fn publish_late(case: &str, profile: &OutputProfile, late: u64, total: u64, dir: &Tmp) -> LatePublish {
     let server = FakeRtmp::held();
     let (mut p, rx, frames, lines) = programme_with(profile);
@@ -3643,20 +3873,24 @@ fn publish_late(case: &str, profile: &OutputProfile, late: u64, total: u64, dir:
     ));
     let stats = p.stats();
     p.swap_sink(1, &rtmp_target(&server));
-    pace(&mut p, 0..late, FrameChoice::Emit);
+    let pushed = late + delay_ticks();
+    pace(&mut p, 0..pushed, FrameChoice::Emit);
     thread::sleep(OWED84_ENCODED_SETTLE);
-    assert_eq!(
-        stats.snapshot().encoded_frames,
-        Some(late),
-        "{case}: setup: the late frames reached the ring before the publish"
+    let held = stats.snapshot().encoded_frames.unwrap_or(0);
+    assert!(
+        (late..=late + 1).contains(&held),
+        "{case}: setup: {held} frames reached the ring of the {late} asked ({pushed} pushed, delay {})",
+        delay_ticks()
     );
+    let late = held;
     assert_eq!(server.record().published, 0, "{case}: setup: the publish is held");
     server.release();
     assert!(
         wait_for_line(&lines, GATE_OPEN_LINE, Duration::from_secs(3)),
         "{case}: the gate never opened"
     );
-    pace(&mut p, late..total, FrameChoice::Emit);
+    pace(&mut p, pushed..total, FrameChoice::Emit);
+    let drain_at = Instant::now();
     let seen = drain_and_wait(&mut p, &rx);
     assert!(
         !seen.iter().any(|e| matches!(e, Event::OutputError { .. })),
@@ -3675,13 +3909,13 @@ fn publish_late(case: &str, profile: &OutputProfile, late: u64, total: u64, dir:
         .collect();
     let first = media.first().expect("a frame was received");
     let (anchor_ts, anchor_at) = (first.ts_ms, first.at);
-    let ahead_most_ms = media
-        .iter()
-        .map(|m| {
-            i128::from(m.ts_ms - anchor_ts.min(m.ts_ms)) - m.at.duration_since(anchor_at).as_millis() as i128
-        })
-        .max()
-        .unwrap_or(i128::MIN);
+    let ahead_of = |m: &&rtmp::Media| {
+        i128::from(m.ts_ms - anchor_ts.min(m.ts_ms)) - m.at.duration_since(anchor_at).as_millis() as i128
+    };
+    let live: Vec<i128> = media.iter().filter(|m| m.at < drain_at).map(ahead_of).collect();
+    let flushed: Vec<i128> = media.iter().filter(|m| m.at >= drain_at).map(ahead_of).collect();
+    let ahead_most_ms = live.iter().copied().max().unwrap_or(i128::MIN);
+    let flush_ahead_ms = flushed.iter().copied().max().unwrap_or(i128::MIN);
     let first_audio_ts_ms = media.iter().find(|m| m.is_aac_frame()).map(|m| m.ts_ms);
     drop(rec);
     for l in lines.lock().unwrap_or_else(PoisonError::into_inner).iter() {
@@ -3690,9 +3924,14 @@ fn publish_late(case: &str, profile: &OutputProfile, late: u64, total: u64, dir:
         }
     }
     LatePublish {
+        late,
+        pushed,
         d: decode(&path),
         lines,
         ahead_most_ms,
+        flush_ahead_ms,
+        live_messages: live.len(),
+        flushed_messages: flushed.len(),
         first_audio_ts_ms,
     }
 }
@@ -3705,7 +3944,8 @@ fn publish_late(case: &str, profile: &OutputProfile, late: u64, total: u64, dir:
 /// time than the backlog taken (the `late - 1` frame periods from the first keyframe to the newest;
 /// CI read 1 122 ms for an 1 100 ms one) and Owed 84's slack (`OWED84_BURST_SLACK_MS`), so no frame
 /// from before the encoder's first was sent. Returns the frames checked.
-fn assert_first_gop_start(case: &str, leg: &LatePublish, late: u64, total: u64, gop: u64) -> usize {
+fn assert_first_gop_start(case: &str, leg: &LatePublish, total: u64, gop: u64) -> usize {
+    let late = leg.late;
     let d = &leg.d;
     let keys = key_indexes(d);
     eprintln!(
@@ -3753,9 +3993,24 @@ fn assert_first_gop_start(case: &str, leg: &LatePublish, late: u64, total: u64, 
     assert_eq!(keys, vec![0, gop], "{case}: the GOP's own keyframes, none forced");
     let backlog_ms = (late - 1) * 1_000 / u64::from(P720.fps);
     assert!(
+        leg.live_messages > 0,
+        "{case}: no message arrived before the drain, so the burst bound checked nothing"
+    );
+    assert!(
         leg.ahead_most_ms <= i128::from(backlog_ms) + OWED84_BURST_SLACK_MS as i128,
         "{case}: ran {} ms ahead of real time for a {backlog_ms} ms backlog",
         leg.ahead_most_ms
+    );
+    // F-040: the drain's flush of the frames in x264's delay, on top of the backlog and the slack.
+    eprintln!(
+        "{case}: {} messages before the drain, {} in its flush (at most {} ms ahead)",
+        leg.live_messages, leg.flushed_messages, leg.flush_ahead_ms
+    );
+    assert!(
+        leg.flush_ahead_ms
+            <= i128::from(backlog_ms) + OWED84_BURST_SLACK_MS as i128 + i128::from(X264_DELAY_MS),
+        "{case}: the drain's flush ran {} ms ahead of real time for a {backlog_ms} ms backlog",
+        leg.flush_ahead_ms
     );
     let checked = assert_all_camera(case, d);
     assert_eq!(checked as u64, total, "{case}");
@@ -3765,9 +4020,11 @@ fn assert_first_gop_start(case: &str, leg: &LatePublish, late: u64, total: u64, 
 /// Checks a leg whose backlog was dropped as Owed 84 drops it: nothing taken, the keyframe asked
 /// for, and the stream started at it, held to the floor after frame 0 (`key_due`). `over_queue`:
 /// whether the bytes guard was the one that refused (its line), rather than the time bound.
-fn assert_first_gop_dropped(case: &str, leg: &LatePublish, late: u64, total: u64, over_queue: bool) {
+fn assert_first_gop_dropped(case: &str, leg: &LatePublish, total: u64, over_queue: bool) {
     let d = &leg.d;
-    let due = key_due(late, last_natural_key(late));
+    // The gate opened with `late` frames in the ring, `pushed` ticks in (F-040).
+    let late = leg.late;
+    let due = key_start(leg.pushed);
     let owed = total - due;
     let n = d.frames.len() as u64;
     eprintln!(
@@ -3830,7 +4087,7 @@ fn a_publish_that_lands_frames_after_the_first_starts_at_the_first_keyframe() {
         let gop = u64::from(profile.gop_frames());
         let total = gop + OWED84_MARGIN_TICKS;
         let leg = publish_late(&case, &profile, late, total, &dir);
-        let checked = assert_first_gop_start(&case, &leg, late, total, gop);
+        let checked = assert_first_gop_start(&case, &leg, total, gop);
         eprintln!("{case}: frames checked {checked}");
         legs += 1;
     }
@@ -3839,9 +4096,9 @@ fn a_publish_that_lands_frames_after_the_first_starts_at_the_first_keyframe() {
 }
 
 /// Owed 112's two bounds. Within both (720p, 25 frames: 800 ms, about 417 KB at 4 Mbps) the backlog
-/// is taken. Past the time bound (720p, 32 frames: `FIRST_GOP_CATCH_UP_MAX_MS` from `config` and a
-/// frame), it is dropped by the time rule, which is read first (no bytes line). Inside
-/// the time bound and past `OUTPUT_QUEUE_BYTES` (1080p, 30 frames: 967 ms, about 750 KB at 6 Mbps)
+/// is taken. Past the time bound (720p, 34 frames: `FIRST_GOP_CATCH_UP_MAX_MS` from `config` and four
+/// frames), it is dropped by the time rule, which is read first (no bytes line). Inside
+/// the time bound and past `OUTPUT_QUEUE_BYTES` (1080p, 28 frames: 900 ms, about 700 KB at 6 Mbps)
 /// it is dropped by the bytes rule (the C3b review's m2). The time legs are 720p because only that
 /// rate stays under the queue for the whole bound; the bytes leg is 1080p because only its rate
 /// passes the queue inside it (the C3b review's m7). A dropped leg starts at the keyframe it asks
@@ -3853,11 +4110,18 @@ fn a_first_gop_backlog_within_both_bounds_is_taken_and_past_either_is_dropped() 
     let gop = gop_ticks();
     let total = gop + OWED84_MARGIN_TICKS;
     let bound = FIRST_GOP_CATCH_UP_MAX_MS * u64::from(P720.fps) / 1_000;
-    let (inside, past_time, past_bytes) = (25, bound + 2, bound);
-    // Each leg's premise, from `config` and the profiles, never from the rule.
+    // F-040: the legs sit two or more frames clear of their bound, since the ring holds a frame more
+    // or less than asked (`publish_late`: the shipped delay is a frame under the declared one).
+    let (inside, past_time, past_bytes) = (25, bound + 4, bound - 2);
+    // Each leg's premise, from `config` and the profiles, never from the rule. The gate opens `delay`
+    // ticks after the frames in the ring.
     assert!(
-        past_time + OWED84_KEY_WAIT_TICKS < floor_ticks(),
+        past_time + delay_ticks() + 1 + OWED84_KEY_WAIT_TICKS < floor_ticks(),
         "setup: a dropped backlog waits for the floor"
+    );
+    assert!(
+        past_bytes + delay_ticks() + 1 + OWED84_KEY_WAIT_TICKS < floor_ticks(),
+        "setup: a dropped backlog waits for the floor (bytes)"
     );
     assert!(
         (inside - 1) * 1_000 / u64::from(P720.fps) <= FIRST_GOP_CATCH_UP_MAX_MS
@@ -3877,17 +4141,17 @@ fn a_first_gop_backlog_within_both_bounds_is_taken_and_past_either_is_dropped() 
     let case = "owed112-inside-both";
     let dir = Tmp::new(case);
     let leg = publish_late(case, &P720, inside, total, &dir);
-    assert_first_gop_start(case, &leg, inside, total, gop);
+    assert_first_gop_start(case, &leg, total, gop);
 
     let case = "owed112-past-the-time-bound";
     let dir = Tmp::new(case);
     let leg = publish_late(case, &P720, past_time, total, &dir);
-    assert_first_gop_dropped(case, &leg, past_time, total, false);
+    assert_first_gop_dropped(case, &leg, total, false);
 
     let case = "owed112-past-the-output-queue";
     let dir = Tmp::new(case);
     let leg = publish_late(case, &p1080, past_bytes, total, &dir);
-    assert_first_gop_dropped(case, &leg, past_bytes, total, true);
+    assert_first_gop_dropped(case, &leg, total, true);
 }
 
 /// The file's size, 0 if it does not exist (filesink creates it when its pipeline starts).
@@ -3927,7 +4191,7 @@ fn logged(lines: &Lines, needle: &str) -> usize {
 /// rtmp2sink and filesink have nothing owed, and flvmux 1.24.2 forwards no EOS before its first
 /// buffer (PR #57 review I-1). This bound is the one the drain at a pending connect keeps.
 const OWED84_EMPTY_DRAIN_MAX: Duration = Duration::from_millis(1_500);
-/// A pause after the last paced tick that outlasts its encode (zerolatency x264 and the AAC
+/// A pause after the last paced tick that outlasts its encode (x264's frame threads and the AAC
 /// encoder take milliseconds), so no frame is encoded after the gate opens.
 const OWED84_ENCODED_SETTLE: Duration = Duration::from_millis(200);
 
@@ -4009,15 +4273,21 @@ fn a_drain_before_the_asked_keyframe_ends_without_waiting_for_it() {
 }
 
 /// I-1 (c) and m-6: an encoder that never takes the keyframe request. It is asked again at each
-/// frame; the swap comes just after the GOP's second keyframe and the 30 paced end before its
-/// third (`OutputProfile::gop_frames`, F-036), so nothing is sent, and the drain ends with the
-/// encoders.
+/// frame; the swap comes just after the GOP's second keyframe (and its delay, F-040) and the 30 paced
+/// end before its third (`OutputProfile::gop_frames`, F-036), so nothing is sent, and the drain ends
+/// with the encoders.
 #[test]
 fn a_keyframe_request_never_taken_sends_nothing_and_the_drain_ends_with_the_encoders() {
     let _s = serial();
     let dir = Tmp::new("owed84-not-taken");
     let (mut p, rx, _f, lines) = programme();
-    let swap = gop_ticks() + OWED84_MARGIN_TICKS;
+    // F-040: past the encoder's delay after the GOP's keyframe, or the GOP's own keyframe would be in
+    // it and serve the swap with no request made (`key_in_the_delay`).
+    let swap = gop_ticks() + delay_ticks() + OWED84_MARGIN_TICKS;
+    assert!(
+        !key_in_the_delay(swap),
+        "setup: the GOP's keyframe is out of the delay"
+    );
     assert!(
         swap + 30 + OWED84_KEY_WAIT_TICKS < 2 * gop_ticks(),
         "setup: no keyframe of the encoder's own"

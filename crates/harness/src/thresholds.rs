@@ -11,9 +11,9 @@
 //! `cargo test`, not in a two-minute chaos run.
 use domain::config::{
     OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN,
-    FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
+    FORCED_KEYFRAME_ARRIVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
     PLAYOUT_CAP_MS, PLAYOUT_EARLY_REANCHOR_MS, PLAYOUT_SETTLE_MS, PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_TARGET_MS,
-    TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
+    TICK_WIDEST_MS, X264_DELAY_MS, YOUTUBE_KEPT_GAP_MS,
 };
 use serde_json::{json, Map, Value};
 
@@ -30,24 +30,33 @@ pub const BUDGET_RETURN_TO_LIVE_MS: u64 = 1_200;
 /// is waited for: lib.jq's error-to-swap bound (a swap is built after the back-off, before any
 /// keyframe; CI on PR #109 found the floor-widened bound loosened that guard by 2.2 s).
 pub const SPEC_OUTPUT_RECONNECT_MS: u64 = 5_000;
-/// The output reconnect budget every case reads: spec §6's ≤5 s and F-036's forced-keyframe floor
-/// (the C1 review's I2(a); the owner's apply-rec ruling 2026-11-24, docs/_INDEX.md: spec §6's "≤5 s"
-/// now reads "≤5 s + forced-key floor"). A reconnected sink starts at the keyframe its swap asks for,
-/// which the encoder holds to the floor after its last one. Its readers: run-case.sh's
+/// The output reconnect budget every case reads: spec §6's ≤5 s and the forced keyframe's arrival,
+/// F-036's floor and F-040's encoder delay (the C1 review's I2(a); the owner's apply-rec ruling
+/// 2026-11-24, docs/_INDEX.md: spec §6's "≤5 s" now reads "≤5 s + forced-key floor", and since C5
+/// the floor is joined by the look-ahead's 0.8 s). A reconnected sink starts at the keyframe its swap
+/// asks for, which the encoder holds to the floor after its last one and then in its look-ahead. Its readers: run-case.sh's
 /// `output_reconnect`, case 18 (`output-hung.sh`) and the soak's verdict 2 (`soak/verdict.jq`).
 /// Not lib.jq's error-to-swap bound, which waits for no keyframe (`SPEC_OUTPUT_RECONNECT_MS`).
-pub const BUDGET_OUTPUT_RECONNECT_MS: u64 = SPEC_OUTPUT_RECONNECT_MS + FORCED_KEYFRAME_MIN_INTERVAL_MS;
+pub const BUDGET_OUTPUT_RECONNECT_MS: u64 = SPEC_OUTPUT_RECONNECT_MS + FORCED_KEYFRAME_ARRIVAL_MS;
 /// Spec §6, the failure table's output disconnect / stall row: "≤2 s of programme lost".
 pub const BUDGET_OUTPUT_LOST_MAX_MS: u64 = 2_000;
 /// Spec §6, the failure table's encoder overrun row: "Real time within 10 s".
 pub const BUDGET_LADDER_REALTIME_MS: u64 = 10_000;
 /// Spec §6, the failure table's process crash row: "Output back ≤15 s". The same number as the
 /// domain's `YOUTUBE_KEPT_GAP_MS` (F-004: YouTube's broadcast split; owner, 2026-10-20, Owed 69).
-/// Not `OUTPUT_GAP_BUDGET_MS`, which F-036 raised by the forced-keyframe floor for the output's
-/// recovery paths only (the C1 review's I2(b), which names those readers and not this one).
+/// Not `OUTPUT_GAP_BUDGET_MS`, which F-036 and F-040 raised by the forced keyframe's arrival for the
+/// output's recovery paths only (the C1 review's I2(b), which names those readers and not this one).
 pub const BUDGET_PROCESS_RESTART_OUTPUT_MS: u64 = YOUTUBE_KEPT_GAP_MS;
 /// Spec §6 "Budgets": "input frame→encoder ≤150 ms".
 pub const BUDGET_FRAME_TO_ENCODER_MS: u64 = 150;
+/// How much later than the compositor's own log the output strip can show what the log says it did:
+/// spec §6's frame-to-encoder budget (`BUDGET_FRAME_TO_ENCODER_MS`) and then the encoder's frame
+/// delay (`X264_DELAY_MS`, F-040: x264's look-ahead and frame threads hold 0.8 s of frames, so the
+/// first frame made without the overlay comes out that much after the line that hid it). The strip is
+/// the destination's recording (MediaMTX), after the encoder, so the delay is in it; the log line is
+/// before the encoder, so it is not. Read by `cef-hung`'s `detect_ms` (the strip's gap after the
+/// logged hide); the other side, a strip BEFORE the log, keeps `BUDGET_FRAME_TO_ENCODER_MS` alone.
+pub const BUDGET_STRIP_AFTER_LOG_MS: u64 = BUDGET_FRAME_TO_ENCODER_MS + X264_DELAY_MS;
 /// The C14 brief's budget table: the PDF's A/V budget, which spec §6 adopts as written ("The PDF's
 /// failure table, timing budgets and resource bounds are adopted as written"); §6's own text names
 /// no A/V number.
@@ -276,6 +285,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         json!(BUDGET_PROCESS_RESTART_OUTPUT_MS),
     );
     put("budget_frame_to_encoder_ms", json!(BUDGET_FRAME_TO_ENCODER_MS));
+    put("budget_strip_after_log_ms", json!(BUDGET_STRIP_AFTER_LOG_MS));
     put("budget_av_offset_ms", json!(BUDGET_AV_OFFSET_MS));
     put("budget_av_pair_max_ms", json!(BUDGET_AV_PAIR_MAX_MS));
     put(
@@ -466,11 +476,11 @@ mod tests {
         assert!(t.output_backoff_cap_ms < SPEC_OUTPUT_RECONNECT_MS);
         assert_eq!(
             BUDGET_OUTPUT_RECONNECT_MS,
-            5_000 + 2_200,
-            "spec §6's 5 s and F-036's floor"
+            5_000 + 2_200 + 800,
+            "spec §6's 5 s, F-036's floor and F-040's encoder delay"
         );
-        // The output's recovery paths add the same floor to F-004's 15 s.
-        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_200);
+        // The output's recovery paths add the same arrival to F-004's 15 s.
+        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_200 + 800);
         // The restart budget is YouTube's split (F-004) and no looser.
         assert_eq!(BUDGET_PROCESS_RESTART_OUTPUT_MS, 15_000);
     }
@@ -560,6 +570,37 @@ mod tests {
         assert!(
             after_blank < BUDGET_PROCESS_RESTART_OUTPUT_MS,
             "a blank page's reload ({after_blank} ms after it is called blank) slower than a process restart"
+        );
+    }
+
+    // F-040 (C5): the strip is measured after the encoder, the log before it, so the strip lags the log
+    // by the encoder's delay on top of spec §6's frame-to-encoder budget. CI run 45737841032 read
+    // 758 ms against the old 150. The two terms each come from their own declaration (the spec's 150,
+    // pinned by `every_budget_is_the_number_its_source_states`, and the domain's delay), the committed
+    // file carries the sum, and a delay of a whole GOP or more would be no budget at all.
+    #[test]
+    fn the_strip_budget_is_the_encoder_budget_plus_the_encoders_delay() {
+        let v = dump(AdapterConsts {
+            cef_child_poll_ms: 2,
+            encoded_ring_span_ms: 3,
+            reaper_kill_after_ms: 4,
+            teardown_leak_after_ms: 5,
+            audio_bytes_per_ms: 6,
+        });
+        let want = BUDGET_FRAME_TO_ENCODER_MS + X264_DELAY_MS;
+        assert_eq!(v["budget_strip_after_log_ms"].as_u64(), Some(want));
+        let (_, committed) = committed();
+        assert_eq!(committed["budget_strip_after_log_ms"].as_u64(), Some(want));
+        assert!(
+            committed["budget_strip_after_log_ms"].as_u64().unwrap_or(0)
+                > committed["budget_frame_to_encoder_ms"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
+            "the strip budget is no wider than the encoder's own"
+        );
+        assert!(
+            want < domain::config::PROGRAMME_GOP_MS,
+            "{want} ms is a whole GOP of lag"
         );
     }
 

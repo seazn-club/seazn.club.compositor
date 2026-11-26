@@ -208,22 +208,23 @@ pub const OUTPUT_FPS_MIN_WINDOW_MS: Ms = 2_500;
 /// organiser's broadcast through 5 s and 15 s output gaps and started a new broadcast after a 30 s
 /// one. The longest gap it was seen to keep. A const, not a `Thresholds` field: it is YouTube's
 /// behaviour, not a setting of ours. The process restart's budget (spec §6, "Output back ≤15 s") is
-/// this number; the output's recovery paths add F-036's floor to it (`OUTPUT_GAP_BUDGET_MS`).
+/// this number; the output's recovery paths add the forced keyframe's arrival to it (`OUTPUT_GAP_BUDGET_MS`).
 pub const YOUTUBE_KEPT_GAP_MS: Ms = 15_000;
 
 /// Every output recovery path the broadcast must survive finishes its output gap UNDER this: F-004's
-/// 15 s and the forced keyframe's floor (F-036; the C1 review's I2, the controller's ruling and the
-/// owner's apply-rec, 2026-11-24). A recovering sink's picture comes back at the keyframe its swap
-/// asks for, which the encoder holds to the floor after its last one: up to the floor after the new
-/// sink's first bytes. The rest of each path keeps F-004's 15 s (`output_egress_flat_ms` takes the
-/// floor back out, so the backstop's threshold does not move: a false hung declaration costs more
-/// than the floor). 17.2 s is past the longest gap YouTube was seen to keep and short of the 30 s that
-/// split the broadcast; the cost if YouTube splits between them is a documented worst gap 2.2 s
-/// longer. Not in it: F-028's lost forced keyframe (a destination that drops it, seen once in two
-/// MediaMTX runs, waits for the encoder's next own keyframe, a GOP after the forced one: up to
-/// floor + GOP = 5.2 s after the reconnect, 2 s before F-036). No recovery path the domain models
+/// 15 s and the forced keyframe's arrival (`FORCED_KEYFRAME_ARRIVAL_MS`: F-036's floor, and F-040's
+/// encoder delay since C5; the C1 review's I2, the controller's ruling and the owner's apply-rec,
+/// 2026-11-24). A recovering sink's picture comes back at the keyframe its swap asks for, which the
+/// encoder holds to the floor after its last one and then holds in its look-ahead: up to that long
+/// after the new sink's first bytes. The rest of each path keeps F-004's 15 s
+/// (`output_egress_flat_ms` takes the arrival back out, so the backstop's threshold does not move: a
+/// false hung declaration costs more than the floor). 18 s today (17.2 s before C5) is past the
+/// longest gap YouTube was seen to keep and short of the 30 s that split the broadcast; the cost if
+/// YouTube splits between them is a documented worst gap 3 s longer, not 2.2. Not in it: F-028's lost
+/// forced keyframe (a destination that drops it, seen once in two MediaMTX runs, waits for the
+/// encoder's next own keyframe, a GOP after the forced one). No recovery path the domain models
 /// loses a keyframe, so it is stated here, not budgeted.
-pub const OUTPUT_GAP_BUDGET_MS: Ms = YOUTUBE_KEPT_GAP_MS + FORCED_KEYFRAME_MIN_INTERVAL_MS;
+pub const OUTPUT_GAP_BUDGET_MS: Ms = YOUTUBE_KEPT_GAP_MS + FORCED_KEYFRAME_ARRIVAL_MS;
 
 /// rtmp2sink's `timeout`, which C09 sets on every sink: the only detector of a destination stall (Owed 87;
 /// the owner, 2026-10-24, "A": the output's stall rule is retired). rtmp2 counts a message's bytes only once
@@ -304,6 +305,55 @@ pub const fn input_decode_wait_ms(input_stall_after_ms: Ms) -> Ms {
 /// first-GOP bound reads it (`FIRST_GOP_CATCH_UP_MAX_MS`).
 pub const X264_VBV_MS: Ms = 1_000;
 
+/// F-040 (C5; owner's rulings of 2026-11-25, "L2 is the chosen leg"): x264's look-ahead depth,
+/// `rc-lookahead`, in frames. 15 is the leg's value: 20 bought +0.02 / -0.06 VMAF for 0.17 s more
+/// delay (F-040, L3), and the product's old `zerolatency` tune ran none. C09 sets it on x264enc
+/// (`gst_programme.rs`); here because the frame delay below reads it.
+pub const X264_RC_LOOKAHEAD_FRAMES: u32 = 15;
+
+/// F-040: x264's frame threads (`sliced-threads=false`, `threads`), pinned. 9 is what x264 picked on
+/// the 6-vCPU guest the cost legs run on (cpus x 3 / 2, probed in F-040's method), where L2 was
+/// measured and soaked. Left on auto the delay below would follow the host's core count (a 16-vCPU
+/// host reads 24 threads), and the forced-key guard (`gst_output::own_key_in_flight`) is only as good
+/// as that bound, so the count is ours. Each frame thread is one more frame in x264's pipeline.
+pub const X264_THREADS: u32 = 9;
+
+/// F-040's X1 leg: x264's `sync-lookahead` off. It took one frame out of the delay (801 ms to
+/// 770 ms, 24 frames to 23) at no VMAF cost (rush 82.88 against 82.88, touchdown 91.55 against
+/// 91.58) and no CPU cost (snow x1.14 on both).
+pub const X264_SYNC_LOOKAHEAD_FRAMES: i32 = 0;
+
+/// F-040: the most frames x264 holds between a frame going in and its access unit coming out:
+/// the look-ahead's depth and one per frame thread. The legs measured it as 24 frames with
+/// `sync-lookahead` on (L2: 15 + 9, 801 ms) and 23 with it off (X1, 770 ms), so this is a bound with
+/// one frame to spare for the shipped settings. GStreamer's own latency query reads 0 on every leg
+/// (F-040), so the delay is declared here and read by what depends on it.
+pub const X264_DELAY_FRAMES: u32 = X264_RC_LOOKAHEAD_FRAMES + X264_THREADS;
+
+/// F-040: `X264_DELAY_FRAMES` as time, at the slowest profile (both run 30 fps today, ADR 0005): 800
+/// ms. How much later an access unit reaches the output than the frame it holds reached the encoder,
+/// and so how much later a forced keyframe does (F-040: a key asked clear of the floor arrived 834 ms
+/// after the ask, against 39 ms on `zerolatency`).
+pub const X264_DELAY_MS: Ms = {
+    let (a, b) = (OutputProfile::P720.fps as Ms, OutputProfile::P1080.fps as Ms);
+    let slowest = if a < b { a } else { b };
+    (X264_DELAY_FRAMES as Ms * 1_000).div_ceil(slowest)
+};
+
+/// F-036 and F-040: the longest a keyframe the encoder is asked for takes to reach the output after
+/// the encoder's last one: the floor it is held to (`FORCED_KEYFRAME_MIN_INTERVAL_MS`, in the
+/// encoder's input time) and then the frame delay (`X264_DELAY_MS`) before it comes out. What every
+/// output recovery path adds to its own terms where it said "the floor" before F-040
+/// (`OUTPUT_GAP_BUDGET_MS`, `output_egress_flat_ms`, the harness's `BUDGET_OUTPUT_RECONNECT_MS`).
+///
+/// A bound, not a path (the C5 review's m1): a request made at the ring's newest video `n` after the
+/// encoder's last keyframe `K` is made at input time `max(n + delay, K + floor)` and comes out when
+/// the ring reaches it, so the modelled wait is `max(delay, K + floor - n)`, at most the floor alone
+/// (2.2 s), and the sum below is up to the delay (0.8 s) over it. The sum stays: a tighter bound would
+/// move `OUTPUT_GAP_BUDGET_MS`, the chaos budgets and `thresholds.json`, and no run has measured a
+/// path that needs them tighter. Owed 124.
+pub const FORCED_KEYFRAME_ARRIVAL_MS: Ms = FORCED_KEYFRAME_MIN_INTERVAL_MS + X264_DELAY_MS;
+
 /// Owed 112 (C3b, `_FINDINGS.md` F-038; chaos runs 45480676592 `cef-hung` and 45498019823
 /// `dest-stall-rule`, head outages of 813 and 816 ms): the longest backlog of the encoder's first
 /// frames that a sink whose publish lands after them starts from, at the encoder's first keyframe,
@@ -317,6 +367,13 @@ pub const X264_VBV_MS: Ms = 1_000;
 /// ruling (docs/_INDEX.md, "Owed 112 built"): a smaller bound is this one constant. Under the GOP
 /// (`PROGRAMME_GOP_MS`), so only the encoder's first GOP is ever taken, and under the encoded
 /// ring's 2 s (C09, the plan's Global Constraints), so the ring still holds it.
+///
+/// F-040 (C5): the encoder's frame delay (`X264_DELAY_MS`) does NOT move it. A sink that can send
+/// `T` after the programme's frame 0 finds `T - delay` of backlog in the ring (the first frame
+/// comes out `delay` late). Dropping it, the key asked then is made at the floor in input time and
+/// comes out `delay` later, so the stream starts at `floor + delay` and the head outage is
+/// `floor + delay - T`: `floor - backlog` again, the delay in both terms. Half the floor stays where
+/// taking and dropping cost the same.
 pub const FIRST_GOP_CATCH_UP_MAX_MS: Ms = {
     let half_floor = FORCED_KEYFRAME_MIN_INTERVAL_MS / 2;
     if half_floor < X264_VBV_MS {
@@ -459,16 +516,16 @@ pub const TICK_WIDEST_MS: Ms = {
 };
 
 /// Owed 94's threshold, derived (the one place it is): the output gap budget less the backstop path's
-/// other terms, the forced keyframe's floor (F-036: the picture comes back up to it after the next
-/// sink's first bytes), the next sink's whole connect, the base back-off (the swap is failure 1 from
-/// Connected), the poll that sees the last growth late, and a tick each for the backstop and the
-/// build; then floored to the poll's grid. With today's numbers
-/// 17 200 − 2 200 − 5 000 − 500 − 250 − 2 × 34 = 9 182, so 9 000 ms, as before F-036 (the C1 review's
-/// I2: the floor does not shorten hung detection). A threshold the budget cannot hold is a compile
-/// error (the subtraction underflows).
+/// other terms, the forced keyframe's arrival (F-036's floor and F-040's encoder delay: the picture
+/// comes back up to that after the next sink's first bytes), the next sink's whole connect, the base
+/// back-off (the swap is failure 1 from Connected), the poll that sees the last growth late, and a
+/// tick each for the backstop and the build; then floored to the poll's grid. With today's numbers
+/// 18 000 - 3 000 - 5 000 - 500 - 250 - 2 x 34 = 9 182, so 9 000 ms, as before F-036 and F-040 (the C1
+/// review's I2: the floor does not shorten hung detection, and neither does the delay). A threshold
+/// the budget cannot hold is a compile error (the subtraction underflows).
 pub const fn output_egress_flat_ms(backoff_base_ms: Ms, connect_timeout_ms: Ms) -> Ms {
     let room = OUTPUT_GAP_BUDGET_MS
-        - FORCED_KEYFRAME_MIN_INTERVAL_MS
+        - FORCED_KEYFRAME_ARRIVAL_MS
         - connect_timeout_ms
         - backoff_base_ms
         - OUTPUT_PROGRESS_POLL_MS
@@ -939,7 +996,7 @@ mod tests {
             connect_path < YOUTUBE_KEPT_GAP_MS,
             "output recovery to the connect {connect_path} ms"
         );
-        let gap = connect_path + FORCED_KEYFRAME_MIN_INTERVAL_MS;
+        let gap = connect_path + FORCED_KEYFRAME_ARRIVAL_MS;
         assert!(gap < OUTPUT_GAP_BUDGET_MS, "output recovery gap {gap} ms");
     }
 
@@ -956,10 +1013,10 @@ mod tests {
     // source and written here, not read from the derivation: the last growth is seen up to one poll late
     // (C09's poll), the backstop fires on the first tick at or after its threshold, the swap waits the
     // base back-off (failure 1 from Connected) and then the first tick after it, the next sink's
-    // first bytes come 1 ms before its connect timeout, and its keyframe up to F-036's floor after
-    // them. All of it stays under the output gap budget, and a threshold one poll longer would not:
+    // first bytes come 1 ms before its connect timeout, and its keyframe up to F-036's floor and
+    // F-040's encoder delay after them. All of it stays under the output gap budget, and a threshold one poll longer would not:
     // the threshold is as long as the budget allows, on the poll's grid (nothing finer can see a flat
-    // total). F-036 did not move it (the C1 review's I2(b)): 9 000 ms, as Owed 94 set it.
+    // total). F-036 and F-040 did not move it (the C1 review's I2(b)): 9 000 ms, as Owed 94 set it.
     #[test]
     fn the_egress_backstop_is_the_longest_threshold_that_keeps_the_15_s_budget() {
         let t = Thresholds::default();
@@ -976,7 +1033,7 @@ mod tests {
                 + t.output_backoff_base_ms
                 + tick
                 + (t.output_connect_timeout_ms - 1)
-                + FORCED_KEYFRAME_MIN_INTERVAL_MS
+                + FORCED_KEYFRAME_ARRIVAL_MS
         };
         let flat = t.output_egress_flat_ms;
         assert_eq!(flat, 9_000, "Owed 94's threshold, unmoved by F-036's floor");
@@ -1078,6 +1135,53 @@ mod tests {
         assert_eq!(checked, 7, "intervals checked: {checked}");
     }
 
+    // F-040 (C5), each number against its source, written here and not read back: the chosen leg's
+    // x264 settings (the owner's ruling of 2026-11-25: L2, with X1's one frame), the 6-vCPU guest's
+    // frame threads, and the delay F-040 measured on them (801 ms with `sync-lookahead` on, 770 ms off:
+    // 24 and 23 frames at 30 fps). The delay the product declares is the larger frame count, and
+    // every budget that waits for a forced keyframe reads it through `FORCED_KEYFRAME_ARRIVAL_MS`.
+    #[test]
+    fn the_encoder_delay_bounds_what_f040_measured_and_every_budget_reads_it() {
+        assert_eq!(X264_RC_LOOKAHEAD_FRAMES, 15, "L2's rc-lookahead");
+        assert_eq!(X264_THREADS, 9, "6 vCPUs x 3 / 2, what x264 picks there");
+        assert_eq!(X264_SYNC_LOOKAHEAD_FRAMES, 0, "X1's sync-lookahead");
+        // F-040's legs: L2 (`sync-lookahead` on) 24 frames, X1 (off, the shipped setting) 23 frames,
+        // 770 ms at 30 fps. The declared bound is L2's count, a frame over the shipped one.
+        let (measured_frames_on, measured_frames_off, measured_off_ms) = (24, 23, 770);
+        let mut checked = 0;
+        for p in BOTH_MODES {
+            // The frames x264 holds, at this profile's rate, floored.
+            let held_ms = Ms::from(X264_DELAY_FRAMES) * 1_000 / Ms::from(p.fps);
+            assert_eq!(X264_DELAY_FRAMES, measured_frames_on, "{p:?}: L2's 15 + 9");
+            assert!(X264_DELAY_FRAMES > measured_frames_off, "{p:?}: a frame to spare");
+            assert!(
+                X264_DELAY_MS >= measured_off_ms,
+                "{p:?}: {X264_DELAY_MS} ms is under X1's 770"
+            );
+            // 30 fps (ADR 0005): 24 frames, 800 ms. A bound, not a measurement: under a GOP, and
+            // under the encoded ring's 2 s (`gst_output::ENCODED_RING_SPAN`).
+            assert_eq!(held_ms, 800, "{p:?}");
+            const { assert!(X264_DELAY_MS < PROGRAMME_GOP_MS) };
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "profiles checked: {checked}");
+        assert_eq!(X264_DELAY_MS, 800);
+        assert_eq!(
+            FORCED_KEYFRAME_ARRIVAL_MS,
+            2_000 + 200 + 800,
+            "Cloudflare's floor, the margin and the delay"
+        );
+        assert_eq!(
+            OUTPUT_GAP_BUDGET_MS,
+            15_000 + 2_200 + 800,
+            "F-004's 15 s, the floor and the delay"
+        );
+        // The first-GOP catch-up does not take the delay: backlog and head outage are both
+        // measured in the encoder's own pts, so the delay is in both and the half-floor stays the
+        // point where they are equal (`FIRST_GOP_CATCH_UP_MAX_MS`).
+        assert_eq!(FIRST_GOP_CATCH_UP_MAX_MS, 1_000);
+    }
+
     // Owed 15 (the choice recorded in `_FINDINGS.md` F-011): C09 reads the sink's total every 250 ms.
     #[test]
     fn the_progress_poll_is_owed_15s_250_ms() {
@@ -1132,12 +1236,12 @@ mod tests {
     }
 
     // F-004: the same broadcast survived a 15 s gap, and a 30 s gap split it. F-036 (the C1 review's
-    // I2, 2026-11-24): the output's budget is that and the forced keyframe's 2.2 s floor, still short
-    // of the gap that split it.
+    // I2, 2026-11-24): the output's budget is that and the forced keyframe's 2.2 s floor, F-040 (C5):
+    // and the encoder's 0.8 s delay, still short of the gap that split it.
     #[test]
     fn output_gap_budget_is_the_15_s_youtube_kept_in_f004() {
         assert_eq!(YOUTUBE_KEPT_GAP_MS, 15_000);
-        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_200);
+        assert_eq!(OUTPUT_GAP_BUDGET_MS, 15_000 + 2_200 + 800);
         // Short of F-004's split; constant against constant, so the compiler checks it.
         const _: () = assert!(OUTPUT_GAP_BUDGET_MS < 30_000);
     }

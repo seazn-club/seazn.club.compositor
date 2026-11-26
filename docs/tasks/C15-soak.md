@@ -168,7 +168,9 @@ sweep").
 - **Size rule (acceptance).** A leg passes only if all three hold over its whole run, the reload
   included:
   1. The p95 of Machine CPU is at most 50 % of the guest's cores, which is 2.0 cores on
-     performance-4x.
+     performance-4x. (Amended since: 75 % on 2026-10-27, F-033, and 85 % on 2026-11-25, C5, the
+     owner's "Up to 80 - 85 % is fine": 5.1 of 6 cores on performance-6x; `cost_cpu_p95_max_share`
+     in `soak.json` is the number, `docs/_INDEX.md` the rows.)
   2. **No step down:** every beat's `rung` is `full`.
   3. **No pre-encoder drops:** the final `droppedFrames` is 0.
 
