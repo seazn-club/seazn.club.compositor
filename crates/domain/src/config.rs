@@ -451,6 +451,16 @@ pub const PLAYOUT_MAX_FRAMES: usize = (PLAYOUT_CAP_MS * CAMERA_MAX_FPS / 1_000 +
 /// picture. The same slack joins two audio chunks whose stamps differ by rounding.
 pub const PLAYOUT_AUDIO_SLACK_MS: Ms = 1;
 
+/// C8 (Owed 122; F-043): how many samples late `voaacenc` (VisualOn's AAC-LC encoder, the programme's
+/// and the harness camera's) emits what it is fed: 1 600, 33.3 ms at 48 kHz, one whole frame at 30 fps.
+/// The library's declared delay, not a measurement: ffmpeg's wrapper of the same library declares
+/// `#define ENC_DELAY 1600` (`libavcodec/libvo-aacenc.c`) and sets its `initial_padding` from it; the
+/// checker's fixture reads the same 33 ms through GStreamer's wrapper (`strip.rs`). The encoder stamps
+/// each output frame with the time of the samples fed and the stream carries no word of the delay, so
+/// the programme stamps its AAC frames that much earlier (`gst_programme::without_aac_delay`) and the
+/// sound lands on its picture. `harness::checker::CAMERA_AAC_DELAY_MS` is the same fact for the camera.
+pub const AAC_ENCODER_DELAY_SAMPLES: u64 = 1_600;
+
 /// C4 fix round 1 (the review's C1 and I1): the most the camera's audio stamps may sit from its
 /// video's before the audio is re-based onto the video's (its stamps shifted by the difference,
 /// counted as a re-anchor). The clock anchors on the later-arriving of the two streams,
@@ -1523,6 +1533,14 @@ mod tests {
         // for a burst, and the slack is far under the target.
         const _: () =
             assert!(PLAYOUT_TARGET_MS < PLAYOUT_CAP_MS && PLAYOUT_AUDIO_SLACK_MS * 100 < PLAYOUT_TARGET_MS);
+    }
+
+    // C8 (Owed 122): the encoder's delay is the library's declared 1 600 samples: one frame at 30 fps
+    // (48 000 / 30), the 33.3 ms the harness's camera fixture reads.
+    #[test]
+    fn the_aac_encoders_delay_is_the_declared_1600_samples_one_frame_at_30_fps() {
+        assert_eq!(AAC_ENCODER_DELAY_SAMPLES, 1_600);
+        assert_eq!(AAC_ENCODER_DELAY_SAMPLES, 48_000 / 30);
     }
 
     // C4 (S1): the phase machine still reads decode time (the brief: `InputFrame` drives it), so the

@@ -1138,54 +1138,49 @@ fn camera_flap_holds_off_each_return_and_reds_without_the_hold_off() {
     assert_eq!(checked, 14);
 }
 
-/// C4 round 6 (owner 2026-11-25, merge C4 with camera-burst's `av_in_step` red named): the red stays
-/// red (no budget widened) and the verdict prints the row that names it, `Owed 122`, which is a real
-/// open row of docs/_INDEX.md that names camera-burst's `av_in_step`; a good run prints it as holding.
+/// C8 (Owed 122, closed): camera-burst's A/V red is no longer named as owed, because it is no longer
+/// excused: the programme stamps its AAC frames the encoder's delay early (`gst_programme`), so the
+/// offset is no longer 33 ms off its centre and the gate's budgets stand as they were. A good run
+/// prints no `OWED` line at all, and a run whose pairs sit at the old centre's far edge (49 ms, the
+/// run CI read p50 48 and 49 on before the fix) is a plain red.
 #[test]
-fn camera_bursts_av_red_is_named_by_its_owed_row_and_stays_red() {
+fn camera_bursts_av_gate_has_no_owed_line_and_reds_on_the_old_centre() {
     let freeze = 300 - PLAYOUT_TARGET_MS as i64;
     let good = judge(
         &camera_burst(freeze, |_| {}),
         "camera-burst",
         "",
-        "burst-owed-good",
+        "burst-closed-good",
     );
-    assert_pass(&good, "burst-owed-good");
-    assert!(
-        good.lines
-            .iter()
-            .any(|l| l.starts_with("OWED av_in_step_run_offset (Owed 122): holds")),
-        "{:?}",
-        good.lines
-    );
+    assert_pass(&good, "burst-closed-good");
     let red = judge(
         &camera_burst(freeze, |w| {
             w.report_patch = Some(|r| gate_av(r, GATE_EXCLUDED_MS, 49, Spoil::KeptLevel(49)))
         }),
         "camera-burst",
         "",
-        "burst-owed-red",
+        "burst-closed-red",
     );
-    assert_fails(&red, "av_in_step", "burst-owed-red");
-    assert!(
-        red.lines
-            .iter()
-            .any(|l| l.starts_with("OWED av_in_step_run_offset (Owed 122): does not hold")),
-        "{:?}",
-        red.lines
-    );
+    assert_fails(&red, "av_in_step", "burst-closed-red");
+    let mut checked = 0;
+    for run in [&good, &red] {
+        assert!(
+            run.lines.iter().all(|l| !l.starts_with("OWED ")),
+            "Owed 122 is closed: {:?}",
+            run.lines
+        );
+        checked += 1;
+    }
+    eprintln!("camera-burst verdicts read for an OWED line: {checked}");
+    assert_eq!(checked, 2);
     let index = std::fs::read_to_string(repo().join("docs/_INDEX.md")).unwrap();
     let row = index
         .lines()
         .find(|l| l.starts_with("| 122 | "))
         .expect("Owed 122 is a row of docs/_INDEX.md");
     assert!(
-        row.contains("camera-burst `av_in_step`"),
-        "the row names the check"
-    );
-    assert!(
-        !row.contains("camera-flap `av_in_step`"),
-        "camera-flap is not exempt"
+        row.starts_with("| 122 | ~~") && row.contains("CLOSED"),
+        "the case no longer names the row, so the row says it is closed"
     );
 }
 

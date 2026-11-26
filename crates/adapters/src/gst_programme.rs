@@ -35,8 +35,8 @@ use std::time::Instant;
 use app::ports::{Inbound, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Sender;
 use domain::config::{
-    OutputProfile, FORCED_KEYFRAME_MIN_INTERVAL_MS, X264_RC_LOOKAHEAD_FRAMES, X264_SYNC_LOOKAHEAD_FRAMES,
-    X264_THREADS,
+    OutputProfile, AAC_ENCODER_DELAY_SAMPLES, FORCED_KEYFRAME_MIN_INTERVAL_MS, X264_RC_LOOKAHEAD_FRAMES,
+    X264_SYNC_LOOKAHEAD_FRAMES, X264_THREADS,
 };
 use domain::health::ExitDetail;
 use domain::ladder::Rung;
@@ -1162,13 +1162,35 @@ fn note_push(
     }
 }
 
+/// C8 (Owed 122): the AAC encoder's delay as stream time: `AAC_ENCODER_DELAY_SAMPLES` at the
+/// programme's rate (33.3 ms).
+fn aac_delay() -> gst::ClockTime {
+    gst::ClockTime::from_nseconds(AAC_ENCODER_DELAY_SAMPLES * 1_000_000_000 / u64::from(AUDIO_RATE))
+}
+
+/// An encoded AAC frame's stamp with the encoder's delay taken out. `voaacenc` stamps each output
+/// frame with the time of the samples it was fed, but what it emits is those samples one delay
+/// late (its first frames hold the priming), and the container carries no word of it, so every
+/// player puts the sound a delay behind its picture. The frame is stamped a delay earlier, which
+/// puts the sound where it was fed. The stream's first frames, which hold only the priming, stamp
+/// at 0 (the time line starts there).
+fn without_aac_delay(stamp: gst::ClockTime) -> gst::ClockTime {
+    stamp.saturating_sub(aac_delay())
+}
+
 /// The encoded `sample` as a ring entry, its PTS and DTS converted to running time through its own
-/// segment (x264enc's output segment starts at 1 000 h: spike trap, F-001's chain).
+/// segment (x264enc's output segment starts at 1 000 h: spike trap, F-001's chain), the audio's with
+/// the encoder's delay taken out (`without_aac_delay`).
 fn running_time_entry(sample: &gst::Sample, video: bool) -> Option<Entry> {
     let buffer = sample.buffer()?;
     let segment = sample.segment()?.downcast_ref::<gst::ClockTime>()?;
     let pts = segment.to_running_time(buffer.pts()?)?;
     let dts = buffer.dts().and_then(|d| segment.to_running_time(d));
+    let (pts, dts) = if video {
+        (pts, dts)
+    } else {
+        (without_aac_delay(pts), dts.map(without_aac_delay))
+    };
     let key = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
     let mut copy = buffer.copy();
     {
@@ -1393,7 +1415,30 @@ impl PinkNoise {
 
 #[cfg(test)]
 mod tests {
-    use super::PinkNoise;
+    use super::{without_aac_delay, PinkNoise};
+    use gstreamer as gst;
+
+    // C8 (Owed 122): the delay `voaacenc` adds is the library's declared 1 600 samples (ffmpeg's
+    // wrapper of the same library: `#define ENC_DELAY 1600`), 33 333 333 ns at 48 kHz; a frame past
+    // it is stamped that much earlier, one before it stamps at 0 rather than before the time line.
+    #[test]
+    fn an_aac_frames_stamp_loses_the_encoders_delay_and_never_goes_below_zero() {
+        // (stamp ns, expected ns): the delay is 1 600 / 48 000 s, 33 333 333 ns whole.
+        let cases: [(u64, u64); 6] = [
+            (1_000_000_000, 966_666_667),
+            (33_333_334, 1),
+            (33_333_333, 0),
+            (33_333_332, 0),
+            (21_333_333, 0),
+            (0, 0),
+        ];
+        for (stamp, want) in cases {
+            let got = without_aac_delay(gst::ClockTime::from_nseconds(stamp));
+            assert_eq!(got.nseconds(), want, "a frame stamped {stamp} ns");
+        }
+        eprintln!("aac stamps checked: {}", cases.len());
+        assert_eq!(cases.len(), 6, "anti-vacuity: six stamps");
+    }
 
     // F-004: the filler is ~−60 dBFS noise, never digital zero. Expected values from the finding, not
     // from the generator: a peak at or under 0.001 of full scale (about 33 counts), an RMS between
