@@ -19,7 +19,7 @@
 # before it, inside the domain's window on the process's own clock; the beats from the backstop's firing until sink 2 could have earned
 # Connected read `stalled`, never `playing` over the dead output (`beat_stalled`); the viewer's gap
 # is inside the output gap budget (output_gap_budget_ms: the owner's 15 s target and the forced
-# keyframe's arrival, F-036's floor and F-040's encoder delay, 18 s; `gap_in_budget`); no outage outside it;
+# keyframe's arrival, the GOP's 2 s and F-040's encoder delay, 17.8 s since C7; `gap_in_budget`); no outage outside it;
 # sink 2 is the last swap (`one_swap`); and once sink 2 could have earned Connected the beats read
 # `playing` again (`beat_playing_again`). Every number comes from harness/thresholds.json but the
 # drive's own schedule (OUTPUT_HUNG_AFTER_MS, CASE_LIVE_S), as in every case.
@@ -62,7 +62,7 @@ else
   export COMPOSITOR_TEST_HOLD_SINK_AFTER_MS= COMPOSITOR_TEST_HANG_SINK_AFTER_MS=$OUTPUT_HUNG_AFTER_MS
 fi
 CASE_COMPOSE=compose.output-hung.yml
-# Four output gap budgets (68.8 s since F-036): past the hang's whole hold (twice F-004's 15 s,
+# Four output gap budgets (71.2 s since C7): past the hang's whole hold (twice F-004's 15 s,
 # adapters' SINK_HANG_HOLD) and past any backstop threshold the budget allows (under one), so
 # MediaMTX closes no idle publisher of this case's run.
 MTX_READ_TIMEOUT_MS=$((4 * $(threshold output_gap_budget_ms)))
