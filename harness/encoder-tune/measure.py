@@ -35,7 +35,7 @@ FRAME_BYTES = W * H * 3 // 2
 COMMON = {
     "speed-preset": "medium",  # gst_programme.rs X264_SPEED_PRESET (owner ruling 2026-10-27, F-033)
     "bitrate": 6000,  # config.rs OutputProfile::P1080.video_kbps
-    "key-int-max": 90,  # config.rs PROGRAMME_GOP_MS 3000 at 30 fps (F-036)
+    "key-int-max": 90,  # the 3 s GOP of F-036/C5 (config.rs PROGRAMME_GOP_MS was 3000 then; 2000 since C7: legs G2/Q2/U2)
     "vbv-buf-capacity": 1000,  # config.rs X264_VBV_MS
     # gst_programme.rs X264_OPTIONS + X264_NO_SCENE_CUT
     "option-string": "nal-hrd=cbr:filler=1:scenecut=0",
@@ -44,12 +44,23 @@ COMMON = {
 }
 CF_GOP_FLOOR_MS = 2000  # config.rs CF_KEYFRAME_INTERVAL_MIN_MS (Cloudflare: GOP between 2 and 10 s)
 PRODUCT_FLOOR_MS = 2200  # config.rs FORCED_KEYFRAME_MIN_INTERVAL_MS
+# C7 (2026-11-26): the shipped programme GOP is config.rs PROGRAMME_GOP_MS, 2 s (CF's floor itself); the
+# legs L1..R0 below keep the 3 s of the C5 run they were measured at (`COMMON`), so the C5 table still
+# reads. This file restates the domain's numbers (a measurement never imports the code under test), so
+# a later move of `CF_KEYFRAME_INTERVAL_MIN_MS` or the margin is a change here too: the constants below.
+PROGRAMME_GOP_MS = 2000
+C5_GOP_MS = 3000
 # C5 Phase B (the shipped guard, `gst_output::own_key_in_flight`): the adapter asks for no keyframe while
 # the GOP's own is due within the encoder's delay of the newest video it has taken, counted in FRAMES
 # since the last keyframe taken (x264 counts frames; the review's I3).
 GOP_FRAMES = 90  # gop_frames() at 30 fps: config.rs PROGRAMME_GOP_MS 3000
 DELAY_FRAMES = 24  # config.rs X264_DELAY_FRAMES = X264_RC_LOOKAHEAD_FRAMES 15 + X264_THREADS 9
 DELAY_MS = 800  # config.rs X264_DELAY_MS: those frames at 30 fps
+
+
+def gop_frames(gop_ms):
+    """`OutputProfile::gop_frames`: the GOP in whole frames at 30 fps."""
+    return gop_ms * FPS // 1000
 
 
 def legs(vcpus=6):
@@ -92,6 +103,38 @@ def legs(vcpus=6):
             "id": "P1",
             "name": "the product (C5): as X1, forced keys asked behind the in-flight guard",
             "props": {**nt, "sync-lookahead": 0},
+            "guard": True,
+            "paced_only": True,
+        },
+        {
+            # C7: the shipped encoder (X1's settings) at each GOP: the quality and CPU cost of 2 s
+            # against the 3 s it ran at until C7, same clips, bitrate and VMAF tool.
+            "id": "G3",
+            "name": "C7 control: the shipped encoder at the 3 s GOP of C5 (key-int-max 90)",
+            "props": {**nt, "sync-lookahead": 0, "key-int-max": gop_frames(C5_GOP_MS)},
+            "gop_leg": True,
+        },
+        {
+            "id": "G2",
+            "name": "C7: the shipped encoder at the 2 s GOP (key-int-max 60)",
+            "props": {**nt, "sync-lookahead": 0, "key-int-max": gop_frames(PROGRAMME_GOP_MS)},
+            "gop_leg": True,
+        },
+        {
+            # C7: forced keys at the 2 s GOP the way the product asks since C7: never, since the
+            # floor (66 frames) is over the GOP (60): the GOP's own key serves every request.
+            "id": "Q2",
+            "name": "C7 product: 2 s GOP, no key asked (the floor is over the GOP)",
+            "props": {**nt, "sync-lookahead": 0, "key-int-max": gop_frames(PROGRAMME_GOP_MS)},
+            "guard": "floor_over_gop",
+            "paced_only": True,
+        },
+        {
+            # The control for Q2: the same 2 s GOP with C5's rule (asks unless the GOP's own is in the
+            # delay). It should cut GOPs under 2 s: the reason the rule above exists.
+            "id": "U2",
+            "name": "C7 control: 2 s GOP, C5's rule (asks, unless the GOP's own is in the delay)",
+            "props": {**nt, "sync-lookahead": 0, "key-int-max": gop_frames(PROGRAMME_GOP_MS)},
             "guard": True,
             "paced_only": True,
         },
@@ -270,12 +313,26 @@ def vmaf(ref, h264, frames, out_json):
     return r
 
 
+def chosen_legs(spec):
+    """The legs a run takes: all of them when `spec` is empty, else those named (a name that matches
+    no leg is a refusal, so a typo cannot read as a green run of nothing)."""
+    ls = legs()
+    if not spec:
+        return ls
+    want = [x for x in spec.split(",") if x]
+    known = {lg["id"] for lg in ls}
+    bad = [x for x in want if x not in known]
+    if bad:
+        raise SystemExit(f"unknown legs {bad}: {sorted(known)}")
+    return [lg for lg in ls if lg["id"] in want]
+
+
 def cmd_quality(a):
     Gst, _ = gst()
     clips = dict(c.split("=", 1) for c in a.clip)
     results = []
     checked = 0
-    for leg in legs():
+    for leg in chosen_legs(a.legs):
         if leg.get("paced_only"):
             continue
         for cname, cpath in clips.items():
@@ -485,6 +542,23 @@ def key_in_flight(outs, gop_frames=GOP_FRAMES, delay_frames=DELAY_FRAMES):
     return "in_flight" if 0 < due_in <= delay_frames else None
 
 
+def leg_gop_frames(leg):
+    """The leg's `key-int-max` (the leg's own, else `COMMON`'s)."""
+    return int(leg["props"].get("key-int-max", COMMON["key-int-max"]))
+
+
+def refusal_for(leg, outs):
+    """What the product refuses to ask for at this moment of this leg, or None: C7's rule first (a
+    floor not under the GOP asks nothing, `gst_output::forced_key_can_beat_the_gop`), then C5's."""
+    guard = leg.get("guard")
+    if not guard:
+        return None
+    gop = leg_gop_frames(leg)
+    if guard == "floor_over_gop" and gop_frames(PRODUCT_FLOOR_MS) >= gop:
+        return key_in_flight(outs, gop) if not [o for o in outs if o[1] is not None] else "floor_over_gop"
+    return key_in_flight(outs, gop)
+
+
 def key_episode(Gst, GstVideo, leg, feed, offset_s):
     """One fresh encoder; a forced key asked `offset_s` after its first frame, the way
     `gst_programme.rs` asks (an upstream force-key-unit event from the parser's src pad, running time
@@ -500,7 +574,7 @@ def key_episode(Gst, GstVideo, leg, feed, offset_s):
     skipped = None
     serves_from = req_rt
     while n < deadline_frames:
-        refusal = key_in_flight(r.snapshot()) if n == n_req and leg.get("guard") else None
+        refusal = refusal_for(leg, r.snapshot()) if n == n_req else None
         if refusal:
             # The product asks nothing here (`gst_output::ask_key`): a key it already has serves. With
             # no video out yet that is the encoder's first frame (key 0, however early its running
@@ -549,7 +623,7 @@ def cmd_paced(a):
     Gst, GstVideo = gst()
     feed = Feed(a.clip)
     print(f"feed: {feed.n} frames")
-    all_legs = [lg for lg in legs() if not lg.get("quality_only")]
+    all_legs = [lg for lg in chosen_legs(a.legs) if not lg.get("quality_only")]
     free = {}
     order = [None] + all_legs
     for rnd in range(a.rounds):
@@ -563,6 +637,8 @@ def cmd_paced(a):
     episodes = {}
     offsets = [float(x) for x in a.offsets.split(",")]
     for leg in all_legs:
+        if leg.get("gop_leg"):
+            continue  # C7's G3/G2 are the cost and quality legs: no forced keys
         rows = []
         for rep in range(a.reps):
             for off in offsets:
@@ -600,6 +676,8 @@ def cmd_table(a):
         out.append("| Leg | " + " | ".join(clips) + " | kbps (filler share) |")
         out.append("|---|" + "---|" * (len(clips) + 1))
         for lid in names:
+            if not any(r["leg"] == lid for r in q["rows"]):
+                continue  # a leg this run did not take (C7 runs G3,G2 only)
             cells, kb = [], []
             for c in clips:
                 rr = [r for r in q["rows"] if r["leg"] == lid and r["clip"] == c]
@@ -700,11 +778,24 @@ def cmd_selftest(_):
     assert x264_options(b"nothing here") is None
     # legs: five of the brief, one extra, R0, one profile each, the product's floor and GOP carried
     ls = legs()
-    assert [lg["id"] for lg in ls] == ["L1", "L2", "L3", "L4", "L5", "L5a", "X1", "P1", "R0"]
+    assert [lg["id"] for lg in ls] == ["L1", "L2", "L3", "L4", "L5", "L5a", "X1", "P1", "G3", "G2", "Q2", "U2", "R0"]
     assert COMMON["key-int-max"] == 3 * FPS and COMMON["min-force-key-unit-interval"] == PRODUCT_FLOOR_MS * 1_000_000
     p = {lg["id"]: lg["props"] for lg in ls}
     assert p["L1"]["tune"] == "zerolatency" and "tune" not in p["L2"]
     assert (p["L2"]["rc-lookahead"], p["L3"]["rc-lookahead"], p["L4"]["bframes"]) == (15, 20, 2)
+    # C7: the GOP legs, in frames, from the two GOPs in ms; every other leg keeps the C5 run's 3 s
+    assert (gop_frames(PROGRAMME_GOP_MS), gop_frames(C5_GOP_MS)) == (60, 90)
+    assert (p["G2"]["key-int-max"], p["G3"]["key-int-max"], p["Q2"]["key-int-max"], p["U2"]["key-int-max"]) == (60, 90, 60, 60)
+    assert "key-int-max=60" in enc_props(next(lg for lg in ls if lg["id"] == "G2"))
+    assert "key-int-max=90" in enc_props(next(lg for lg in ls if lg["id"] == "G3"))
+    assert "key-int-max=90" in enc_props(next(lg for lg in ls if lg["id"] == "X1"))
+    assert [lg["id"] for lg in chosen_legs("G3,G2")] == ["G3", "G2"] and len(chosen_legs("")) == len(ls)
+    for bad in ("G9", "G3,nope"):
+        try:
+            chosen_legs(bad)
+            raise AssertionError("an unknown leg must refuse")
+        except SystemExit:
+            pass
     assert "nal-hrd=vbr" in p["L5"]["option-string"] and "filler" not in p["L5"]["option-string"]
     assert p["L5a"]["option-string"].count("filler=0") == 1 and "filler=1" in COMMON["option-string"]
     assert 'option-string="nal-hrd=cbr:filler=0:scenecut=0"' in enc_props(ls[5])
@@ -722,6 +813,17 @@ def cmd_selftest(_):
     # inside the GOP leave the same frames in flight (the review's I3; a time rule moves them).
     lost = lambda i: ns(i + 30)
     assert [n for n in range(0, 180) if key_in_flight(outs(n, lost)) == "in_flight"] == yes
+    # C7: at a 60-frame GOP the delay window is the newest frames 36..59; with the floor (66 frames) over
+    # the GOP the product asks nothing at any of them (`refusal_for`), and with no video out it is the
+    # first-frame answer; a leg with no guard never refuses.
+    g2, q2, u2 = (next(lg for lg in ls if lg["id"] == i) for i in ("G2", "Q2", "U2"))
+    assert gop_frames(PRODUCT_FLOOR_MS) == 66 and leg_gop_frames(q2) == 60
+    assert [n for n in range(0, 120) if key_in_flight(outs(n), 60) == "in_flight"] == list(range(36, 60))
+    assert all(refusal_for(q2, outs(n)) == "floor_over_gop" for n in range(0, 120))
+    assert [n for n in range(0, 120) if refusal_for(u2, outs(n)) == "in_flight"] == list(range(36, 60))
+    assert refusal_for(q2, []) == "first_frame" and refusal_for(g2, outs(40)) is None
+    x1 = next(lg for lg in ls if lg["id"] == "X1")
+    assert refusal_for(x1, outs(40)) is None and leg_gop_frames(x1) == 90
     # A later keyframe resets the count (a forced key, which x264 counts from).
     reset = outs(100) + [(0.0, ns(101), True)] + [(0.0, ns(102 + i), False) for i in range(10)]
     assert key_in_flight(reset) is None
@@ -743,6 +845,7 @@ def main():
     q = sub.add_parser("quality")
     q.add_argument("--clip", action="append", required=True, help="NAME=path.yuv")
     q.add_argument("--out", required=True)
+    q.add_argument("--legs", default="", help="comma list of leg ids; empty is all (C7: G3,G2)")
     q.set_defaults(fn=cmd_quality)
     pc = sub.add_parser("paced")
     pc.add_argument("--clip", required=True)
@@ -750,6 +853,7 @@ def main():
     pc.add_argument("--seconds", type=float, default=45)
     pc.add_argument("--rounds", type=int, default=2)
     pc.add_argument("--reps", type=int, default=2)
+    pc.add_argument("--legs", default="", help="comma list of leg ids; empty is all (C7: G3,G2,Q2,U2)")
     pc.add_argument("--offsets", default="0.1,0.5,1.0,1.5,2.0,2.3,2.6,2.8,3.0,3.4")
     pc.set_defaults(fn=cmd_paced)
     t = sub.add_parser("table")
