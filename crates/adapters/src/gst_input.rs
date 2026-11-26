@@ -29,11 +29,12 @@
 //! **The camera's own size** (Task E). The appsink's caps are the programme's box, whatever the camera
 //! sends, so the size of the picture as the phone makes it is read one step earlier: a probe on the
 //! decoder's src pad takes each caps event (`avdec_h264`'s output, before `videoconvertscale`) and
-//! records its width and height into the shared `InputPicture` (`with_picture`), under the same open
-//! gate as a frame, so a build the domain gave up or retired records nothing. A retire (`rebuild`,
-//! `stop`, the drop) clears it, so a new build starts with none until its own decoder announces one.
-//! A loss or an abandon does not clear it: the beat's driver keeps the size only while the input link
-//! is connected.
+//! records its width and height into the shared `InputPicture` (`with_picture`) for the open build and
+//! for a build the domain gave up and may take back (its first caps can arrive inside the back-off,
+//! before the take-back re-opens the gate), never for a retired one. A retire (`rebuild`, `stop`, the
+//! drop) clears it, so a new build starts with none until its own decoder announces one. A loss or an
+//! abandon does not clear it: the beat's driver keeps the size only while the input link is
+//! connected. A phone turned over inside a build moves it (a new caps event; `tests/input.rs`).
 //!
 //! **Error or EOS is decided when the error is posted** (PR #30 review I1). On a peer close `srtsrc`
 //! posts an error and `basesrc` then pushes an EOS, which reaches the video appsink 1–7 ms later. The
@@ -271,12 +272,21 @@ impl Shared {
         true
     }
 
-    /// Records the size a build's decoder announced (Task E), when that build may: the gate is held
-    /// across the write, so a retire's shut-then-clear cannot fall between the check and the store.
-    /// False when it did not (a size that is no size, or a build that may not write).
+    /// Records the size a build's decoder announced (Task E), when that build may: the open build, and
+    /// a build the domain gave up that still runs. The second is deliberate. A connect that timed out
+    /// is given up before its first picture; the camera's first picture inside the back-off is what
+    /// tells the domain it is back (`InputAgain`), and its caps event comes before that picture, with
+    /// the gate shut. A take-back re-opens the gate after the event has passed, so a size kept only
+    /// under the open gate would leave the connected camera with none for the whole build. The driver
+    /// keeps the size off the beat while the link is not connected, so recording it early shows
+    /// nothing early. A retired build (`shut`) is neither, and writes nothing. Both locks are held
+    /// across the write, in `give_up`'s order, so a retire's shut-then-clear cannot fall between the
+    /// check and the store. False when nothing was written (a build that may not write, or a size that
+    /// is no size).
     fn record_picture(&self, build: u64, picture: &InputPicture, width: i32, height: i32) -> bool {
         let gate = locked(&self.gate);
-        if *gate != Some(build) {
+        let given_up = locked(&self.given_up);
+        if *gate != Some(build) && *given_up != Some(build) {
             return false;
         }
         picture.set(width, height)
@@ -819,9 +829,8 @@ impl GstInput {
         // Task E: the size the decoder announces, before `videoconvertscale` fits the picture into the
         // programme's box (the appsink's own caps are the programme's, whatever the camera sends). One
         // caps event opens the stream and another follows each change (a phone turned over, a
-        // transcode change). Recorded under the build's open gate, as a frame is, so a build the
-        // domain gave up or retired never writes it; the gate is held across the write, so a retire's
-        // shut-then-clear cannot fall between the check and the store.
+        // transcode change). Written by the open build, or by one the domain gave up and may take back
+        // (`Shared::record_picture`), never by a retired one.
         let (picture, open) = (Arc::clone(&self.picture), Arc::clone(&self.shared));
         vdec.static_pad("src")
             .ok_or("avdec_h264 has no src pad")?

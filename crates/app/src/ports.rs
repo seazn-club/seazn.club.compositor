@@ -246,8 +246,9 @@ pub struct Measured {
     pub input_queue_overruns: Option<u64>,
     /// The size of the camera's decoded picture, as its decoder makes it and before the input's scaler
     /// fits it into the programme's (Task E: `inputWidth` and `inputHeight`, under `RELAY_INPUT_BEAT`).
-    /// The adapter reports the last size its open build's decoder announced; the DRIVER keeps it only
-    /// on a beat whose input link is connected, so a camera that is not there reports no size.
+    /// The adapter reports the last size its open (or given-up, and so possibly taken-back) build's
+    /// decoder announced; the DRIVER keeps it only on a beat whose input link is connected, so a camera
+    /// that is not there reports no size. The driver writes it on the `input received` line too.
     pub input_picture: Option<PictureSize>,
 }
 

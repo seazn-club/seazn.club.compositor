@@ -73,7 +73,8 @@
 //! - **The camera as the relay received it** (C2, S4): each beat's metrics sample that carries
 //!   either camera rate (or, C3, either loss total) writes `input received fps=<x.y> kbps=<n>`
 //!   (`-` for the one not measured), then ` withheld_spans=<n> queue_overruns=<n>` when a loss total
-//!   is measured; a sample with none of them writes nothing.
+//!   is measured, and (Task E) ` picture=<w>x<h>` last, while the connected camera's decoded size is
+//!   known; a sample with none of them writes nothing.
 //! - **Each camera generation given up** (C2, S4), read off the input link before and after each
 //!   decision (`Supervisor::input_give_up`), never decided here: `input give up gen=<g>
 //!   reason=<connect_timeout|stalled|phone_live_discard|hold_end|eos|error>`, once a generation,
@@ -712,11 +713,18 @@ fn phase_word(p: ProgrammePhase) -> &'static str {
 /// measured, and only when either is (so a beat without them writes C2's line as it was). C4 (S1):
 /// the camera playout's beat (`playout`, each total's rise since the last beat) follows, `
 /// audio_pad_bytes=<n> audio_overflow_bytes=<n> audio_late_bytes=<n> reanchors=<n>`, only when the
-/// sample carried it.
+/// sample carried it. Task E: the connected camera's decoded size follows, ` picture=<w>x<h>`, only
+/// when the sample carries it (the driver has already cleared it for a beat whose link is not
+/// connected), and it alone is enough to write the line.
 fn received_line(m: &Measured, playout: Option<PlayoutTotals>) -> Option<String> {
     let fps = m.input_received_fps.filter(|f| f.is_finite() && *f >= 0.0);
     let loss = m.input_withheld_spans.is_some() || m.input_queue_overruns.is_some();
-    if fps.is_none() && m.input_received_kbps.is_none() && !loss && playout.is_none() {
+    if fps.is_none()
+        && m.input_received_kbps.is_none()
+        && !loss
+        && playout.is_none()
+        && m.input_picture.is_none()
+    {
         return None;
     }
     let count = |n: Option<u64>| n.map_or("-".to_owned(), |k| k.to_string());
@@ -737,6 +745,9 @@ fn received_line(m: &Measured, playout: Option<PlayoutTotals>) -> Option<String>
             " audio_pad_bytes={} audio_overflow_bytes={} audio_late_bytes={} reanchors={}",
             b.audio_pad_bytes, b.audio_overflow_bytes, b.audio_late_bytes, b.reanchors
         ));
+    }
+    if let Some(p) = m.input_picture {
+        line.push_str(&format!(" picture={}x{}", p.width, p.height));
     }
     Some(line)
 }
