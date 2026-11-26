@@ -3986,12 +3986,13 @@ was NOT re-measured; a longer GOP codes fewer keyframes, so its cost is expected
 5 919 to 6 231 kbps for both. x264's own SEI reads `keyint=60 keyint_min=6 scenecut=0` against `keyint=90 keyint_min=9`.
 
 **CPU at the first cut.** The encoder alone on the 4-vCPU runner (paced 30 fps): G3 0.34 cores, G2 0.33, encode latency
-771 / 772 ms both. The Fly cost legs (performance-6x, 16 min, p95 cores, size rule p95 ≤ 5.1; run 45825969361 at the 2 s
-head): **C:snow 3.731 (PASS)**, **D:snow 5.576 (FAIL cpu, over 5.1)** (avg 4.926, max 5.89, compositor 4.754 of it). The
-control, `main` (3 s, with #115), D:snow alone, run 45832881352: **4.737 (PASS)**. F-040's L2 reads of the 3 s encoder
-were C 4.013 and D 3.458 on another day (noise ±0.6 to 1.0 core). That one D read is a single sample against a noise band
-this wide; the C7 review's I4 asked for D:snow twice on the 2.2 s head and twice on `main` the same day (results: below,
-once run).
+771 / 772 ms both. The Fly cost legs (performance-6x, 15 to 16 min, p95 cores, size rule p95 ≤ 5.1), D:snow on the 2 s
+head: **5.576** (run 45825969361, avg 4.926, max 5.89, compositor 4.754 of it) and **5.36** (run 45848911827); C:snow
+**3.731 (PASS)**. The control, `main` (3 s, with #115), D:snow, run 45832881352: **4.737 (PASS)**. F-040's L2 reads of the
+3 s encoder were C 4.013 and D 3.458 on another day (noise ±0.6 to 1.0 core). Two D reads over the rule against one
+under it. **The owner accepted the overshoot for the stg trial on 2026-11-26** ("ok let's go all in a one shot"): Owed
+133. The shipped 2.2 s GOP codes slightly fewer keyframes than the 2 s one; its own D:snow reads were dispatched after the
+review round (run ids in the PR).
 
 **Audio at a start (the review's I1 and N1, FIXED).** A sink started by a keyframe already in x264's delay (a swap up
 to 0.8 s after a GOP's keyframe) used to get no audio from between the keyframe and the swap: `reconnect_point` dropped
@@ -4010,7 +4011,10 @@ window and past it (261 starts in a local run, 94 440 audio frames: start within
 duplicate, none backwards, none missing); the adapters swap sweep and `assert_fresh_start` check the same on the real
 encoder (strictly increasing PTS).
 
-**Owed.** (1) A Cloudflare stg run of the 2.2 s programme GOP: segment length, TARGETDURATION and camera-to-viewer delay
-(24.5 s before), and no `ERR_GOP_OUT_OF_RANGE`. (2) VMAF and the paced-key legs at 66 frames (`measure.py` G2/Q2/U2 now
-read `PROGRAMME_GOP_MS` 2 200). (3) A real-encoder test of the forced-keyframe path, if a GOP over the floor is ever
-shipped.
+**Owed.** (1) A Cloudflare stg run of the 2.2 s programme GOP: segment length, TARGETDURATION and camera-to-viewer
+delay (24.5 s before), no `ERR_GOP_OUT_OF_RANGE`, and the encoder's CPU under real sessions (Owed 132). (2) VMAF and the
+paced-key legs at 66 frames (`measure.py` G2/Q2/U2 now read `PROGRAMME_GOP_MS` 2 200). (3) A real-encoder test of the
+forced-keyframe path, if a GOP over the floor is ever shipped. (4) `Feeder::next` itself (the ring's lock, the gate) is
+not driven by a unit test, which needs GStreamer: the unit test drives the `RingState` methods it calls
+(`push_entry`, `pop_entry`, `plain_reconnect`) and the real `Picker`, and the adapters sweep and `assert_fresh_start` read
+the audio on the real encoder.
