@@ -353,7 +353,8 @@ require_restart_outage() {
 # `budget_output_reconnect_ms` is spec §6's "≤5 s" and the forced keyframe's arrival, F-036's floor and
 # F-040's encoder delay, 8 s (the C1 review's I2(a), the owner's apply-rec ruling 2026-11-24): the new
 # sink starts at the keyframe its swap asks for, which the encoder holds to the floor after its last
-# one and then in its look-ahead.
+# one and then in its look-ahead. C7: the GOP is the floor (2.2 s), so none is asked and the sink starts at
+# the GOP's own next keyframe, at most a GOP on: the same 8 s.
 require_output_recovers() {
   require outage_spans_fault '[.output_outages[] | select(.to_wall_ms > mark_at("cut") and .from_wall_ms < mark_at("clear"))] | length >= 1' \
     '[.output_outages[] | {from_wall_ms, to_wall_ms}]'

@@ -65,8 +65,11 @@ pub const AV_PAIR_WITHIN_MS: f64 = 500.0;
 /// is therefore the authority.
 ///
 /// It is subtracted from every pair, so `av_offset_ms` is the programme's offset with the harness's
-/// camera taken out. The compositor's own encoder delay stays in, because the viewer hears it too.
-pub const CAMERA_AAC_DELAY_MS: f64 = 1_600.0 / 48.0;
+/// camera taken out. The compositor's own encoder delay was left in until C8 (Owed 122), because the
+/// viewer hears it too; the programme now stamps its AAC frames a delay early
+/// (`domain::config::AAC_ENCODER_DELAY_SAMPLES`, the one authority for both), so the pairs read the
+/// picture's tick quantisation (half a tick either way) and the audio's jitter.
+pub const CAMERA_AAC_DELAY_MS: f64 = domain::config::AAC_ENCODER_DELAY_SAMPLES as f64 / 48.0;
 /// Fewer repeats than this after a counter's first frame are cadence (`camera.cadence`), not a
 /// freeze. A 30 fps programme sampling a 30 fps camera repeats and skips single frames: the smoke run
 /// had 456 one- and two-frame repeats (PR #48 review).

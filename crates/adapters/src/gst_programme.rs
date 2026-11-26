@@ -3,7 +3,8 @@
 //!
 //! - video: `appsrc(base) + appsrc(overlay) → compositor → AYUV (BT.709) → videoconvert → I420
 //!   (BT.709) → queue(leaky) → x264enc → h264parse → appsink(venc)`;
-//! - audio: `appsrc(audio) → audioconvert → voaacenc → aacparse → appsink(aenc)`.
+//! - audio: `appsrc(audio) → audioconvert → voaacenc → aacparse → appsink(aenc)`, each AAC frame
+//!   stamped the encoder's delay early (`without_aac_delay`, C8), so the sound lands on its picture.
 //!
 //! **Its own clock.** Every buffer is timestamped by tick index, `pts = index × period`, so the
 //! output stays constant-rate however the loop is paced. The appsrcs are not live: nothing in this
@@ -35,8 +36,8 @@ use std::time::Instant;
 use app::ports::{Inbound, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Sender;
 use domain::config::{
-    OutputProfile, FORCED_KEYFRAME_MIN_INTERVAL_MS, X264_RC_LOOKAHEAD_FRAMES, X264_SYNC_LOOKAHEAD_FRAMES,
-    X264_THREADS,
+    OutputProfile, AAC_ENCODER_DELAY_SAMPLES, FORCED_KEYFRAME_MIN_INTERVAL_MS, X264_RC_LOOKAHEAD_FRAMES,
+    X264_SYNC_LOOKAHEAD_FRAMES, X264_THREADS,
 };
 use domain::health::ExitDetail;
 use domain::ladder::Rung;
@@ -73,7 +74,8 @@ const AAC_BITRATE: i32 = 128_000;
 /// +1.4 to +4.2 VMAF at 6 Mbps for 0.8 s of frame delay (`domain::config::X264_DELAY_MS`) and 0 to 14 %
 /// more encoder CPU. B-frames stay off: they bought nothing and the output's rebase cannot carry them. C00 measured a 2 s keyframe interval with x264's scene cut on; F-036 made it
 /// a fixed 3 s GOP (`OutputProfile::gop_frames`) with the scene cut off (`X264_NO_SCENE_CUT`), which
-/// codes fewer keyframes, never more.
+/// codes fewer keyframes, never more; C7 (the owner, 2026-11-26) shortened it to 2.2 s, Cloudflare's
+/// floor and a margin (`PROGRAMME_GOP_MS`), to cut the viewer's delay.
 const X264_SPEED_PRESET: &str = "medium";
 // The VBV lives in `config` (`X264_VBV_MS`), since the first-GOP bound reads it (Owed 112); the
 // property takes a u32 of ms, and a value it cannot carry is a compile error.
@@ -85,7 +87,7 @@ const _: () = assert!(X264_RC_LOOKAHEAD_FRAMES <= i32::MAX as u32);
 const X264_OPTIONS: &str = "nal-hrd=cbr:filler=1";
 /// F-036: x264's scene cut off, so a hard cut in the picture (the slate to the camera, a camera
 /// returning) never starts a GOP early: Cloudflare errored the programme input for GOPs under 2 s
-/// (`ERR_GOP_OUT_OF_RANGE`). x264enc 1.24.2 has no property for it, and reads its `option-string`
+/// (`ERR_GOP_OUT_OF_RANGE`), and at the 2.2 s GOP of C7, 0.2 s over that floor, a cut starting a GOP early is the whole risk. x264enc 1.24.2 has no property for it, and reads its `option-string`
 /// before its properties, none of which sets the scene cut. F-036's libx264 probe: across 210 frames
 /// with hard cuts, keyframes at frames 0, 30, 60, 69, 78, 87 and 177 with it on, at 0, 90 and 180
 /// with `scenecut=0`. x264's `min-keyint` cannot stand in for it: x264 clamps it to
@@ -112,7 +114,7 @@ pub enum SinkStall {
 }
 
 /// How long a planted hang holds: twice F-004's 15 s, past the backstop and a whole recovery (18 s
-/// with F-036's floor and F-040's encoder delay). The kept gap, not the output's budget, so F-036 left case 18's hold at 30 s.
+/// with the new keyframe's arrival: the GOP and F-040's encoder delay). The kept gap, not the output's budget, so F-036 left case 18's hold at 30 s.
 #[cfg(feature = "test-hooks")]
 pub const SINK_HANG_HOLD: Duration = Duration::from_millis(2 * domain::config::YOUTUBE_KEPT_GAP_MS);
 
@@ -601,7 +603,9 @@ impl GstProgramme {
         encoder.set_property("sync-lookahead", X264_SYNC_LOOKAHEAD_FRAMES);
         encoder.set_property("bitrate", profile.video_kbps);
         encoder.set_property("key-int-max", profile.gop_frames());
-        self.shared.ring.set_gop_frames(profile.gop_frames());
+        self.shared
+            .ring
+            .set_gop_frames(profile.gop_frames(), profile.forced_keyframe_min_frames());
         encoder.set_property("bframes", 0u32);
         encoder.set_property("vbv-buf-capacity", X264_VBV_PROPERTY_MS);
         encoder.set_property("option-string", format!("{X264_OPTIONS}:{X264_NO_SCENE_CUT}"));
@@ -617,8 +621,13 @@ impl GstProgramme {
         // by. The adapter does: it asks nothing while the GOP's own keyframe is due within the delay
         // (`gst_output::own_key_in_flight`; the keyframe in the look-ahead serves the swap), and
         // otherwise the request's throttle sees every keyframe it can collide with. This property still
-        // holds a request off a keyframe the encoder HAS handed out, and one request off another
-        // (`a_keyframe_asked_frames_after_the_gops_own_waits_for_the_floor`).
+        // holds a request off a keyframe the encoder HAS handed out, and one request off another.
+        // C7: at the shipped GOP the floor is the GOP (2.2 s each), so the adapter asks for none at
+        // all (`gst_output::forced_key_can_beat_the_gop`, witnessed by
+        // `a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_gop_is_short`).
+        // This property, the request and its retry are retained but INERT at this configuration; they
+        // run only for a GOP over the floor (see `FORCED_KEYFRAME_MIN_INTERVAL_MS`), and nothing
+        // exercises them end to end here.
         encoder.set_property(
             "min-force-key-unit-interval",
             gst::ClockTime::from_mseconds(FORCED_KEYFRAME_MIN_INTERVAL_MS).nseconds(),
@@ -940,11 +949,13 @@ impl ProgrammeOutput for GstProgramme {
         if let Some(old) = r.output.take() {
             old.retire(&self.shared);
         }
-        // The new output starts at a keyframe encoded after its sink can send (Owed 84): its feeder
-        // asks the encoder for one then, from its own thread. The encoder makes it at once, or at
-        // `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later (F-036), or
-        // none, when it has made one at or after `serves_from` already: the GOP's own keyframe,
-        // encoded after the reconnect point, starts the stream (the C1 review's I1). Before the ring
+        // The new output starts at a keyframe encoded after its sink can send (Owed 84). Since C7
+        // its feeder asks the encoder for none at the shipped GOP (the floor is not under it,
+        // `forced_key_can_beat_the_gop`): the GOP's own keyframe starts the stream, at most a GOP away.
+        // For a GOP over the floor it asks from its own thread: the encoder makes the keyframe at
+        // once, or at `FORCED_KEYFRAME_MIN_INTERVAL_MS` after its last keyframe if that is later
+        // (F-036), or none, when it has made one at or after `serves_from` already: the GOP's own
+        // keyframe, encoded after the reconnect point, starts the stream (the C1 review's I1). Before the ring
         // has taken any video the feeder asks nothing: the encoder's first frame is the keyframe
         // (`gst_output::KeyRequest`; CI on PR #109), nor when it starts from the encoder's first
         // frames (Owed 112, `gst_output::first_gop_backlog`).
@@ -1162,13 +1173,53 @@ fn note_push(
     }
 }
 
+/// C8 (Owed 122): the AAC encoder's delay as stream time: `AAC_ENCODER_DELAY_SAMPLES` at the
+/// programme's rate (33.3 ms).
+fn aac_delay() -> gst::ClockTime {
+    gst::ClockTime::from_nseconds(AAC_ENCODER_DELAY_SAMPLES * 1_000_000_000 / u64::from(AUDIO_RATE))
+}
+
+/// An encoded AAC frame's stamp with the encoder's delay taken out. `voaacenc` stamps each output
+/// frame with the time of the samples it was fed, but what it emits is those samples one delay
+/// late (its first frames hold the priming), and the container carries no word of it, so every
+/// player puts the sound a delay behind its picture. The frame is stamped a delay earlier, which
+/// puts the sound where it was fed.
+///
+/// `None` for a frame whose corrected stamp would fall below 0: the stream's first frames hold only
+/// the encoder's priming, not programme audio, so they are dropped (the standard handling of AAC
+/// priming; the C7 final review's I1). Saturating them at 0 stamped the first two frames (0 and
+/// 21.3 ms) both 0, a duplicate stamp into the mux. At 48 kHz that is the frames stamped under
+/// 33.3 ms: the first two (`dropped_priming_frames`).
+fn without_aac_delay(stamp: gst::ClockTime) -> Option<gst::ClockTime> {
+    stamp
+        .nseconds()
+        .checked_sub(aac_delay().nseconds())
+        .map(gst::ClockTime::from_nseconds)
+}
+
+/// An audio entry's PTS and DTS with the encoder's delay taken out, or `None` to drop the frame (a
+/// priming frame: `without_aac_delay`). A DTS that would fall below 0 on a frame that is kept is
+/// dropped from the buffer, the muxer then using its PTS.
+fn corrected_audio_stamps(
+    pts: gst::ClockTime,
+    dts: Option<gst::ClockTime>,
+) -> Option<(gst::ClockTime, Option<gst::ClockTime>)> {
+    Some((without_aac_delay(pts)?, dts.and_then(without_aac_delay)))
+}
+
 /// The encoded `sample` as a ring entry, its PTS and DTS converted to running time through its own
-/// segment (x264enc's output segment starts at 1 000 h: spike trap, F-001's chain).
+/// segment (x264enc's output segment starts at 1 000 h: spike trap, F-001's chain), the audio's with
+/// the encoder's delay taken out (`without_aac_delay`).
 fn running_time_entry(sample: &gst::Sample, video: bool) -> Option<Entry> {
     let buffer = sample.buffer()?;
     let segment = sample.segment()?.downcast_ref::<gst::ClockTime>()?;
     let pts = segment.to_running_time(buffer.pts()?)?;
     let dts = buffer.dts().and_then(|d| segment.to_running_time(d));
+    let (pts, dts) = if video {
+        (pts, dts)
+    } else {
+        corrected_audio_stamps(pts, dts)?
+    };
     let key = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
     let mut copy = buffer.copy();
     {
@@ -1393,7 +1444,87 @@ impl PinkNoise {
 
 #[cfg(test)]
 mod tests {
-    use super::PinkNoise;
+    use super::{corrected_audio_stamps, without_aac_delay, PinkNoise};
+    use crate::frame_store::AUDIO_RATE;
+    use domain::config::AAC_ENCODER_DELAY_SAMPLES;
+    use gstreamer as gst;
+
+    // C8 (Owed 122): the delay `voaacenc` adds is the library's declared 1 600 samples (ffmpeg's
+    // wrapper of the same library: `#define ENC_DELAY 1600`), 33 333 333 ns at 48 kHz; a frame past
+    // it is stamped that much earlier, and one that would fall before the time line is dropped (the
+    // C7 final review's I1: priming, not programme audio; saturating at 0 stamped two frames 0).
+    #[test]
+    fn an_aac_frames_stamp_loses_the_encoders_delay_and_a_priming_frame_is_dropped() {
+        // (stamp ns, expected ns): the delay is 1 600 / 48 000 s, 33 333 333 ns whole.
+        let cases: [(u64, Option<u64>); 6] = [
+            (1_000_000_000, Some(966_666_667)),
+            (33_333_334, Some(1)),
+            (33_333_333, Some(0)),
+            (33_333_332, None),
+            (21_333_333, None),
+            (0, None),
+        ];
+        for (stamp, want) in cases {
+            let got = without_aac_delay(gst::ClockTime::from_nseconds(stamp));
+            assert_eq!(
+                got.map(gst::ClockTime::nseconds),
+                want,
+                "a frame stamped {stamp} ns"
+            );
+        }
+        eprintln!("aac stamps checked: {}", cases.len());
+        assert_eq!(cases.len(), 6, "anti-vacuity: six stamps");
+    }
+
+    // The C7 final review's I1: the AAC encoder's frames as it stamps them (1 024 samples each, from
+    // 0), through the rule the programme applies. The first one kept is the first whose corrected
+    // stamp is not below 0, worked out in SAMPLES from the declared delay (1 600) and the frame size
+    // (1 024), not from the rule's own nanosecond arithmetic: frame k holds samples from k x 1 024, so
+    // it is kept when k x 1 024 >= 1 600, i.e. from k = ceil(1 600 / 1 024) = 2. Every stamp that comes
+    // out is then at least 0 and strictly increasing, and exactly `first_kept` frames were dropped.
+    #[test]
+    fn the_first_aac_frames_that_would_stamp_below_zero_are_dropped_and_the_rest_never_repeat() {
+        const AAC_FRAME_SAMPLES: u64 = 1_024;
+        let rate = u64::from(AUDIO_RATE);
+        let first_kept = AAC_ENCODER_DELAY_SAMPLES.div_ceil(AAC_FRAME_SAMPLES);
+        assert_eq!(first_kept, 2, "setup: 1 600 samples span two 1 024-sample frames");
+        let (mut dropped, mut kept) = (0u64, Vec::new());
+        for k in 0..40u64 {
+            let stamp = gst::ClockTime::from_nseconds(k * AAC_FRAME_SAMPLES * 1_000_000_000 / rate);
+            match corrected_audio_stamps(stamp, Some(stamp)) {
+                None => {
+                    assert!(k < first_kept, "frame {k} was dropped past the priming");
+                    dropped += 1;
+                }
+                Some((pts, dts)) => {
+                    assert!(k >= first_kept, "priming frame {k} was kept, stamped {pts:?}");
+                    assert_eq!(dts, Some(pts), "frame {k}: DTS follows PTS");
+                    // The expected stamp, in samples: where the frame's own samples were fed.
+                    let fed = (k * AAC_FRAME_SAMPLES - AAC_ENCODER_DELAY_SAMPLES) * 1_000_000_000 / rate;
+                    assert!(
+                        pts.nseconds().abs_diff(fed) <= 1,
+                        "frame {k}: stamped {} ns, fed at {fed} ns",
+                        pts.nseconds()
+                    );
+                    kept.push(pts.nseconds());
+                }
+            }
+        }
+        assert_eq!(dropped, first_kept, "frames dropped");
+        assert_eq!(kept.len() as u64, 40 - first_kept, "frames kept");
+        assert!(
+            kept.windows(2).all(|w| w[1] > w[0]),
+            "a stamp repeats or runs backwards: {kept:?}"
+        );
+        // A kept frame whose DTS alone would fall below 0 keeps its PTS and loses the DTS.
+        let (pts, dts) = corrected_audio_stamps(
+            gst::ClockTime::from_nseconds(40_000_000),
+            Some(gst::ClockTime::from_nseconds(10_000_000)),
+        )
+        .expect("a frame past the delay");
+        assert!(pts.nseconds() > 0 && dts.is_none());
+        eprintln!("aac priming frames dropped {dropped}, kept {}", kept.len());
+    }
 
     // F-004: the filler is ~−60 dBFS noise, never digital zero. Expected values from the finding, not
     // from the generator: a peak at or under 0.001 of full scale (about 33 counts), an RMS between

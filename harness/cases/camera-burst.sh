@@ -41,7 +41,7 @@ case_drive() {
   "$HERE/netem.sh" check out
 }
 
-CASE_CHECKS=12
+CASE_CHECKS=11
 case_verdict() {
   # The fault: five holds, as asked.
   require bursts_applied '(mark("burst") | length) == 5 and all(mark("burst")[]; .value.ms == 300)' \
@@ -70,14 +70,13 @@ case_verdict() {
   # after the run's first pair (the case has holds, no return), the earlier ones within
   # `budget_av_offset_excluded_ms`, the median of all pairs within `budget_av_offset_ms` (round 6: it catches a
   # whole-run steady offset), the kept and excluded counts in the measure (lib.jq).
+  # C8 (Owed 122, closed): the offset read 20 to 50 ms and moved from run to run because the programme's own
+  # AAC encoder delays what it is fed by 33.3 ms and the picture's tick quantisation (half a tick either way)
+  # then placed each run between 17 and 50 ms (CI runs 45826423801 to 45842877400: p50 22, 21, 20, 49, 48; the
+  # 48 and 49 runs flipped between 17 and 50 at the quantisation's tie). The programme stamps its AAC frames
+  # the delay early now, so the pairs read the quantisation alone, about 0 +/- 17 ms: no budget moved.
   require av_in_step "def av_starts: [.audio.av_offset_ms.list[0].at_ms // empty]; av_gate_ok(av_starts; 30)" \
     "def av_starts: [.audio.av_offset_ms.list[0].at_ms // empty]; av_gate(av_starts) + {p50: .audio.av_offset_ms.p50}"
-  # Owed 122 (round 6, owner 2026-11-25: merge C4 with this red named): camera-burst's A/V offset is
-  # constant for a whole run and differs between runs (pair p50 22, 45, 49 on one code), so
-  # `av_in_step` can red on the median or the pair budget with no playout fault. The require above
-  # stays red (no budget is widened); this line names the row beside it, and reports whether the gap
-  # the row owes is closed (the same gate holds).
-  owed av_in_step_run_offset 'Owed 122' "def av_starts: [.audio.av_offset_ms.list[0].at_ms // empty]; av_gate_ok(av_starts; 30)"
   measure compositor_repeat_ticks '{repeat_ticks: ([.log.camera_repeats[].repeat_ticks] | add),
     replaced: ([.log.camera_repeats[].replaced] | add)}'
   require no_interior_slates '.camera.slate_frames == 0'

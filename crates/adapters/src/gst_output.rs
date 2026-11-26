@@ -12,18 +12,25 @@
 //! the stream restarts at the next keyframe, so viewers never get a burst of old frames; F-023).
 //! The feeder takes nothing from the ring until the sink can send (`Gate`): a file at once, and
 //! rtmp2sink once its publish is accepted. Until then the ring stays the only queue, and it drops
-//! its oldest. At that moment (the reconnect point) the feeder asks the encoder for a keyframe (made
-//! at once, or, within `FORCED_KEYFRAME_MIN_INTERVAL_MS` of the encoder's last keyframe, at that
-//! floor: F-036), and no video frame the ring holds then may start the stream (`Picker`): the first
-//! frame sent is a keyframe encoded after the reconnect point, and no audio older than it is sent. A request the
-//! encoder does not take is asked again at each entry. A drain that reaches an output that has sent
-//! nothing, at the gate or after it, ends with the encoders (`release_unsent`).
+//! its oldest. At that moment (the reconnect point) no video frame the ring holds may start the
+//! stream (`Picker`): the first frame sent is a keyframe encoded after the reconnect point, and no
+//! audio older than it is sent; the audio from that keyframe's time on is kept for it (`audio_to_hold`
+//! from the ring's `audio_history`, C7), since the audio encoder has no delay and the keyframe may still
+//! be in x264's, and the audio from it to the swap was taken by the old sink's feeder.
+//! Since C7 the feeder asks the encoder for a keyframe only when one asked for can come before the
+//! GOP's own (`forced_key_can_beat_the_gop`: the floor, `FORCED_KEYFRAME_MIN_INTERVAL_MS`, under the GOP;
+//! F-036): a request is made at once, or, within the floor of the encoder's last keyframe, held to it,
+//! and asked again at each entry until the encoder takes it. At the shipped GOP the floor is the GOP
+//! and nothing is asked: the stream starts at the GOP's own next keyframe, at most a GOP away. A drain
+//! that reaches an output that has sent nothing, at the gate or after it, ends with the encoders
+//! (`release_unsent`).
 //!
 //! **One exception: the encoder's first frames** (Owed 112). A sink that can send only after the
 //! encoder's first frames, while the ring still holds all of them, at most
 //! `FIRST_GOP_CATCH_UP_MAX_MS` of them and under `OUTPUT_QUEUE_BYTES` a track, starts at the
 //! encoder's first keyframe and asks nothing (a bounded exception to Owed 84, pending the owner):
-//! dropping them would hold the stream to F-036's floor after frame 0, a head outage of up to 2.2 s.
+//! dropping them would hold the stream to the GOP's next keyframe after frame 0, a head outage of up
+//! to a GOP (`NEW_OUTPUT_KEY_WAIT_MS`).
 //!
 //! **Progress** (Owed 13). A poll every `OUTPUT_PROGRESS_POLL_MS` reads the sink's bytes-SENT total,
 //! rtmp2sink `stats` field `out-bytes-total` (F-010), or the file's size for `file://`, and sends
@@ -135,9 +142,16 @@ impl<S> Entry<S> {
     }
 }
 
-#[derive(Default)]
-struct RingState {
-    entries: VecDeque<Entry>,
+/// The ring's state, generic over the sample so its logic (`push_entry`, `pop_entry`,
+/// `plain_reconnect`) runs in unit tests without GStreamer.
+struct RingState<S = gst::Sample> {
+    entries: VecDeque<Entry<S>>,
+    /// C7 (the review's N1): the audio the ring has been handed, whether or not a feeder has taken it
+    /// since, newest last and bounded like the ring (`note_audio`). A new sink's stream may start at a
+    /// keyframe still inside x264's delay, made before the swap, and the audio from that keyframe's
+    /// time to the swap was taken by the OLD sink's feeder (a healthy swap) or sits in `entries` (a
+    /// sink that waited at the gate): only a history that outlives the taking holds it for both.
+    audio_history: VecDeque<Entry<S>>,
     next_seq: u64,
     video_eos: bool,
     audio_eos: bool,
@@ -157,9 +171,67 @@ struct RingState {
     video_since_key: Option<u64>,
     /// The programme's GOP in frames (`key-int-max`), 0 until the programme sets it.
     gop_frames: u32,
+    /// The forced keyframe's floor in frames (`FORCED_KEYFRAME_MIN_INTERVAL_MS`), 0 until the
+    /// programme sets it (C7: `forced_key_can_beat_the_gop` reads it with the GOP).
+    floor_frames: u32,
     /// The entries the ring dropped for its span or its count, per track (the test hooks read it).
     #[cfg(feature = "test-hooks")]
     pruned: Encoded,
+}
+
+impl<S> Default for RingState<S> {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            audio_history: VecDeque::new(),
+            next_seq: 0,
+            video_eos: false,
+            audio_eos: false,
+            owner: 0,
+            drained_sent: false,
+            encoded: Encoded::default(),
+            newest_video: None,
+            video_since_key: None,
+            gop_frames: 0,
+            floor_frames: 0,
+            #[cfg(feature = "test-hooks")]
+            pruned: Encoded::default(),
+        }
+    }
+}
+
+impl<S: Clone> RingState<S> {
+    /// Takes an entry from the encoders: stamps its seq, counts it, keeps audio in the history and
+    /// prunes the ring. Returns what the ring's bounds dropped, (video, audio).
+    fn push_entry(&mut self, mut e: Entry<S>) -> (u64, u64) {
+        e.seq = self.next_seq;
+        self.next_seq += 1;
+        if e.video {
+            self.encoded.video += 1;
+            self.newest_video = Some(self.newest_video.map_or(e.pts, |n| n.max(e.pts)));
+            self.video_since_key = since_key_after(self.video_since_key, e.key);
+        } else {
+            self.encoded.audio += 1;
+            note_audio(&mut self.audio_history, &e);
+        }
+        self.entries.push_back(e);
+        prune(&mut self.entries)
+    }
+
+    /// The next entry a feeder takes: the oldest the ring holds.
+    fn pop_entry(&mut self) -> Option<Entry<S>> {
+        self.entries.pop_front()
+    }
+
+    /// The reconnect point of a sink that starts at the next keyframe (every path but Owed 112's):
+    /// the seq of the first entry encoded after it, and the audio the new sink's `Picker` is handed
+    /// first (`audio_to_hold`). What `entries` still holds reaches it through `pop_entry` in order,
+    /// so what is held here is only the audio older than the ring's oldest entry: nothing is sent
+    /// twice and the audio's PTS never runs backwards.
+    fn plain_reconnect(&self) -> (u64, VecDeque<Entry<S>>) {
+        let first_left = self.entries.front().map_or(self.next_seq, |e| e.seq);
+        (self.next_seq, audio_to_hold(&self.audio_history, first_left))
+    }
 }
 
 /// The programme → output hand-off: bounded by span (per track) and by count, dropping the oldest.
@@ -170,19 +242,9 @@ pub(crate) struct EncodedRing {
 }
 
 impl EncodedRing {
-    pub(crate) fn push(&self, mut e: Entry) {
+    pub(crate) fn push(&self, e: Entry) {
         let mut r = locked(&self.state);
-        e.seq = r.next_seq;
-        r.next_seq += 1;
-        if e.video {
-            r.encoded.video += 1;
-            r.newest_video = Some(r.newest_video.map_or(e.pts, |n| n.max(e.pts)));
-            r.video_since_key = since_key_after(r.video_since_key, e.key);
-        } else {
-            r.encoded.audio += 1;
-        }
-        r.entries.push_back(e);
-        let dropped = prune(&mut r.entries);
+        let dropped = r.push_entry(e);
         #[cfg(feature = "test-hooks")]
         {
             r.pruned.video += dropped.0;
@@ -205,9 +267,12 @@ impl EncodedRing {
         locked(&self.state).entries.len()
     }
 
-    /// The programme's GOP in frames, set when it builds its encoder (`own_key_in_flight`).
-    pub(crate) fn set_gop_frames(&self, gop_frames: u32) {
-        locked(&self.state).gop_frames = gop_frames;
+    /// The programme's GOP in frames, set when it builds its encoder (`own_key_in_flight`), and the
+    /// forced keyframe's floor in frames (C7, `forced_key_can_beat_the_gop`).
+    pub(crate) fn set_gop_frames(&self, gop_frames: u32, floor_frames: u32) {
+        let mut r = locked(&self.state);
+        r.gop_frames = gop_frames;
+        r.floor_frames = floor_frames;
     }
 
     /// The entries dropped for the ring's span or count so far, (video, audio) (the test hooks read it).
@@ -714,12 +779,22 @@ struct Reconnect {
     /// Owed 112: the encoder's first frames, taken out of the ring at the gate, from which the
     /// stream starts at the encoder's first keyframe; empty on every other path.
     first_gop: VecDeque<Entry>,
+    /// C7 (the review's I1, N1): the audio handed to the ring before the reconnect point that the ring
+    /// no longer holds (`RingState::plain_reconnect`), to be held by the `Picker` for the keyframe the
+    /// stream starts on. The audio encoder has no delay, so when that keyframe is the GOP's own, made
+    /// before the swap and still in x264's delay, the audio from its time on is in no later entry, and
+    /// on a healthy swap the old sink's feeder has taken it from the ring; the `Picker` sends what is at
+    /// or after the keyframe and nothing older. Never an entry the ring still holds (`next` delivers
+    /// those: held too they are sent twice). Empty on the Owed 112 path (`first_gop` holds its audio).
+    held_audio: VecDeque<Entry>,
 }
 
 /// The keyframe asked for at the reconnect point (Owed 84): asked again at each entry until the
 /// encoder takes it or the stream has started, so a refused request does not leave the stream
-/// waiting for the encoder's own keyframe, up to a GOP away (3 s, F-036; PR #57 review m-6). The
-/// request carries the running time a keyframe serves from (`KeyRequest`).
+/// waiting for the encoder's own keyframe, up to a GOP away (PR #57 review m-6). With the floor not
+/// under the GOP (the shipped case, C7) none is asked (`forced_key_can_beat_the_gop`), so this retry
+/// runs only for a GOP over the floor. The request carries the running time a keyframe serves from
+/// (`KeyRequest`).
 #[derive(Default)]
 struct KeyAsk {
     tries: u32,
@@ -729,6 +804,9 @@ struct KeyAsk {
     /// `ask_key` has said that nothing is asked because the GOP's own keyframe is in the encoder
     /// (F-040, `own_key_in_flight`): said once.
     said_in_flight: bool,
+    /// `ask_key` has said that nothing is asked because the forced keyframe's floor is not under the
+    /// GOP (C7, `forced_key_can_beat_the_gop`): said once.
+    said_floor_over_gop: bool,
 }
 
 impl Feeder {
@@ -737,6 +815,7 @@ impl Feeder {
             seq,
             serves_from,
             first_gop,
+            held_audio,
         }) = self.reconnect_point()
         else {
             return;
@@ -749,6 +828,11 @@ impl Feeder {
         for e in first_gop {
             pick.take(e, |e, base| self.push(e, base));
         }
+        // C7 (the review's I1): the audio queued before the swap, held for the keyframe (never sent
+        // ahead of it: `Picker::take`).
+        for e in held_audio {
+            pick.take(e, |e, base| self.push(e, base));
+        }
         // F-036 (CI on PR #109): before the ring has taken any video, nothing is asked. x264's first
         // frame is a keyframe, and every video entry comes after the reconnect point, so that frame
         // starts the stream. A request there would also be matched on that frame at a running time
@@ -758,7 +842,7 @@ impl Feeder {
         // x264enc's min-pts has moved that frame's PTS on by 1 000 h (gstx264enc.c 1418; 1574-1583).
         // The 1 000 h becomes `last_force_key_unit_request` (1696), and the floor then throttles
         // every later forced keyframe (1600-1607) until the encoder stops: each later sink waits for
-        // the GOP's own keyframe, up to 3 s. `ask_key`'s `None` branch is that guard, and it writes
+        // the GOP's own keyframe, up to a GOP. `ask_key`'s `None` branch is that guard, and it writes
         // the line the tests wait on (the C1 review's m1: the line and the guard are one branch).
         if !pick.started() {
             self.ask_key(&mut ask, serves_from);
@@ -802,6 +886,27 @@ impl Feeder {
             return;
         };
         if ask.taken {
+            return;
+        }
+        // C7: with the floor over the GOP, a keyframe asked for can only be made after the GOP's own
+        // (held to the floor), and, the GOP's own being in x264's delay, right behind it: a GOP under
+        // Cloudflare's floor. The GOP's own keyframe serves every swap, at most a GOP away.
+        let (can_beat, gop, floor) = {
+            let r = locked(&self.ring.state);
+            (
+                forced_key_can_beat_the_gop(r.gop_frames, r.floor_frames),
+                r.gop_frames,
+                r.floor_frames,
+            )
+        };
+        if !can_beat {
+            if !std::mem::replace(&mut ask.said_floor_over_gop, true) {
+                self.shared.log(&format!(
+                    "output gen={}: {FLOOR_OVER_GOP_LINE} (floor {floor} frames, GOP {gop}): the GOP's own \
+                     keyframe, at most a GOP on, serves this sink",
+                    self.gen
+                ));
+            }
             return;
         }
         // F-040: the GOP's own keyframe is in the encoder's delay, due within `X264_DELAY_MS`, and
@@ -899,9 +1004,10 @@ impl Feeder {
                         seq,
                         serves_from,
                         first_gop,
+                        held_audio: VecDeque::new(),
                     });
                 }
-                let seq = r.next_seq;
+                let (seq, held_audio) = r.plain_reconnect();
                 drop(r);
                 self.shared.log(&format!(
                     "output gen={}: the sink can send after {waited} ms; the {held} video frames queued \
@@ -912,6 +1018,7 @@ impl Feeder {
                     seq,
                     serves_from,
                     first_gop: VecDeque::new(),
+                    held_audio,
                 });
             }
             let r = locked(&self.ring.state);
@@ -951,7 +1058,7 @@ impl Feeder {
                     return Next::Eos;
                 }
             } else if !self.backed_up() {
-                let e = r.entries.pop_front().expect("checked non-empty");
+                let e = r.pop_entry().expect("checked non-empty");
                 return Next::Entry(e);
             }
             r = self
@@ -983,6 +1090,8 @@ impl Feeder {
 ///   encoder runs about 60 ms ahead of the video one, so a keyframe's first audio arrives before it
 ///   (dropping it lost 2 or 3 AAC frames per sink). Once the keyframe sets the base, the held audio
 ///   at or after it is sent, and no audio before it, so the audio never starts ahead of the video.
+///   C7: the audio handed to the ring before the reconnect point and no longer in it is held the
+///   same way (`audio_to_hold`), for a keyframe already made and still in x264's delay.
 /// - A seq gap (the ring dropped entries this output never took) makes the video resume at a
 ///   keyframe.
 pub(crate) struct Picker<S = gst::Sample> {
@@ -1048,6 +1157,38 @@ impl<S> Picker<S> {
     }
 }
 
+/// C7 (the review's I1, N1): `history` is the audio the ring has been handed, oldest first
+/// (`RingState::audio_history`). `note_audio` adds one entry and bounds the history like the ring: a
+/// span (`ENCODED_RING_SPAN`) behind its newest, and `ENCODED_RING_MAX_ENTRIES`.
+pub(crate) fn note_audio<S: Clone>(history: &mut VecDeque<Entry<S>>, e: &Entry<S>) {
+    history.push_back(e.clone());
+    while history.len() > ENCODED_RING_MAX_ENTRIES {
+        history.pop_front();
+    }
+    while history
+        .front()
+        .is_some_and(|f| e.pts.saturating_sub(f.pts) > span())
+    {
+        history.pop_front();
+    }
+}
+
+/// C7 (the review's I1, N1): the audio a new sink's `Picker` is handed before the ring's own entries:
+/// the history's entries older than `first_left`, the seq of the oldest entry the ring still holds
+/// (or the next seq when it holds none). The stream starts at a keyframe that may be the GOP's own,
+/// made before the swap and still inside x264's delay (`own_key_in_flight`); the audio encoder has
+/// no delay, so the audio from that keyframe's time to the swap was handed to the ring BEFORE the
+/// swap, and on a healthy swap the old sink's feeder has taken it from `entries` (nothing in the ring
+/// holds it). Dropped with the video (the reconnect point is `next_seq`), the stream's audio began as
+/// late as the swap was after its keyframe, up to `X264_DELAY_MS`, a silent lead-in under a picture.
+/// Only entries OLDER than `first_left` are held: what `entries` still holds reaches the `Picker`
+/// through the feeder's own `next`, so holding it here too sent each such audio frame twice and ran
+/// its PTS backwards into the mux. The `Picker` holds these as it holds the audio that arrives before
+/// a keyframe and sends only what is at or after it.
+pub(crate) fn audio_to_hold<S: Clone>(history: &VecDeque<Entry<S>>, first_left: u64) -> VecDeque<Entry<S>> {
+    history.iter().filter(|e| e.seq < first_left).cloned().collect()
+}
+
 /// `RingState::video_since_key` after one more video entry: a keyframe is frame 0 of its GOP, any
 /// other entry one more, and before any keyframe there is nothing to count from.
 fn since_key_after(since: Option<u64>, key: bool) -> Option<u64> {
@@ -1077,6 +1218,24 @@ fn since_key_after(since: Option<u64>, key: bool) -> Option<u64> {
 pub(crate) fn own_key_in_flight(video_since_key: Option<u64>, gop_frames: u32) -> Option<u64> {
     let due_in = u64::from(gop_frames).checked_sub(video_since_key?)?;
     (due_in > 0 && due_in <= u64::from(X264_DELAY_FRAMES)).then_some(due_in)
+}
+
+/// C7: the line `ask_key` writes, once, when it asks for no keyframe because the floor is not under
+/// the GOP (the programme tests wait on it).
+pub(crate) const FLOOR_OVER_GOP_LINE: &str =
+    "the keyframe is not asked: a forced keyframe cannot come before the GOP's own";
+
+/// C7: whether a keyframe asked for can come before the GOP's own: only when the floor it is held
+/// to is shorter than the GOP, both in frames (x264 counts frames; `domain::config::forced_key_can_beat`
+/// is the one authority, and `OutputProfile::forced_key_can_beat_the_gop` the same comparison on the
+/// profile). Held to the floor after the last keyframe, a request made when the floor is the GOP or
+/// longer is made at or after the GOP's own keyframe's frame, which x264 has already coded and not yet
+/// handed out (`own_key_in_flight`), so GstVideoEncoder's throttle cannot see it and the request cuts
+/// a GOP of the few frames between: under Cloudflare's floor. A GOP or a floor not yet set (0) asks
+/// nothing (the review's M3: unset fails closed, at the cost of waiting for the GOP's own keyframe,
+/// never of a GOP under the floor; `set_gop_frames` runs when the encoder is built, before any sink).
+pub(crate) fn forced_key_can_beat_the_gop(gop_frames: u32, floor_frames: u32) -> bool {
+    domain::config::forced_key_can_beat(gop_frames, floor_frames)
 }
 
 /// Owed 112: whether a sink that can send only now starts from the encoder's first keyframe rather
@@ -1322,6 +1481,190 @@ mod tests {
         );
     }
 
+    /// What one new sink sends, as (is video, PTS ms, base ms) in order, and how it got there.
+    struct SinkRun {
+        sent: Vec<(bool, u64, u64)>,
+        /// Audio entries the new sink was handed by `plain_reconnect` (`audio_to_hold`).
+        held: usize,
+    }
+
+    /// C7 (the review's I1 and N1), the ring and the feeder's loop as they run, minus GStreamer: the
+    /// REAL `RingState` (`push_entry`, `pop_entry`, `plain_reconnect`) and the REAL `Picker`, with the
+    /// encoders' entries pushed in the order they hand them out. Video: 30 fps, a keyframe every GOP
+    /// (66 frames, 2 200 ms), each frame out of x264 `delay_ms` after its PTS (`X264_DELAY_MS`);
+    /// audio: 21 ms frames with no delay.
+    ///
+    /// - Before `swap_ms` the OLD sink's feeder takes every entry the moment it arrives (`pop_entry`).
+    /// - From `swap_ms` the new sink owns the ring and waits at its gate for `gate_ms` (0: a file, or
+    ///   a publish that is already accepted): nothing takes entries, the ring only prunes.
+    /// - At `swap_ms + gate_ms` the sink can send: `plain_reconnect`, its `Picker`, the held audio,
+    ///   then the feeder's loop (`pop_entry` until the ring is empty, and again after each push).
+    fn run_new_sink(swap_ms: u64, gate_ms: u64, delay_ms: u64) -> SinkRun {
+        const GOP_MS: u64 = 2_200;
+        let mut events: Vec<(u64, bool, bool, u64)> = Vec::new(); // wall, video, key, pts
+        for i in 0..400u64 {
+            let pts = i * 1_000 / 30;
+            events.push((pts + delay_ms, true, (pts % GOP_MS) == 0, pts));
+        }
+        for j in 0..600u64 {
+            events.push((j * 21, false, false, j * 21));
+        }
+        events.sort_by_key(|e| (e.0, e.1));
+        let open_at = swap_ms + gate_ms;
+        let mut ring = RingState::<u64>::default();
+        let mut sink: Option<(Picker<u64>, usize)> = None;
+        let mut sent = Vec::new();
+        let mut feed = |pick: &mut Picker<u64>, e: Entry<u64>| {
+            pick.take(e, |e, base| {
+                sent.push((e.video, e.pts.mseconds(), base.mseconds()))
+            });
+        };
+        for (n, (wall, video, key, pts)) in events.into_iter().enumerate() {
+            if sink.is_none() && wall >= open_at {
+                let (reconnect, held) = ring.plain_reconnect();
+                let held_n = held.len();
+                let mut pick = Picker::new(reconnect);
+                for e in held {
+                    feed(&mut pick, e);
+                }
+                while let Some(e) = ring.pop_entry() {
+                    feed(&mut pick, e);
+                }
+                sink = Some((pick, held_n));
+            }
+            ring.push_entry(Entry::new(
+                n as u64,
+                video,
+                key,
+                gst::ClockTime::from_mseconds(pts),
+            ));
+            if wall < swap_ms {
+                while ring.pop_entry().is_some() {} // the old sink's feeder
+            } else if let Some((pick, _)) = sink.as_mut() {
+                while let Some(e) = ring.pop_entry() {
+                    feed(pick, e);
+                }
+            }
+        }
+        SinkRun {
+            sent,
+            held: sink.map_or(0, |(_, n)| n),
+        }
+    }
+
+    /// The review's I1 and N1, three ways a sink comes to start (`gate_ms`: a healthy swap, a short
+    /// gate wait, and an outage longer than the ring's span), and every swap tick across the delay
+    /// window and past it. Whichever way, the new sink's audio starts within one AAC frame (21 ms)
+    /// of its picture and never before it, and is every audio frame from there on exactly once, in
+    /// order: no duplicate PTS, none backwards, none missing (the N1 defect sent each such frame twice
+    /// on a gate wait, and recovered nothing on a healthy swap, where the old feeder had taken the
+    /// audio).
+    ///
+    /// The expected keyframe comes from the declarations: one made before the sink can send and not yet
+    /// out of x264 (a keyframe is made every GOP and comes out `DELAY_MS` later) starts the stream,
+    /// else the next one made. The sweep counts each path and each side of the delay window, and the
+    /// healthy path must hand the new sink audio (`held`), or the sweep proves nothing.
+    #[test]
+    fn a_new_sinks_audio_starts_with_its_keyframe_and_is_sent_once_in_order_on_every_path() {
+        const GOP_MS: u64 = 2_200;
+        const DELAY_MS: u64 = 800;
+        const AAC_FRAME_MS: u64 = 21;
+        let (mut cases, mut in_delay, mut past, mut held_cases, mut audio_sent) = (0, 0, 0, 0, 0);
+        let mut by_gate = [0usize; 3];
+        for (g, gate_ms) in [0u64, 300, 2_500].into_iter().enumerate() {
+            // Swaps from just after the GOP's keyframe to just after the next one's delay.
+            for swap in (2_201..2 * GOP_MS + DELAY_MS + 200).step_by(37) {
+                let open_at = swap + gate_ms;
+                let made = open_at / GOP_MS * GOP_MS;
+                let inside = open_at <= made + DELAY_MS;
+                let want = if inside { made } else { made + GOP_MS };
+                let run = run_new_sink(swap, gate_ms, DELAY_MS);
+                let video: Vec<_> = run.sent.iter().filter(|s| s.0).collect();
+                let audio: Vec<u64> = run.sent.iter().filter(|s| !s.0).map(|s| s.1).collect();
+                let case = format!("swap {swap}, gate {gate_ms}");
+                assert_eq!(video.first().map(|v| v.2), Some(want), "{case}: base");
+                let first = *audio.first().unwrap_or_else(|| panic!("{case}: no audio sent"));
+                assert!(
+                    first >= want && first < want + AAC_FRAME_MS,
+                    "{case}: audio starts at {first} ms, the picture at {want} ms"
+                );
+                // Exactly once, in order, nothing missing: AAC frames 21 ms apart, from `first` on.
+                for w in audio.windows(2) {
+                    assert_eq!(
+                        w[1] - w[0],
+                        AAC_FRAME_MS,
+                        "{case}: audio PTS {} then {}",
+                        w[0],
+                        w[1]
+                    );
+                }
+                audio_sent += audio.len();
+                if inside {
+                    in_delay += 1;
+                    held_cases += usize::from(run.held > 0);
+                } else {
+                    past += 1;
+                }
+                by_gate[g] += 1;
+                cases += 1;
+            }
+        }
+        eprintln!(
+            "sink audio: {cases} starts ({in_delay} in the delay, {past} past it; by gate {by_gate:?}), \
+             held audio in {held_cases}, {audio_sent} audio frames checked"
+        );
+        assert!(
+            in_delay >= 30 && past >= 30 && by_gate.iter().all(|&n| n >= 20) && audio_sent > 0,
+            "{in_delay} {past} {by_gate:?} {audio_sent}"
+        );
+        // Anti-vacuity: the sweep reached the case the hold exists for, and found audio to hold.
+        assert!(
+            held_cases >= in_delay / 2,
+            "held in {held_cases} of {in_delay} in-delay starts"
+        );
+    }
+
+    /// The C7 final review's I2: the audio history is bounded like the ring, by count and by span, and
+    /// each bound is read off the history's length after pushing past it (through the real
+    /// `RingState::push_entry`, as the encoders feed it). The bounds come from the ring's own
+    /// declarations (`ENCODED_RING_MAX_ENTRIES`, `ENCODED_RING_SPAN`), and video entries never enter it.
+    #[test]
+    fn the_audio_history_is_bounded_by_count_and_by_span() {
+        let span_ns = ENCODED_RING_SPAN.as_nanos() as u64;
+        let audio = |n: u64, ns: u64| Entry::new(n, false, false, gst::ClockTime::from_nseconds(ns));
+        let mut checked = 0;
+        // Count: more than the cap at one PTS (no span applies); the oldest go, the newest stay.
+        let mut ring = RingState::<u64>::default();
+        let extra = 7;
+        for i in 0..ENCODED_RING_MAX_ENTRIES as u64 + extra {
+            ring.push_entry(audio(i, 0));
+            checked += 1;
+        }
+        assert_eq!(ring.audio_history.len(), ENCODED_RING_MAX_ENTRIES, "count bound");
+        assert_eq!(
+            ring.audio_history.front().map(|e| e.sample),
+            Some(extra),
+            "the oldest entries went"
+        );
+        // Span: an entry exactly a span behind the newest stays, one nanosecond more goes.
+        let mut ring = RingState::<u64>::default();
+        ring.push_entry(audio(0, 0));
+        ring.push_entry(audio(1, span_ns));
+        assert_eq!(ring.audio_history.len(), 2, "a span behind stays");
+        ring.push_entry(audio(2, span_ns + 1));
+        assert_eq!(ring.audio_history.len(), 2, "a span and a ns behind goes");
+        assert_eq!(ring.audio_history.front().map(|e| e.sample), Some(1));
+        ring.push_entry(audio(3, 10 * span_ns));
+        assert_eq!(ring.audio_history.len(), 1, "everything older than a span goes");
+        checked += 5;
+        // Video never enters the history.
+        let mut ring = RingState::<u64>::default();
+        ring.push_entry(Entry::new(0, true, true, gst::ClockTime::from_nseconds(0)));
+        assert_eq!(ring.audio_history.len(), 0, "video is not audio");
+        checked += 1;
+        assert!(checked > 0, "nothing was pushed");
+    }
+
     #[test]
     fn with_no_keyframe_after_the_reconnect_point_nothing_is_sent() {
         let ring: Vec<_> = ring_with_an_old_keyframe()
@@ -1453,6 +1796,87 @@ mod tests {
         }
         eprintln!("keyframe-in-flight sweep: checked {checked}, in flight {in_flight}");
         assert!(checked > 0 && in_flight > 0 && in_flight < checked);
+    }
+
+    /// C7: a keyframe is asked for exactly when it would be made BEFORE the GOP's own. The expected
+    /// answer is GstVideoEncoder's own model, not this rule's arithmetic: a request made when the
+    /// newest frame the ring holds is `since` frames after the last keyframe reaches the encoder
+    /// `delay` frames on (x264's look-ahead and frame threads), is held to the floor after the last
+    /// keyframe, and so is made at frame `max(since + delay, floor)` after it; the GOP's own comes at
+    /// frame `gop`, and a request made at or after it cuts a GOP of the frames between (under
+    /// Cloudflare's floor). The sweep covers the shipped 2.2 s GOP (never asked: the floor is the GOP),
+    /// the 3 s GOP before C7 (asked until the GOP's keyframe is in the delay), and a 1 s GOP; it
+    /// reports how many of each answer it saw, so a rule that is always yes or always no fails.
+    #[test]
+    fn a_keyframe_is_asked_only_when_it_would_be_made_before_the_gops_own() {
+        let floor = u64::from(domain::config::OutputProfile::P1080.forced_keyframe_min_frames());
+        let delay = u64::from(domain::config::X264_DELAY_FRAMES);
+        let (mut checked, mut asked, mut refused) = (0u64, 0u64, 0u64);
+        let mut asked_at_the_shipped_gop = 0u64;
+        let shipped = domain::config::OutputProfile::P1080.gop_frames();
+        for gop in [shipped, 90, 30] {
+            for since in 0..u64::from(gop) {
+                let lands_at = (since + delay).max(floor);
+                let want = lands_at < u64::from(gop);
+                let got = forced_key_can_beat_the_gop(gop, floor as u32)
+                    && own_key_in_flight(Some(since), gop).is_none();
+                assert_eq!(
+                    got, want,
+                    "GOP {gop}, newest frame {since} after the last keyframe"
+                );
+                if got {
+                    asked += 1;
+                    if gop == shipped {
+                        asked_at_the_shipped_gop += 1;
+                    }
+                } else {
+                    refused += 1;
+                }
+                checked += 1;
+            }
+        }
+        eprintln!("ask sweep: checked {checked}, asked {asked}, refused {refused}");
+        assert!(checked > 0 && asked > 0 && refused > 0);
+        // The shipped GOP: the floor is the GOP, so none is ever asked (C7).
+        assert_eq!(asked_at_the_shipped_gop, 0);
+        assert_eq!(
+            u64::from(shipped),
+            66,
+            "setup: the shipped GOP is 2.2 s at 30 fps"
+        );
+    }
+
+    /// C7: the comparison itself, at its edge and with nothing set. Equal is refused: a request held
+    /// to a floor equal to the GOP is made on the GOP's own keyframe's frame or after it.
+    #[test]
+    fn the_floor_must_be_strictly_under_the_gop_and_unset_values_ask_nothing() {
+        for (gop, floor, want) in [
+            (90, 66, true),
+            (67, 66, true),
+            (66, 66, false),
+            (65, 66, false),
+            (60, 66, false),
+            (0, 66, false),
+            (60, 0, false),
+            (0, 0, false),
+        ] {
+            assert_eq!(
+                forced_key_can_beat_the_gop(gop, floor),
+                want,
+                "GOP {gop}, floor {floor}"
+            );
+        }
+        for p in [
+            domain::config::OutputProfile::P720,
+            domain::config::OutputProfile::P1080,
+        ] {
+            assert_eq!(
+                forced_key_can_beat_the_gop(p.gop_frames(), p.forced_keyframe_min_frames()),
+                p.forced_key_can_beat_the_gop(),
+                "{}p: the frames rule and the declared intervals agree",
+                p.height
+            );
+        }
     }
 
     /// F-040: no keyframe taken yet, or a GOP the programme has not set, is nothing to predict from:

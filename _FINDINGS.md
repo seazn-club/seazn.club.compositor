@@ -3926,3 +3926,176 @@ driver-level scenario above, which can model the hold, and it runs locally.
 **Owed to CI.** Nothing in `adapters` changed. check.yml's tests and the chaos harness (`camera-stop`,
 `camera-flap`, `reader-kicked`: more beats during their input outages, which no case judges as a count) are
 CI's.
+
+## F-042: the programme's GOP is 2.2 s (Cloudflare's floor and the margin), the forced keyframe's floor is the same so none is asked, and the VMAF cost at 2 s was under 0.4 points (C7, 2026-11-26)
+
+**Why 3 s was chosen (F-036).** Two causes, both gone: x264's scene cut (a cut inside a GOP started one under 2 s; off
+since F-036, `scenecut=0`) and Owed 84's forced keyframes (a request landing close behind a natural one; held to the
+floor since F-036). The phone's own ±14 ms jitter at 2 s was the margin, and it is the phone's, not this encoder's (it
+counts frames and stamps tick `i` at `i × 10⁹ / fps`). No ruling forbids a shorter GOP; the owner approved the move
+2026-11-26 to cut viewer latency (Cloudflare cuts live HLS segments at keyframes: stg showed 3 to 3.33 s segments,
+TARGETDURATION 4, camera to viewer 24.5 s). **The first cut was 2.0 s exactly; the C7 review (I2, I5) put it back on the
+200 ms margin: 2.2 s.** A GOP of exactly Cloudflare's 2 s sits on an edge that has never been measured against this
+encoder, which is what the margin is for, and the cost is 0.2 s of latency.
+
+**Cloudflare's floor, regular input against LL input.** The floor is 2 s for all live inputs.
+<https://developers.cloudflare.com/stream/stream-live/start-stream-live/>, "Requirements": "GOP duration
+(keyframe interval) must be between 2 and 10 seconds", stated for live inputs without a split; its Low-Latency HLS
+section only RECOMMENDS "a GOP size of 2 - 4 seconds" (no separate limit). The troubleshooting page words the error as
+"less than 2 seconds or greater than 8". The 2023 LL-HLS open-beta post
+(<https://blog.cloudflare.com/cloudflare-stream-low-latency-hls-open-beta/>) recommends 1 s: a recommendation in a
+dated post, not a documented floor, contradicted by the current docs. Measured on the wire: nothing; a 1 s GOP has not
+been tried against Cloudflare, and the phone's 2 s edge errors (F-036) say the limit is enforced. So 2.2 s is built, and
+a move shorter is one constant (below), to be taken only after a stg run shows `ERR_GOP_OUT_OF_RANGE` does not come.
+
+**One constant.** `CF_KEYFRAME_INTERVAL_MIN_MS` (2 000) plus `FORCED_KEYFRAME_MARGIN_MS` (200) is both the GOP
+(`PROGRAMME_GOP_MS`) and the forced keyframe's floor (`FORCED_KEYFRAME_MIN_INTERVAL_MS`), 66 frames at 30 fps. The
+phone's 3 s `CAMERA_GOP_MS` is the camera's and unchanged. Derived from it, not retyped: `NEW_OUTPUT_KEY_WAIT_MS` (the
+shorter of floor and GOP, 2 200), `FORCED_KEYFRAME_ARRIVAL_MS` (that plus the 800 ms encoder delay, 3 000, as before C7),
+`OUTPUT_GAP_BUDGET_MS` 18 000, harness `budget_output_reconnect_ms` 8 000 (both as on main), `FIRST_GOP_CATCH_UP_MAX_MS`
+(half the wait capped at one VBV, 1 000, unmoved). So no budget or threshold moves from main. The 3 000 is a loose bound
+(the C7 review's I3): a new output waits at most a GOP (2.2 s) and the sum adds the whole delay to it; it overcounts the
+worst real wait by about the delay and stays so the chaos budgets and `thresholds.json` do not move twice (Owed 124).
+
+**The forced key cannot beat the GOP.** With GOP 66 frames and floor 66, a request lands at `max(since + 24, 66)` frames
+after the last keyframe: on or after the GOP's own key at 66. Asked while that key is in x264's delay it cuts a GOP of the
+few frames between, under Cloudflare's floor. So `gst_output::forced_key_can_beat_the_gop` (`domain::config::
+forced_key_can_beat`, the one authority: floor STRICTLY under GOP, and unset values refuse) is false at the shipped
+config and the adapter asks for none; a new output starts at the GOP's own next keyframe, at most a GOP away (2.2 s), or at
+the GOP's keyframe already in the delay. The earlier rule (C5's `own_key_in_flight`) stays for a longer GOP. **The
+request, its retry and the `min-force-key-unit-interval` property are retained but INERT at the shipped config** (the
+review's I5): they run only for a GOP over the floor. They are covered by unit tests of the rule at a GOP over the floor
+(asked) and at the shipped config (none asked; `domain` and `gst_output`), not by a real-encoder test: nothing in the
+suite drives a forced keyframe through x264 at this config, and reviving the path needs one (a profile override under
+`test-hooks`). Measured at the first cut (`encoder-tune`, run 45828709098, G2 encoder at 60 frames, real forced-key
+events at offsets 0.1 to 3.4 s, 2 reps; floor 66): the control **U2** (C5's rule) cut a **200 ms GOP in 10 of 50
+intervals**; **Q2** (nothing asked) cut **0 of 40, shortest 2 000 ms**. Not re-run at 66 frames.
+
+**VMAF cost at the first cut, 2 s (libvmaf 3.2.0, x264enc medium, 6 000 kbps, 1080p30, 220 frames; the shipped L2 +
+`sync-lookahead=0` encoder; G3 = key-int-max 90, G2 = 60). Mean (1 %, 5 %):**
+
+| clip | G3 (3 s) | G2 (2 s) | Δ mean | Δ 1 % |
+|---|---|---|---|---|
+| ball | 97.66 (97.4, 97.5) | 97.66 (97.4, 97.5) | 0.00 | 0.0 |
+| touchdown_pass | 91.53 (81.1, 85.0) | 91.16 (81.1, 84.8) | **−0.37** | 0.0 |
+| rush_field_cuts | 82.89 (73.9, 78.6) | 82.83 (74.7, 77.3) | −0.06 | +0.8 |
+| snow | 15.23 (13.5, 13.7) | 15.34 (13.5, 13.8) | +0.11 | 0.0 |
+
+The largest mean drop is 0.37, under the 1 point that would be reported. The shipped 2.2 s GOP sits between G2 and G3 and
+was NOT re-measured; a longer GOP codes fewer keyframes, so its cost is expected to be no larger than G2's. Bitrates read
+5 919 to 6 231 kbps for both. x264's own SEI reads `keyint=60 keyint_min=6 scenecut=0` against `keyint=90 keyint_min=9`.
+
+**CPU at the first cut.** The encoder alone on the 4-vCPU runner (paced 30 fps): G3 0.34 cores, G2 0.33, encode latency
+771 / 772 ms both. The Fly cost legs (performance-6x, 15 to 16 min, p95 cores, size rule p95 ≤ 5.1), D:snow on the 2 s
+head: **5.576** (run 45825969361, avg 4.926, max 5.89, compositor 4.754 of it) and **5.36** (run 45848911827); C:snow
+**3.731 (PASS)**. The control, `main` (3 s, with #115), D:snow, run 45832881352: **4.737 (PASS)**. F-040's L2 reads of the
+3 s encoder were C 4.013 and D 3.458 on another day (noise ±0.6 to 1.0 core). Two D reads over the rule against one
+under it. **The owner accepted the overshoot for the stg trial on 2026-11-26** ("ok let's go all in a one shot"): Owed
+132. The shipped 2.2 s GOP codes slightly fewer keyframes than the 2 s one; its own D:snow reads were dispatched after the
+review round (run ids in the PR).
+
+**Audio at a start (the review's I1 and N1, FIXED).** A sink started by a keyframe already in x264's delay (a swap up
+to 0.8 s after a GOP's keyframe) used to get no audio from between the keyframe and the swap: `reconnect_point` dropped
+the ring's audio, so the stream's audio started up to 0.8 s late (a second of picture without sound at the start). The
+audio encoder has no delay, so that audio exists only before the swap, and on a healthy swap the OLD sink's feeder has
+already taken it out of the ring. The first fix (0c16499) copied the ring's audio into the new sink's `Picker`: on a gate
+wait or an outage reconnect the ring still held those entries and `next()` delivered them again, so every such audio
+frame was sent twice and its PTS ran backwards into the mux, and on a healthy swap nothing was recovered (the review's
+N1; the unit sweep's fixture had the ring holding what the real feeder had already taken). Now the ring keeps a short
+`audio_history` (`note_audio`: a span and `ENCODED_RING_MAX_ENTRIES`, whether or not a feeder has taken the entry) and
+`RingState::plain_reconnect` hands the new sink's `Picker` only the history OLDER than the ring's oldest entry
+(`audio_to_hold`), so what the ring still holds reaches the sink once through `next()`. Tests:
+`a_new_sinks_audio_starts_with_its_keyframe_and_is_sent_once_in_order_on_every_path` drives the real `RingState` and
+`Picker` over a healthy swap, a short gate wait and an outage past the ring's span, at every swap tick across the delay
+window and past it (261 starts in a local run, 94 440 audio frames: start within one AAC frame, 21 ms apart with no
+duplicate, none backwards, none missing); the adapters swap sweep and `assert_fresh_start` check the same on the real
+encoder (strictly increasing PTS).
+
+**AAC priming frames are dropped (the final review's I1).** With C8's delay correction (`without_aac_delay`), the AAC
+encoder's first two frames (stamped 0 and 21.3 ms, under the 33.3 ms delay) would stamp below 0; saturating them at 0
+stamped both 0, a duplicate stamp into the mux. They hold encoder priming, not programme audio, so
+`corrected_audio_stamps` now drops a frame whose corrected stamp would fall below 0 (`None`), and the first frame kept
+is the first whose samples were fed at or after 0: frame k = ceil(1 600 / 1 024) = 2, derived from the declared delay
+and frame size in the test, not from the rule's nanosecond arithmetic. The audio history's count and span bounds are
+read off its length after pushing past each (`the_audio_history_is_bounded_by_count_and_by_span`; each loop mutated
+once).
+
+The first frame kept stamps at 9.3 ms (frame 2, 42.7 ms, less the 33.3 ms delay), and the 2 frames dropped hold 42.7 ms
+of priming plus about 9 ms of leading programme audio that the encoder's delay hid in them: a recording's audio reads
+42 ms shorter than what was fed (`aac_priming_ms`, derived from the declared delay: the three length asserts in
+`programme_output.rs` add it back, their 40 ms tolerance unchanged; the final review's I3).
+
+**Owed.** (1) A Cloudflare stg run of the 2.2 s programme GOP: segment length, TARGETDURATION and camera-to-viewer
+delay (24.5 s before), no `ERR_GOP_OUT_OF_RANGE`, and the encoder's CPU under real sessions (Owed 132). (2) VMAF and the
+paced-key legs at 66 frames (`measure.py` G2/Q2/U2 now read `PROGRAMME_GOP_MS` 2 200). (3) A real-encoder test of the
+forced-keyframe path, if a GOP over the floor is ever shipped. (4) `Feeder::next` itself (the ring's lock, the gate) is
+not driven by a unit test, which needs GStreamer: the unit test drives the `RingState` methods it calls
+(`push_entry`, `pop_entry`, `plain_reconnect`) and the real `Picker`, and the adapters sweep and `assert_fresh_start` read
+the audio on the real encoder.
+
+## F-043: camera-burst's A/V offset was the programme's own AAC encoder delay (33.3 ms) plus the picture's tick quantisation (±16.7 ms); stamping the AAC frames the delay early centres it on 0 (C8, Owed 122, 2026-11-26)
+
+**Question** (owner, 2026-11-26: "fix bursty camera and increase limit if needed"). camera-burst's `av_in_step`
+failed on and off on every relay PR (PR #116: p50 48 against the 40 ms median budget) while the offset was
+constant for a whole run and differed between runs by up to 28 ms. Where is the per-run phase set, and is it a
+defect or a limit?
+
+**What it is not.** Not the settle or a re-base (C4 round 6: no note ran), not the playout's schedule (its unit
+sweep is phase-independent), and not the camera (`wire.jsonl`'s raw TS stamps are identical across runs: both
+streams start at 324000000, 33.33 ms and 21.33 ms steps).
+
+**Evidence, per-pair lists of six camera-burst runs on one code (on #116's code, runs 45826423801 to 45849160190:
+p50 22, 20, 21, 49, 48, 44) and one camera-flap and one smoke run beside them.**
+- Every list sits in one 33 ms band, 16 to 50 ms, with a centre of 33 ms. The 21 runs hold 19 to 24 and drift a
+  little; the 48 and 49 runs hold 48 to 50 and then FLIP by 33 ms (50 to 16 at 19 s, 16 to 50 at 36 s, 50 to 17
+  at 51 s): they sit on the quantisation's tie. Smoke in the same run reads a steady 20 to 24, camera-flap 5 to
+  49 by window. A tick's quantisation is exactly half a tick either way (the picture airs at the tick whose
+  due time is within half a step of its stamp, `Playout::tick`), so a band exactly one tick wide is that, and
+  its centre is a constant the programme adds.
+- The compositor log's playout trace shows the audio on the clock to the sample and the picture on the nearest
+  tick: `due_ms` less `aired_ms` read +0.9 to +5 ms in a 21 run and +6.6 to +16 ms in a 48 run, from the clock
+  being phased on a start-up step estimated from two decoded stamps (32.1 ms for 33.3: the decoder's stamps are
+  not the camera's for the first ~37 frames) and then frozen once a frame airs (`Playout::phase`). That is the
+  per-run phase, and it is bounded by half a tick whatever the step.
+- The constant is the programme's own AAC encoder: `voaacenc` stamps each output frame with the time of the
+  samples fed, and emits those samples `AAC_ENCODER_DELAY_SAMPLES` (1 600, 33.3 ms: ffmpeg's wrapper of the
+  same library declares `ENC_DELAY 1600`; the harness fixture reads 33 ms through GStreamer's wrapper,
+  `tests/strip.rs`) late, with no word of it in the stream. The checker subtracts the camera's copy of it and
+  had left the programme's in, "because the viewer hears it too".
+- **Red, on the product alone** (`a_tone_fed_on_a_flash_tick_comes_out_on_the_flash_in_the_encoded_output`, PR #117
+  at f67b058, CI run 45849160059): a 1 kHz tone fed on the tick of a white frame, the programme encoding to a
+  flv, the flv decoded, each tone onset placed by its AAC frame's stamp: flashes at 1000 and 2500 ms, tones at
+  1033.4 and 2533.1 ms, `audio less picture` **+33.4 and +33.1 ms**. Nothing else in the 83-test suite failed.
+
+**Cause.** The programme's picture is quantised to its tick (up to ±16.7 ms against the audio, which is placed
+to the sample), and the programme's encoder delay moved the whole band up by 33.3 ms, so a run sat anywhere in
+16 to 50 ms by the phase it started on. The median budget of 40 ms (`budget_av_offset_ms`) was met only by the
+lucky half of the phases.
+
+**Fix (a product fix; no budget moved).** `gst_programme::running_time_entry` stamps each encoded AAC frame
+`without_aac_delay`: a delay early (saturating at 0 at the stream's first frames, which hold only the
+priming). The constant is `domain::config::AAC_ENCODER_DELAY_SAMPLES`, which the checker's
+`CAMERA_AAC_DELAY_MS` now reads too (one authority for one fact). Camera-burst's `owed` line is gone (11 checks
+declared and run), and so is the `case_verdicts` test that pinned Owed 122 as open.
+
+**Residual, and the sign.** The pairs now read the picture's quantisation alone: bounded at half a tick
+(16.7 ms at 30 fps) either way, plus the audio's jitter (under 8 ms in C4 round 6's reading), so about 0 ±17. A
+30 fps picture cannot be placed nearer than half a frame to a continuous sound, so this is the limit, not a
+defect; it sits inside ITU-R BT.1359's detectability window (audio early to 40 ms, late to 60 ms) on both
+sides, where the old centre (audio 17 to 50 ms LATE) used 83 % of the late side. The budgets stand as ruled:
+median 40, kept pair 50, excluded 72, zero-kept fails.
+
+**Read on CI after the fix.** Before the rebase onto #116's head, on the fix alone (PR #117 at
+7c0ee6f): camera-burst p50 **-12** (`kept_max` 20, `excluded_max` 34, 66 pairs, 11 of 11 checks, no `OWED` line;
+dispatch 45853295394) and **+11** (`kept_max` 43, `excluded_max` 43; PR run 45853292840), both pass, against the
+same code without it at 20 to 49. Both lists show the shape the cause predicts, two levels one tick (33 ms) apart
+(+20 then -14; +43 then +9 to +13) where the picture's nearest tick flips once in the run's first ten seconds: the
+steady levels (-12 and +11) are inside the +-17 band, and the early level is the steady one plus a tick, so a run
+whose steady level sits at the band's top edge reads its early pairs at 50 (the kept budget). Then three
+dispatches on #116's head, in the PR's check list.
+
+**Owed (Owed 133).** The picture's phase is still set from the start-up step estimate (`Playout::phase`): it no
+longer moves the offset out of its budget, but a run can still sit on the quantisation's tie (a 33 ms flip
+between two levels, the early one at most the kept budget when the steady level is at the band's top edge).
+Locking the clock on a later, settled step would narrow the band; it is not built, because it moves the clock
+the audio rides.

@@ -14,7 +14,7 @@ name: encoder-tune
 # No secrets. Nothing here reaches stg, prod, Fly or Cloudflare.
 on:
   push:
-    branches: [feat/relay-encoder-tune]
+    branches: [feat/relay-encoder-tune, feat/programme-gop-2s]
     paths:
       - "harness/encoder-tune/**"
       - ".github/workflows/encoder-tune.yml"
@@ -24,6 +24,14 @@ on:
         description: "true: the plumbing on a synthetic clip"
         required: false
         default: "false"
+      quality_legs:
+        description: "comma list of leg ids for the quality job (empty: every leg)"
+        required: false
+        default: "G3,G2"
+      paced_legs:
+        description: "comma list of leg ids for the paced job (empty: every leg)"
+        required: false
+        default: "G3,G2,Q2,U2"
 permissions: { contents: read }
 concurrency:
   group: encoder-tune-${{ github.ref }}
@@ -35,6 +43,11 @@ env:
   # crowd on a field, the hard case). The first FRAMES frames of each, as raw I420.
   CLIPS_URL: https://media.xiph.org/video/derf/y4m
   FRAMES: "220"
+  # C7 (the programme GOP 3 s -> 2.2 s): a push runs the GOP legs only (G3 the 3 s control, G2 at the shipped GOP; the
+  # paced job adds Q2, the product's no-key-asked rule at the shipped GOP, and U2, C5's rule there as its control).
+  # C5's own legs are measured and recorded (F-033, F-040); a dispatch can name any.
+  QUALITY_LEGS: ${{ github.event_name == 'workflow_dispatch' && inputs.quality_legs || 'G3,G2' }}
+  PACED_LEGS: ${{ github.event_name == 'workflow_dispatch' && inputs.paced_legs || 'G3,G2,Q2,U2' }}
   SMOKE: ${{ (inputs.smoke == 'true' || contains(github.event.head_commit.message, '[smoke]')) && 'true' || 'false' }}
 jobs:
   quality:
@@ -113,7 +126,7 @@ jobs:
             n=$(basename "$f" .yuv)
             args+=(--clip "${n}=${f}")
           done
-          /usr/bin/python3 -I harness/encoder-tune/measure.py quality "${args[@]}" --out out/quality.json
+          /usr/bin/python3 -I harness/encoder-tune/measure.py quality "${args[@]}" --legs "$QUALITY_LEGS" --out out/quality.json
       - name: Table
         run: |
           /usr/bin/python3 -I harness/encoder-tune/measure.py table --quality out/quality.json --out out/quality.md
@@ -160,7 +173,7 @@ jobs:
             extra=()
           fi
           /usr/bin/python3 -I harness/encoder-tune/measure.py paced --clip "$RUNNER_TEMP/clips/rush.yuv" \
-            --out out/paced.json "${extra[@]}"
+            --legs "$PACED_LEGS" --out out/paced.json "${extra[@]}"
       - name: Table
         run: |
           /usr/bin/python3 -I harness/encoder-tune/measure.py table --paced out/paced.json --out out/paced.md
