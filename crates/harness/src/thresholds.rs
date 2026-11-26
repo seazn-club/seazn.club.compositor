@@ -13,7 +13,7 @@ use domain::config::{
     OutputProfile, Thresholds, CHROMIUM_GPU_DEATHS_ABORT, ENCODER_SPEED_REALTIME_MIN,
     FORCED_KEYFRAME_ARRIVAL_MS, OUTPUT_GAP_BUDGET_MS, OUTPUT_PROGRESS_POLL_MS, OUTPUT_SINK_TIMEOUT_MS,
     PLAYOUT_CAP_MS, PLAYOUT_EARLY_REANCHOR_MS, PLAYOUT_SETTLE_MS, PLAYOUT_SETTLE_SKIP_MS, PLAYOUT_TARGET_MS,
-    TICK_WIDEST_MS, YOUTUBE_KEPT_GAP_MS,
+    TICK_WIDEST_MS, X264_DELAY_MS, YOUTUBE_KEPT_GAP_MS,
 };
 use serde_json::{json, Map, Value};
 
@@ -49,6 +49,14 @@ pub const BUDGET_LADDER_REALTIME_MS: u64 = 10_000;
 pub const BUDGET_PROCESS_RESTART_OUTPUT_MS: u64 = YOUTUBE_KEPT_GAP_MS;
 /// Spec §6 "Budgets": "input frame→encoder ≤150 ms".
 pub const BUDGET_FRAME_TO_ENCODER_MS: u64 = 150;
+/// How much later than the compositor's own log the output strip can show what the log says it did:
+/// spec §6's frame-to-encoder budget (`BUDGET_FRAME_TO_ENCODER_MS`) and then the encoder's frame
+/// delay (`X264_DELAY_MS`, F-040: x264's look-ahead and frame threads hold 0.8 s of frames, so the
+/// first frame made without the overlay comes out that much after the line that hid it). The strip is
+/// the destination's recording (MediaMTX), after the encoder, so the delay is in it; the log line is
+/// before the encoder, so it is not. Read by `cef-hung`'s `detect_ms` (the strip's gap after the
+/// logged hide); the other side, a strip BEFORE the log, keeps `BUDGET_FRAME_TO_ENCODER_MS` alone.
+pub const BUDGET_STRIP_AFTER_LOG_MS: u64 = BUDGET_FRAME_TO_ENCODER_MS + X264_DELAY_MS;
 /// The C14 brief's budget table: the PDF's A/V budget, which spec §6 adopts as written ("The PDF's
 /// failure table, timing budgets and resource bounds are adopted as written"); §6's own text names
 /// no A/V number.
@@ -277,6 +285,7 @@ pub fn dump(adapters: AdapterConsts) -> Value {
         json!(BUDGET_PROCESS_RESTART_OUTPUT_MS),
     );
     put("budget_frame_to_encoder_ms", json!(BUDGET_FRAME_TO_ENCODER_MS));
+    put("budget_strip_after_log_ms", json!(BUDGET_STRIP_AFTER_LOG_MS));
     put("budget_av_offset_ms", json!(BUDGET_AV_OFFSET_MS));
     put("budget_av_pair_max_ms", json!(BUDGET_AV_PAIR_MAX_MS));
     put(
@@ -561,6 +570,37 @@ mod tests {
         assert!(
             after_blank < BUDGET_PROCESS_RESTART_OUTPUT_MS,
             "a blank page's reload ({after_blank} ms after it is called blank) slower than a process restart"
+        );
+    }
+
+    // F-040 (C5): the strip is measured after the encoder, the log before it, so the strip lags the log
+    // by the encoder's delay on top of spec §6's frame-to-encoder budget. CI run 45737841032 read
+    // 758 ms against the old 150. The two terms each come from their own declaration (the spec's 150,
+    // pinned by `every_budget_is_the_number_its_source_states`, and the domain's delay), the committed
+    // file carries the sum, and a delay of a whole GOP or more would be no budget at all.
+    #[test]
+    fn the_strip_budget_is_the_encoder_budget_plus_the_encoders_delay() {
+        let v = dump(AdapterConsts {
+            cef_child_poll_ms: 2,
+            encoded_ring_span_ms: 3,
+            reaper_kill_after_ms: 4,
+            teardown_leak_after_ms: 5,
+            audio_bytes_per_ms: 6,
+        });
+        let want = BUDGET_FRAME_TO_ENCODER_MS + X264_DELAY_MS;
+        assert_eq!(v["budget_strip_after_log_ms"].as_u64(), Some(want));
+        let (_, committed) = committed();
+        assert_eq!(committed["budget_strip_after_log_ms"].as_u64(), Some(want));
+        assert!(
+            committed["budget_strip_after_log_ms"].as_u64().unwrap_or(0)
+                > committed["budget_frame_to_encoder_ms"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
+            "the strip budget is no wider than the encoder's own"
+        );
+        assert!(
+            want < domain::config::PROGRAMME_GOP_MS,
+            "{want} ms is a whole GOP of lag"
         );
     }
 
