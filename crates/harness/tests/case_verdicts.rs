@@ -887,8 +887,11 @@ fn gate_av(r: &mut Value, excluded_ms: i64, kept_ms: i64, spoil: Spoil) {
                 (ret - emitted - RETURN_LINE_AFTER_EMIT_MS).abs() <= PERIOD_MS as i64,
                 "the return line's wall: {ret} after emit {emitted}"
             );
+            // (Without the hold-off, the missing-hold-off mutants' world, the strip shows the frame a
+            // latency after its emit: 450 ms past the return line. The anchors still differ by far more
+            // than the 1 ms the boundary pairs sit either side of the cut.)
             assert!(
-                shown - ret >= 1_000,
+                shown - ret >= RETURN_LINE_AFTER_EMIT_MS,
                 "the anchors must differ from the first frame shown ({shown} against {ret})"
             );
         }
