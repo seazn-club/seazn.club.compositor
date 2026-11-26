@@ -1943,6 +1943,8 @@ fn swapping_twice_starts_each_sink_at_a_keyframe_and_drains_once() {
             first_audio <= 1_024 * 1_000 / 48_000,
             "{name}: audio starts at {first_audio} ms"
         );
+        let frames = assert_audio_once_in_order(name, &d.audio_pts_ms);
+        eprintln!("{name}: {frames} audio frames, once and in order");
         sinks += 1;
     }
     eprintln!("sinks checked: {sinks}");
@@ -2110,6 +2112,7 @@ fn a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_go
     let inside = [1, 2, delay / 3, delay - WINDOW_EDGE_TICKS - 1];
     let past = [delay + WINDOW_EDGE_TICKS + 4];
     let (mut cases, mut intervals, mut served, mut waited, mut audio_checked) = (0, 0, 0, 0, 0);
+    let mut audio_frames = 0;
     for profile in [P720, OutputProfile::P1080] {
         let gop = u64::from(profile.gop_frames());
         for after in inside.into_iter().chain(past) {
@@ -2166,6 +2169,7 @@ fn a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_go
                 first_audio <= 1_024 * 1_000 / 48_000,
                 "{case}: audio starts at {first_audio} ms"
             );
+            audio_frames += assert_audio_once_in_order(&case, &d.audio_pts_ms);
             audio_checked += 1;
             let key_ms: Vec<u64> = d.parsed.iter().filter(|f| f.1).map(|f| f.0).collect();
             for w in key_ms.windows(2) {
@@ -2186,12 +2190,13 @@ fn a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_go
     }
     eprintln!(
         "swapped after the GOP's keyframe: cases {cases} ({served} served by the GOP's own in the delay, \
-         {waited} waited for its next), key intervals checked {intervals}, audio starts checked {audio_checked}"
+         {waited} waited for its next), key intervals checked {intervals}, audio starts checked {audio_checked}, audio frames {audio_frames}"
     );
     assert_eq!(cases, 2 * (inside.len() + past.len()));
     assert_eq!((served, waited), (2 * inside.len(), 2 * past.len()));
     assert!(intervals >= cases, "intervals checked: {intervals}");
     assert_eq!(audio_checked, cases, "audio starts checked");
+    assert!(audio_frames > 0, "audio frames checked: {audio_frames}");
 }
 
 #[test]
@@ -3468,6 +3473,24 @@ fn delay_ticks() -> u64 {
 /// ticks either side is not.
 const WINDOW_EDGE_TICKS: u64 = 3;
 
+/// C7 (the review's N1): the audio a sink sent is every frame once and in order. A frame sent twice
+/// (the ring's audio held while the feeder still takes it) shows as a PTS equal to or behind the one
+/// before; AAC frames are 21.3 ms apart, so a healthy stream is strictly increasing. Returns how many
+/// it checked, which must not be 0.
+fn assert_audio_once_in_order(case: &str, pts_ms: &[u64]) -> usize {
+    assert!(pts_ms.len() > 1, "{case}: {} audio frames", pts_ms.len());
+    for (i, w) in pts_ms.windows(2).enumerate() {
+        assert!(
+            w[1] > w[0],
+            "{case}: audio frame {} has PTS {} ms after {} ms: sent twice or out of order",
+            i + 1,
+            w[1],
+            w[0]
+        );
+    }
+    pts_ms.len()
+}
+
 /// F-040: whether the GOP's own keyframe is still in the encoder's delay when a sink swapped in at
 /// `swap` (frames `0..swap` pushed) can send. Then it serves the swap, and the feeder asks for none
 /// (`gst_output::own_key_in_flight`): the newest natural keyframe pushed is fewer than the delay's
@@ -3645,6 +3668,15 @@ fn assert_fresh_start(
         first_audio.ts_ms,
         first_video.ts_ms
     );
+    // C7 (the review's N1): every audio frame once and in order, whichever way the sink came to start
+    // (a gate that waited, an outage that reconnected).
+    let audio_ts: Vec<u64> = frames
+        .iter()
+        .filter(|m| m.is_aac_frame())
+        .map(|m| u64::from(m.ts_ms))
+        .collect();
+    let audio_frames = assert_audio_once_in_order(case, &audio_ts);
+    eprintln!("{case}: {audio_frames} audio frames, once and in order");
     let (anchor_ts, anchor_at) = (frames[0].ts_ms, frames[0].at);
     let (mut ahead_most, mut back, mut live, mut flushed) = (i128::MIN, 0, 0, 0);
     for (i, m) in frames.iter().enumerate() {

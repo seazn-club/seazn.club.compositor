@@ -3993,15 +3993,22 @@ were C 4.013 and D 3.458 on another day (noise ±0.6 to 1.0 core). That one D re
 this wide; the C7 review's I4 asked for D:snow twice on the 2.2 s head and twice on `main` the same day (results: below,
 once run).
 
-**Audio at a start (the review's I1, FIXED).** A sink started by a keyframe already in x264's delay (a swap up to 0.8 s
-after a GOP's keyframe) used to get no audio from between the keyframe and the swap: `reconnect_point` dropped the ring's
-audio, so the stream's audio started up to 0.8 s late (the video PTS 0, the audio's right, and a second of picture
-without sound at the start). The audio encoder has no delay, so that audio exists only in the ring. Now
-`gst_output::audio_to_hold` hands the ring's audio to the new sink's `Picker`, which sends the part at or after the start
-keyframe, so the audio starts with the picture within one AAC frame (21 ms). Tests: `the_audio_queued_before_a_swap_starts_
-with_the_keyframe_it_starts_on` (unit sweep over every swap tick across the delay window and past it, counts reported) and
-the adapters sweep `a_swap_made_frames_after_the_gops_own_keyframe_starts_at_a_keyframe_and_no_gop_is_short`, which asserts
-the audio start bound in every case (adapters tests are CI-only on a Mac without GStreamer).
+**Audio at a start (the review's I1 and N1, FIXED).** A sink started by a keyframe already in x264's delay (a swap up
+to 0.8 s after a GOP's keyframe) used to get no audio from between the keyframe and the swap: `reconnect_point` dropped
+the ring's audio, so the stream's audio started up to 0.8 s late (a second of picture without sound at the start). The
+audio encoder has no delay, so that audio exists only before the swap, and on a healthy swap the OLD sink's feeder has
+already taken it out of the ring. The first fix (0c16499) copied the ring's audio into the new sink's `Picker`: on a gate
+wait or an outage reconnect the ring still held those entries and `next()` delivered them again, so every such audio
+frame was sent twice and its PTS ran backwards into the mux, and on a healthy swap nothing was recovered (the review's
+N1; the unit sweep's fixture had the ring holding what the real feeder had already taken). Now the ring keeps a short
+`audio_history` (`note_audio`: a span and `ENCODED_RING_MAX_ENTRIES`, whether or not a feeder has taken the entry) and
+`RingState::plain_reconnect` hands the new sink's `Picker` only the history OLDER than the ring's oldest entry
+(`audio_to_hold`), so what the ring still holds reaches the sink once through `next()`. Tests:
+`a_new_sinks_audio_starts_with_its_keyframe_and_is_sent_once_in_order_on_every_path` drives the real `RingState` and
+`Picker` over a healthy swap, a short gate wait and an outage past the ring's span, at every swap tick across the delay
+window and past it (261 starts in a local run, 94 440 audio frames: start within one AAC frame, 21 ms apart with no
+duplicate, none backwards, none missing); the adapters swap sweep and `assert_fresh_start` check the same on the real
+encoder (strictly increasing PTS).
 
 **Owed.** (1) A Cloudflare stg run of the 2.2 s programme GOP: segment length, TARGETDURATION and camera-to-viewer delay
 (24.5 s before), and no `ERR_GOP_OUT_OF_RANGE`. (2) VMAF and the paced-key legs at 66 frames (`measure.py` G2/Q2/U2 now

@@ -14,8 +14,9 @@
 //! rtmp2sink once its publish is accepted. Until then the ring stays the only queue, and it drops
 //! its oldest. At that moment (the reconnect point) no video frame the ring holds may start the
 //! stream (`Picker`): the first frame sent is a keyframe encoded after the reconnect point, and no
-//! audio older than it is sent; the audio the ring holds from that keyframe's time on is kept for it
-//! (`audio_to_hold`, C7), since the audio encoder has no delay and the keyframe may still be in x264's.
+//! audio older than it is sent; the audio from that keyframe's time on is kept for it (`audio_to_hold`
+//! from the ring's `audio_history`, C7), since the audio encoder has no delay and the keyframe may still
+//! be in x264's, and the audio from it to the swap was taken by the old sink's feeder.
 //! Since C7 the feeder asks the encoder for a keyframe only when one asked for can come before the
 //! GOP's own (`forced_key_can_beat_the_gop`: the floor, `FORCED_KEYFRAME_MIN_INTERVAL_MS`, under the GOP;
 //! F-036): a request is made at once, or, within the floor of the encoder's last keyframe, held to it,
@@ -141,9 +142,16 @@ impl<S> Entry<S> {
     }
 }
 
-#[derive(Default)]
-struct RingState {
-    entries: VecDeque<Entry>,
+/// The ring's state, generic over the sample so its logic (`push_entry`, `pop_entry`,
+/// `plain_reconnect`) runs in unit tests without GStreamer.
+struct RingState<S = gst::Sample> {
+    entries: VecDeque<Entry<S>>,
+    /// C7 (the review's N1): the audio the ring has been handed, whether or not a feeder has taken it
+    /// since, newest last and bounded like the ring (`note_audio`). A new sink's stream may start at a
+    /// keyframe still inside x264's delay, made before the swap, and the audio from that keyframe's
+    /// time to the swap was taken by the OLD sink's feeder (a healthy swap) or sits in `entries` (a
+    /// sink that waited at the gate): only a history that outlives the taking holds it for both.
+    audio_history: VecDeque<Entry<S>>,
     next_seq: u64,
     video_eos: bool,
     audio_eos: bool,
@@ -171,6 +179,61 @@ struct RingState {
     pruned: Encoded,
 }
 
+impl<S> Default for RingState<S> {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            audio_history: VecDeque::new(),
+            next_seq: 0,
+            video_eos: false,
+            audio_eos: false,
+            owner: 0,
+            drained_sent: false,
+            encoded: Encoded::default(),
+            newest_video: None,
+            video_since_key: None,
+            gop_frames: 0,
+            floor_frames: 0,
+            #[cfg(feature = "test-hooks")]
+            pruned: Encoded::default(),
+        }
+    }
+}
+
+impl<S: Clone> RingState<S> {
+    /// Takes an entry from the encoders: stamps its seq, counts it, keeps audio in the history and
+    /// prunes the ring. Returns what the ring's bounds dropped, (video, audio).
+    fn push_entry(&mut self, mut e: Entry<S>) -> (u64, u64) {
+        e.seq = self.next_seq;
+        self.next_seq += 1;
+        if e.video {
+            self.encoded.video += 1;
+            self.newest_video = Some(self.newest_video.map_or(e.pts, |n| n.max(e.pts)));
+            self.video_since_key = since_key_after(self.video_since_key, e.key);
+        } else {
+            self.encoded.audio += 1;
+            note_audio(&mut self.audio_history, &e);
+        }
+        self.entries.push_back(e);
+        prune(&mut self.entries)
+    }
+
+    /// The next entry a feeder takes: the oldest the ring holds.
+    fn pop_entry(&mut self) -> Option<Entry<S>> {
+        self.entries.pop_front()
+    }
+
+    /// The reconnect point of a sink that starts at the next keyframe (every path but Owed 112's):
+    /// the seq of the first entry encoded after it, and the audio the new sink's `Picker` is handed
+    /// first (`audio_to_hold`). What `entries` still holds reaches it through `pop_entry` in order,
+    /// so what is held here is only the audio older than the ring's oldest entry: nothing is sent
+    /// twice and the audio's PTS never runs backwards.
+    fn plain_reconnect(&self) -> (u64, VecDeque<Entry<S>>) {
+        let first_left = self.entries.front().map_or(self.next_seq, |e| e.seq);
+        (self.next_seq, audio_to_hold(&self.audio_history, first_left))
+    }
+}
+
 /// The programme → output hand-off: bounded by span (per track) and by count, dropping the oldest.
 #[derive(Default)]
 pub(crate) struct EncodedRing {
@@ -179,19 +242,9 @@ pub(crate) struct EncodedRing {
 }
 
 impl EncodedRing {
-    pub(crate) fn push(&self, mut e: Entry) {
+    pub(crate) fn push(&self, e: Entry) {
         let mut r = locked(&self.state);
-        e.seq = r.next_seq;
-        r.next_seq += 1;
-        if e.video {
-            r.encoded.video += 1;
-            r.newest_video = Some(r.newest_video.map_or(e.pts, |n| n.max(e.pts)));
-            r.video_since_key = since_key_after(r.video_since_key, e.key);
-        } else {
-            r.encoded.audio += 1;
-        }
-        r.entries.push_back(e);
-        let dropped = prune(&mut r.entries);
+        let dropped = r.push_entry(e);
         #[cfg(feature = "test-hooks")]
         {
             r.pruned.video += dropped.0;
@@ -726,11 +779,13 @@ struct Reconnect {
     /// Owed 112: the encoder's first frames, taken out of the ring at the gate, from which the
     /// stream starts at the encoder's first keyframe; empty on every other path.
     first_gop: VecDeque<Entry>,
-    /// C7 (the review's I1): the audio the ring holds at the reconnect point, to be held by the
-    /// `Picker` for the keyframe the stream starts on. The audio encoder has no delay, so when that
-    /// keyframe is the GOP's own, made before the swap and still in x264's delay, the audio from its
-    /// time on is in the ring now and in no later entry; the `Picker` sends what is at or after the
-    /// keyframe and nothing older. Empty on the Owed 112 path (`first_gop` holds its audio).
+    /// C7 (the review's I1, N1): the audio handed to the ring before the reconnect point that the ring
+    /// no longer holds (`RingState::plain_reconnect`), to be held by the `Picker` for the keyframe the
+    /// stream starts on. The audio encoder has no delay, so when that keyframe is the GOP's own, made
+    /// before the swap and still in x264's delay, the audio from its time on is in no later entry, and
+    /// on a healthy swap the old sink's feeder has taken it from the ring; the `Picker` sends what is at
+    /// or after the keyframe and nothing older. Never an entry the ring still holds (`next` delivers
+    /// those: held too they are sent twice). Empty on the Owed 112 path (`first_gop` holds its audio).
     held_audio: VecDeque<Entry>,
 }
 
@@ -952,8 +1007,7 @@ impl Feeder {
                         held_audio: VecDeque::new(),
                     });
                 }
-                let seq = r.next_seq;
-                let held_audio = audio_to_hold(&r.entries);
+                let (seq, held_audio) = r.plain_reconnect();
                 drop(r);
                 self.shared.log(&format!(
                     "output gen={}: the sink can send after {waited} ms; the {held} video frames queued \
@@ -1004,7 +1058,7 @@ impl Feeder {
                     return Next::Eos;
                 }
             } else if !self.backed_up() {
-                let e = r.entries.pop_front().expect("checked non-empty");
+                let e = r.pop_entry().expect("checked non-empty");
                 return Next::Entry(e);
             }
             r = self
@@ -1036,8 +1090,8 @@ impl Feeder {
 ///   encoder runs about 60 ms ahead of the video one, so a keyframe's first audio arrives before it
 ///   (dropping it lost 2 or 3 AAC frames per sink). Once the keyframe sets the base, the held audio
 ///   at or after it is sent, and no audio before it, so the audio never starts ahead of the video.
-///   C7: the audio the ring holds at the reconnect point is held the same way (`audio_to_hold`), for
-///   a keyframe already made and still in x264's delay.
+///   C7: the audio handed to the ring before the reconnect point and no longer in it is held the
+///   same way (`audio_to_hold`), for a keyframe already made and still in x264's delay.
 /// - A seq gap (the ring dropped entries this output never took) makes the video resume at a
 ///   keyframe.
 pub(crate) struct Picker<S = gst::Sample> {
@@ -1103,15 +1157,36 @@ impl<S> Picker<S> {
     }
 }
 
-/// C7 (the review's I1): the audio entries of the ring at the reconnect point, oldest first. The
-/// stream starts at a keyframe that may be the GOP's own, made before the swap and still inside
-/// x264's delay (`own_key_in_flight`); the audio encoder has no delay, so the audio from that
-/// keyframe's time to the swap is in the ring and in nothing taken later. Dropped with the video
-/// (the reconnect point is `next_seq`), the stream's audio began as late as the swap was after its
-/// keyframe, up to `X264_DELAY_MS`, a silent lead-in under a picture. The `Picker` holds these as it
-/// holds the audio that arrives before a keyframe and sends only what is at or after it.
-pub(crate) fn audio_to_hold<S: Clone>(entries: &VecDeque<Entry<S>>) -> VecDeque<Entry<S>> {
-    entries.iter().filter(|e| !e.video).cloned().collect()
+/// C7 (the review's I1, N1): `history` is the audio the ring has been handed, oldest first
+/// (`RingState::audio_history`). `note_audio` adds one entry and bounds the history like the ring: a
+/// span (`ENCODED_RING_SPAN`) behind its newest, and `ENCODED_RING_MAX_ENTRIES`.
+pub(crate) fn note_audio<S: Clone>(history: &mut VecDeque<Entry<S>>, e: &Entry<S>) {
+    history.push_back(e.clone());
+    while history.len() > ENCODED_RING_MAX_ENTRIES {
+        history.pop_front();
+    }
+    while history
+        .front()
+        .is_some_and(|f| e.pts.saturating_sub(f.pts) > span())
+    {
+        history.pop_front();
+    }
+}
+
+/// C7 (the review's I1, N1): the audio a new sink's `Picker` is handed before the ring's own entries:
+/// the history's entries older than `first_left`, the seq of the oldest entry the ring still holds
+/// (or the next seq when it holds none). The stream starts at a keyframe that may be the GOP's own,
+/// made before the swap and still inside x264's delay (`own_key_in_flight`); the audio encoder has
+/// no delay, so the audio from that keyframe's time to the swap was handed to the ring BEFORE the
+/// swap, and on a healthy swap the old sink's feeder has taken it from `entries` (nothing in the ring
+/// holds it). Dropped with the video (the reconnect point is `next_seq`), the stream's audio began as
+/// late as the swap was after its keyframe, up to `X264_DELAY_MS`, a silent lead-in under a picture.
+/// Only entries OLDER than `first_left` are held: what `entries` still holds reaches the `Picker`
+/// through the feeder's own `next`, so holding it here too sent each such audio frame twice and ran
+/// its PTS backwards into the mux. The `Picker` holds these as it holds the audio that arrives before
+/// a keyframe and sends only what is at or after it.
+pub(crate) fn audio_to_hold<S: Clone>(history: &VecDeque<Entry<S>>, first_left: u64) -> VecDeque<Entry<S>> {
+    history.iter().filter(|e| e.seq < first_left).cloned().collect()
 }
 
 /// `RingState::video_since_key` after one more video entry: a keyframe is frame 0 of its GOP, any
@@ -1406,101 +1481,145 @@ mod tests {
         );
     }
 
-    /// C7 (the review's I1): the encoded ring as a swap finds it. Video: 30 fps, a keyframe every GOP
-    /// (66 frames, 2 200 ms), each frame out of x264 `delay` ms after its PTS (`X264_DELAY_MS`); audio:
-    /// 21 ms frames with no delay. Returns the swap's reconnect seq, the ring's entries then, and what
-    /// is pushed after, all in the order the encoders hand them out.
-    fn ring_at_a_swap(swap_ms: u64, delay_ms: u64) -> (u64, VecDeque<Entry<u64>>, Vec<Entry<u64>>) {
+    /// What one new sink sends, as (is video, PTS ms, base ms) in order, and how it got there.
+    struct SinkRun {
+        sent: Vec<(bool, u64, u64)>,
+        /// Audio entries the new sink was handed by `plain_reconnect` (`audio_to_hold`).
+        held: usize,
+    }
+
+    /// C7 (the review's I1 and N1), the ring and the feeder's loop as they run, minus GStreamer: the
+    /// REAL `RingState` (`push_entry`, `pop_entry`, `plain_reconnect`) and the REAL `Picker`, with the
+    /// encoders' entries pushed in the order they hand them out. Video: 30 fps, a keyframe every GOP
+    /// (66 frames, 2 200 ms), each frame out of x264 `delay_ms` after its PTS (`X264_DELAY_MS`);
+    /// audio: 21 ms frames with no delay.
+    ///
+    /// - Before `swap_ms` the OLD sink's feeder takes every entry the moment it arrives (`pop_entry`).
+    /// - From `swap_ms` the new sink owns the ring and waits at its gate for `gate_ms` (0: a file, or
+    ///   a publish that is already accepted): nothing takes entries, the ring only prunes.
+    /// - At `swap_ms + gate_ms` the sink can send: `plain_reconnect`, its `Picker`, the held audio,
+    ///   then the feeder's loop (`pop_entry` until the ring is empty, and again after each push).
+    fn run_new_sink(swap_ms: u64, gate_ms: u64, delay_ms: u64) -> SinkRun {
         const GOP_MS: u64 = 2_200;
         let mut events: Vec<(u64, bool, bool, u64)> = Vec::new(); // wall, video, key, pts
         for i in 0..400u64 {
             let pts = i * 1_000 / 30;
             events.push((pts + delay_ms, true, (pts % GOP_MS) == 0, pts));
         }
-        for j in 0..400u64 {
+        for j in 0..600u64 {
             events.push((j * 21, false, false, j * 21));
         }
         events.sort_by_key(|e| (e.0, e.1));
-        let entries: Vec<Entry<u64>> = events
-            .iter()
-            .enumerate()
-            .map(|(seq, e)| entry(seq as u64, e.1, e.2, e.3))
-            .collect();
-        let reconnect = events.iter().take_while(|e| e.0 < swap_ms).count();
-        let ring: VecDeque<Entry<u64>> = entries[..reconnect].iter().cloned().collect();
-        (reconnect as u64, ring, entries[reconnect..].to_vec())
-    }
-
-    /// What a `Picker` sends from `held` then `later`: the first video entry's PTS (the base, the
-    /// stream's keyframe) and the PTS of the first audio entry sent after it, with the audio count.
-    fn start_of_the_stream(
-        reconnect: u64,
-        held: VecDeque<Entry<u64>>,
-        later: &[Entry<u64>],
-    ) -> (Option<u64>, Option<u64>, usize) {
-        let mut pick = Picker::new(reconnect);
-        let (mut base, mut first_audio, mut audio) = (None, None, 0);
-        for e in held.into_iter().chain(later.iter().cloned()) {
-            pick.take(e, |e, b| {
-                if e.video {
-                    base.get_or_insert(b.mseconds());
-                } else {
-                    first_audio.get_or_insert(e.pts.mseconds());
-                    audio += 1;
-                }
+        let open_at = swap_ms + gate_ms;
+        let mut ring = RingState::<u64>::default();
+        let mut sink: Option<(Picker<u64>, usize)> = None;
+        let mut sent = Vec::new();
+        let mut feed = |pick: &mut Picker<u64>, e: Entry<u64>| {
+            pick.take(e, |e, base| {
+                sent.push((e.video, e.pts.mseconds(), base.mseconds()))
             });
+        };
+        for (n, (wall, video, key, pts)) in events.into_iter().enumerate() {
+            if sink.is_none() && wall >= open_at {
+                let (reconnect, held) = ring.plain_reconnect();
+                let held_n = held.len();
+                let mut pick = Picker::new(reconnect);
+                for e in held {
+                    feed(&mut pick, e);
+                }
+                while let Some(e) = ring.pop_entry() {
+                    feed(&mut pick, e);
+                }
+                sink = Some((pick, held_n));
+            }
+            ring.push_entry(Entry::new(
+                n as u64,
+                video,
+                key,
+                gst::ClockTime::from_mseconds(pts),
+            ));
+            if wall < swap_ms {
+                while ring.pop_entry().is_some() {} // the old sink's feeder
+            } else if let Some((pick, _)) = sink.as_mut() {
+                while let Some(e) = ring.pop_entry() {
+                    feed(pick, e);
+                }
+            }
         }
-        (base, first_audio, audio)
+        SinkRun {
+            sent,
+            held: sink.map_or(0, |(_, n)| n),
+        }
     }
 
-    /// The review's I1. A sink swapped in `after` ms after the GOP's own keyframe, while it is still in
-    /// x264's delay, starts at that keyframe; the audio queued since is in the ring, and dropped with
-    /// the video the stream's audio began as late as the swap was after the keyframe. With the audio
-    /// held (`audio_to_hold`) it starts within one AAC frame (21 ms) of the picture, and never before
-    /// it. The sweep crosses the delay's edge (800 ms) and the next GOP's keyframe and counts each
-    /// side; the control (nothing held, the old behaviour) must show the lag, or the sweep proves nothing.
+    /// The review's I1 and N1, three ways a sink comes to start (`gate_ms`: a healthy swap, a short
+    /// gate wait, and an outage longer than the ring's span), and every swap tick across the delay
+    /// window and past it. Whichever way, the new sink's audio:
+    /// - starts within one AAC frame (21 ms) of its picture, and never before it;
+    /// - is every audio frame from there on exactly once, in order: no duplicate PTS, none backwards,
+    ///   none missing (the N1 defect sent each such frame twice on a gate wait, and recovered nothing
+    ///   on a healthy swap, where the old feeder had taken the audio).
+    /// The expected keyframe comes from the declarations: one made before the sink can send and not yet
+    /// out of x264 (a keyframe is made every GOP and comes out `DELAY_MS` later) starts the stream,
+    /// else the next one made. The sweep counts each path and each side of the delay window, and the
+    /// healthy path must hand the new sink audio (`held`), or the sweep proves nothing.
     #[test]
-    fn the_audio_queued_before_a_swap_starts_with_the_keyframe_it_starts_on() {
+    fn a_new_sinks_audio_starts_with_its_keyframe_and_is_sent_once_in_order_on_every_path() {
         const GOP_MS: u64 = 2_200;
         const DELAY_MS: u64 = 800;
         const AAC_FRAME_MS: u64 = 21;
-        let (mut cases, mut in_delay, mut past, mut lagging_control) = (0, 0, 0, 0);
-        // From just after the GOP's keyframe (made at 2 200 ms) to just after the next one's delay.
-        for swap in (2_201..2 * GOP_MS + DELAY_MS + 200).step_by(37) {
-            let (reconnect, ring, later) = ring_at_a_swap(swap, DELAY_MS);
-            // The expected keyframe, from the declarations: a GOP's own keyframe made before the swap
-            // and not yet out of x264 starts the stream, else the next one made after it.
-            let made = swap / GOP_MS * GOP_MS;
-            let inside = swap < made + DELAY_MS;
-            let want = if inside { made } else { made + GOP_MS };
-            let (base, first, audio) = start_of_the_stream(reconnect, audio_to_hold(&ring), &later);
-            assert_eq!(base, Some(want), "swap {swap}");
-            let first = first.unwrap_or_else(|| panic!("swap {swap}: no audio sent"));
-            assert!(
-                first >= want && first < want + AAC_FRAME_MS,
-                "swap {swap}: audio starts at {first} ms, the picture at {want} ms"
-            );
-            assert!(audio > 0, "swap {swap}");
-            let (_, control_first, _) = start_of_the_stream(reconnect, VecDeque::new(), &later);
-            let control_first = control_first.expect("control audio");
-            if inside && swap - made >= 2 * AAC_FRAME_MS {
+        let (mut cases, mut in_delay, mut past, mut held_cases, mut audio_sent) = (0, 0, 0, 0, 0);
+        let mut by_gate = [0usize; 3];
+        for (g, gate_ms) in [0u64, 300, 2_500].into_iter().enumerate() {
+            // Swaps from just after the GOP's keyframe to just after the next one's delay.
+            for swap in (2_201..2 * GOP_MS + DELAY_MS + 200).step_by(37) {
+                let open_at = swap + gate_ms;
+                let made = open_at / GOP_MS * GOP_MS;
+                let inside = open_at <= made + DELAY_MS;
+                let want = if inside { made } else { made + GOP_MS };
+                let run = run_new_sink(swap, gate_ms, DELAY_MS);
+                let video: Vec<_> = run.sent.iter().filter(|s| s.0).collect();
+                let audio: Vec<u64> = run.sent.iter().filter(|s| !s.0).map(|s| s.1).collect();
+                let case = format!("swap {swap}, gate {gate_ms}");
+                assert_eq!(video.first().map(|v| v.2), Some(want), "{case}: base");
+                let first = *audio.first().unwrap_or_else(|| panic!("{case}: no audio sent"));
                 assert!(
-                    control_first >= want + AAC_FRAME_MS,
-                    "swap {swap}: the old behaviour does not lag ({control_first} ms from {want}): the case proves nothing"
+                    first >= want && first < want + AAC_FRAME_MS,
+                    "{case}: audio starts at {first} ms, the picture at {want} ms"
                 );
-                lagging_control += 1;
+                // Exactly once, in order, nothing missing: AAC frames 21 ms apart, from `first` on.
+                for w in audio.windows(2) {
+                    assert_eq!(
+                        w[1] - w[0],
+                        AAC_FRAME_MS,
+                        "{case}: audio PTS {} then {}",
+                        w[0],
+                        w[1]
+                    );
+                }
+                audio_sent += audio.len();
+                if inside {
+                    in_delay += 1;
+                    held_cases += usize::from(run.held > 0);
+                } else {
+                    past += 1;
+                }
+                by_gate[g] += 1;
+                cases += 1;
             }
-            if inside {
-                in_delay += 1;
-            } else {
-                past += 1;
-            }
-            cases += 1;
         }
-        eprintln!("audio at a start: {cases} swaps ({in_delay} in the delay, {past} past it), the control lagged in {lagging_control}");
+        eprintln!(
+            "sink audio: {cases} starts ({in_delay} in the delay, {past} past it; by gate {by_gate:?}), \
+             held audio in {held_cases}, {audio_sent} audio frames checked"
+        );
         assert!(
-            in_delay >= 15 && past >= 15 && lagging_control >= 10,
-            "{in_delay} {past} {lagging_control}"
+            in_delay >= 30 && past >= 30 && by_gate.iter().all(|&n| n >= 20) && audio_sent > 0,
+            "{in_delay} {past} {by_gate:?} {audio_sent}"
+        );
+        // Anti-vacuity: the sweep reached the case the hold exists for, and found audio to hold.
+        assert!(
+            held_cases >= in_delay / 2,
+            "held in {held_cases} of {in_delay} in-delay starts"
         );
     }
 
