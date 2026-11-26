@@ -4018,3 +4018,70 @@ forced-keyframe path, if a GOP over the floor is ever shipped. (4) `Feeder::next
 not driven by a unit test, which needs GStreamer: the unit test drives the `RingState` methods it calls
 (`push_entry`, `pop_entry`, `plain_reconnect`) and the real `Picker`, and the adapters sweep and `assert_fresh_start` read
 the audio on the real encoder.
+
+## F-043: camera-burst's A/V offset was the programme's own AAC encoder delay (33.3 ms) plus the picture's tick quantisation (±16.7 ms); stamping the AAC frames the delay early centres it on 0 (C8, Owed 122, 2026-11-26)
+
+**Question** (owner, 2026-11-26: "fix bursty camera and increase limit if needed"). camera-burst's `av_in_step`
+failed on and off on every relay PR (PR #116: p50 48 against the 40 ms median budget) while the offset was
+constant for a whole run and differed between runs by up to 28 ms. Where is the per-run phase set, and is it a
+defect or a limit?
+
+**What it is not.** Not the settle or a re-base (C4 round 6: no note ran), not the playout's schedule (its unit
+sweep is phase-independent), and not the camera (`wire.jsonl`'s raw TS stamps are identical across runs: both
+streams start at 324000000, 33.33 ms and 21.33 ms steps).
+
+**Evidence, per-pair lists of six camera-burst runs on one code (on #116's code, runs 45826423801 to 45849160190:
+p50 22, 20, 21, 49, 48, 44) and one camera-flap and one smoke run beside them.**
+- Every list sits in one 33 ms band, 16 to 50 ms, with a centre of 33 ms. The 21 runs hold 19 to 24 and drift a
+  little; the 48 and 49 runs hold 48 to 50 and then FLIP by 33 ms (50 to 16 at 19 s, 16 to 50 at 36 s, 50 to 17
+  at 51 s): they sit on the quantisation's tie. Smoke in the same run reads a steady 20 to 24, camera-flap 5 to
+  49 by window. A tick's quantisation is exactly half a tick either way (the picture airs at the tick whose
+  due time is within half a step of its stamp, `Playout::tick`), so a band exactly one tick wide is that, and
+  its centre is a constant the programme adds.
+- The compositor log's playout trace shows the audio on the clock to the sample and the picture on the nearest
+  tick: `due_ms` less `aired_ms` read +0.9 to +5 ms in a 21 run and +6.6 to +16 ms in a 48 run, from the clock
+  being phased on a start-up step estimated from two decoded stamps (32.1 ms for 33.3: the decoder's stamps are
+  not the camera's for the first ~37 frames) and then frozen once a frame airs (`Playout::phase`). That is the
+  per-run phase, and it is bounded by half a tick whatever the step.
+- The constant is the programme's own AAC encoder: `voaacenc` stamps each output frame with the time of the
+  samples fed, and emits those samples `AAC_ENCODER_DELAY_SAMPLES` (1 600, 33.3 ms: ffmpeg's wrapper of the
+  same library declares `ENC_DELAY 1600`; the harness fixture reads 33 ms through GStreamer's wrapper,
+  `tests/strip.rs`) late, with no word of it in the stream. The checker subtracts the camera's copy of it and
+  had left the programme's in, "because the viewer hears it too".
+- **Red, on the product alone** (`a_tone_fed_on_a_flash_tick_comes_out_on_the_flash_in_the_encoded_output`, PR #117
+  at f67b058, CI run 45849160059): a 1 kHz tone fed on the tick of a white frame, the programme encoding to a
+  flv, the flv decoded, each tone onset placed by its AAC frame's stamp: flashes at 1000 and 2500 ms, tones at
+  1033.4 and 2533.1 ms, `audio less picture` **+33.4 and +33.1 ms**. Nothing else in the 83-test suite failed.
+
+**Cause.** The programme's picture is quantised to its tick (up to ±16.7 ms against the audio, which is placed
+to the sample), and the programme's encoder delay moved the whole band up by 33.3 ms, so a run sat anywhere in
+16 to 50 ms by the phase it started on. The median budget of 40 ms (`budget_av_offset_ms`) was met only by the
+lucky half of the phases.
+
+**Fix (a product fix; no budget moved).** `gst_programme::running_time_entry` stamps each encoded AAC frame
+`without_aac_delay`: a delay early (saturating at 0 at the stream's first frames, which hold only the
+priming). The constant is `domain::config::AAC_ENCODER_DELAY_SAMPLES`, which the checker's
+`CAMERA_AAC_DELAY_MS` now reads too (one authority for one fact). Camera-burst's `owed` line is gone (11 checks
+declared and run), and so is the `case_verdicts` test that pinned Owed 122 as open.
+
+**Residual, and the sign.** The pairs now read the picture's quantisation alone: bounded at half a tick
+(16.7 ms at 30 fps) either way, plus the audio's jitter (under 8 ms in C4 round 6's reading), so about 0 ±17. A
+30 fps picture cannot be placed nearer than half a frame to a continuous sound, so this is the limit, not a
+defect; it sits inside ITU-R BT.1359's detectability window (audio early to 40 ms, late to 60 ms) on both
+sides, where the old centre (audio 17 to 50 ms LATE) used 83 % of the late side. The budgets stand as ruled:
+median 40, kept pair 50, excluded 72, zero-kept fails.
+
+**Read on CI after the fix.** Before the rebase onto #116's head, on the fix alone (PR #117 at
+7c0ee6f): camera-burst p50 **-12** (`kept_max` 20, `excluded_max` 34, 66 pairs, 11 of 11 checks, no `OWED` line;
+dispatch 45853295394) and **+11** (`kept_max` 43, `excluded_max` 43; PR run 45853292840), both pass, against the
+same code without it at 20 to 49. Both lists show the shape the cause predicts, two levels one tick (33 ms) apart
+(+20 then -14; +43 then +9 to +13) where the picture's nearest tick flips once in the run's first ten seconds: the
+steady levels (-12 and +11) are inside the +-17 band, and the early level is the steady one plus a tick, so a run
+whose steady level sits at the band's top edge reads its early pairs at 50 (the kept budget). Then three
+dispatches on #116's head, in the PR's check list.
+
+**Owed (Owed 133).** The picture's phase is still set from the start-up step estimate (`Playout::phase`): it no
+longer moves the offset out of its budget, but a run can still sit on the quantisation's tie (a 33 ms flip
+between two levels, the early one at most the kept budget when the steady level is at the band's top edge).
+Locking the clock on a later, settled step would narrow the band; it is not built, because it moves the clock
+the audio rides.
