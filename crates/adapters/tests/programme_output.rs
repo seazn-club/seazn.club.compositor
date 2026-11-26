@@ -1940,6 +1940,10 @@ fn swapping_twice_starts_each_sink_at_a_keyframe_and_drains_once() {
         // never gets the audio the ring queued between the two, so its audio starts that late; the
         // first sink, swapped in before any frame, starts with its picture.
         let aac_frame_ms = 1_024 * 1_000 / 48_000;
+        // The audio encoder runs about 60 ms ahead of the video one (`Picker`'s note; 282 ms measured
+        // against the 333 ms between keyframe and swap), so some of the audio after the swap is
+        // ahead of the keyframe too: the lower bound allows that and a margin.
+        const AUDIO_AHEAD_OF_VIDEO_MS: u64 = 100;
         let swap = match name {
             "a.flv" => 0,
             "b.flv" => each,
@@ -1960,7 +1964,7 @@ fn swapping_twice_starts_each_sink_at_a_keyframe_and_drains_once() {
         );
         if name != "a.flv" {
             assert!(
-                first_audio + 2 * aac_frame_ms >= missing_ms,
+                first_audio + AUDIO_AHEAD_OF_VIDEO_MS >= missing_ms,
                 "{name}: audio starts at {first_audio} ms, short of the {missing_ms} ms"
             );
         }
