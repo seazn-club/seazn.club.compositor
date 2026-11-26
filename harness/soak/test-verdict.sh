@@ -99,8 +99,8 @@ case_() {
   local name="$1" page="$2" want="$3" want_failed="$4" reason="$5" filter="$6" b out got failed ids n
   cases=$((cases + 1))
   b="$WORK/case-$name.json"
-  # A filter may read soak.json as $soak[0] (the drift cases' bound).
-  if ! "$JQ" --slurpfile soak "$HERE/soak.json" "$filter" "$BASE" >"$b" 2>"$WORK/$name.patch.err"; then
+  # A filter may read soak.json as $soak[0] (the drift cases' bound) and the thresholds as $t[0].
+  if ! "$JQ" --slurpfile soak "$HERE/soak.json" --slurpfile t "$ROOT/harness/thresholds.json" "$filter" "$BASE" >"$b" 2>"$WORK/$name.patch.err"; then
     fail "$name: the patch does not apply: $(head -c 300 "$WORK/$name.patch.err")"
     return
   fi
@@ -207,7 +207,7 @@ case_ no-dropped-frames-field real fail '4' 'no beat carried droppedFrames' '.re
 case_ no-rung-field real fail '6' 'no beat carried a rung' '.report.heartbeats.series |= map(del(.body.rung))'
 case_ pts-gap real fail '2' 'pts gaps' '.report.pts_gaps = [{at_ms: 1792800400000, gap_ms: 400}]'
 case_ late-reconnect real fail '2' 'after its disconnect ended' \
-  '.report.output_outages[1].to_wall_ms = ((.actions[] | select(.kind == "disconnect" and .slot == 1) | .end_ms) + 8000)'
+  '.report.output_outages[1].to_wall_ms = ((.actions[] | select(.kind == "disconnect" and .slot == 1) | .end_ms) + $t[0].budget_output_reconnect_ms + 1000)'
 case_ dropped-frames real fail '4' 'dropped frames' '.report.heartbeats.series[-2].body.droppedFrames = 60'
 # Fewer beats than 5.beats's floor are fewer memMb beats than check 1.projection fits too.
 case_ few-beats real fail '1.projection,5.beats' '5.beats:heartbeats' \
