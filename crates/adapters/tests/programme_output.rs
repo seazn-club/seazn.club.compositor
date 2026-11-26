@@ -25,10 +25,10 @@ use adapters::stats::StatsSnapshot;
 use app::ports::{Inbound, Metrics, ProgrammeOutput, TargetSpec};
 use crossbeam_channel::Receiver;
 use domain::config::{
-    OutputProfile, Thresholds, CF_KEYFRAME_INTERVAL_MAX_MS, CF_KEYFRAME_INTERVAL_MIN_MS,
-    ENCODER_SPEED_REALTIME_MIN, FIRST_GOP_CATCH_UP_MAX_MS, FORCED_KEYFRAME_MIN_INTERVAL_MS,
-    OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS, PLAYOUT_CAP_MS, PLAYOUT_TARGET_MS, PROGRAMME_GOP_MS,
-    X264_DELAY_FRAMES, X264_DELAY_MS,
+    OutputProfile, Thresholds, AAC_ENCODER_DELAY_SAMPLES, CF_KEYFRAME_INTERVAL_MAX_MS,
+    CF_KEYFRAME_INTERVAL_MIN_MS, ENCODER_SPEED_REALTIME_MIN, FIRST_GOP_CATCH_UP_MAX_MS,
+    FORCED_KEYFRAME_MIN_INTERVAL_MS, OUTPUT_FPS_MIN_WINDOW_MS, OUTPUT_SINK_TIMEOUT_MS, PLAYOUT_CAP_MS,
+    PLAYOUT_TARGET_MS, PROGRAMME_GOP_MS, X264_DELAY_FRAMES, X264_DELAY_MS,
 };
 use domain::ladder::Rung;
 use domain::output_link::{Encoded, OutputLink, OutputState, SwapReason};
@@ -63,6 +63,15 @@ const AAC_FRAMES_PER_S: f64 = 48_000.0 / 1_024.0;
 const AAC_KBPS: f64 = 128.0;
 /// The brief's A/V tolerance (PDF rank 4): ±40 ms.
 const AV_TOLERANCE_MS: u64 = 40;
+
+/// C7 (the final review's I3): the programme drops the AAC frames that hold only the encoder's priming
+/// (a frame fed before `AAC_ENCODER_DELAY_SAMPLES` of samples would stamp below 0), so a recording's
+/// audio is that much shorter than what was fed. The frames dropped are those whose first sample is
+/// under the delay: `ceil(delay / 1 024)`, worked out from the declared delay, not typed.
+fn aac_priming_ms() -> u64 {
+    let dropped = AAC_ENCODER_DELAY_SAMPLES.div_ceil(1_024);
+    dropped * 1_024 * 1_000 / 48_000
+}
 /// One tick of S16LE 48 kHz stereo at 30 fps: 1 600 frames of 4 bytes.
 const TICK_AUDIO_BYTES: usize = 48_000 / 30 * 4;
 
@@ -390,6 +399,12 @@ impl Decoded {
         (self.aac_frames as u64 * 1_024 * 1_000) / 48_000
     }
 
+    /// The audio's length with the encoder's priming put back (`aac_priming_ms`): what the programme
+    /// fed, which a length assert compares with the time it ran for.
+    fn audio_ms_fed(&self) -> u64 {
+        self.audio_ms() + aac_priming_ms()
+    }
+
     fn zero_share(&self) -> f64 {
         self.aac.iter().filter(|&&b| b == 0).count() as f64 / self.aac.len().max(1) as f64
     }
@@ -541,9 +556,10 @@ fn ninety_slate_ticks_give_ninety_frames_at_constant_spacing() {
         );
     }
     assert!(
-        d.audio_ms().abs_diff(3_000) <= AV_TOLERANCE_MS,
-        "audio {} ms against 3 000 ± {AV_TOLERANCE_MS}",
-        d.audio_ms()
+        d.audio_ms_fed().abs_diff(3_000) <= AV_TOLERANCE_MS,
+        "audio {} ms (+ {} ms of priming dropped) against 3 000 ± {AV_TOLERANCE_MS}",
+        d.audio_ms(),
+        aac_priming_ms()
     );
     // The track starts with the picture: the first AAC frame is the keyframe's, within one frame
     // (1 024 samples, 21 ms) of it.
@@ -1855,9 +1871,10 @@ fn live_audio_passes_through_and_an_underrun_neither_silences_nor_gaps_the_track
     // are the check.
     report_audio("live, underrun, live", &d);
     assert!(
-        d.audio_ms().abs_diff(3_000) <= AV_TOLERANCE_MS,
-        "no gap in the track: {} ms",
-        d.audio_ms()
+        d.audio_ms_fed().abs_diff(3_000) <= AV_TOLERANCE_MS,
+        "no gap in the track: {} ms (+ {} ms of priming dropped)",
+        d.audio_ms(),
+        aac_priming_ms()
     );
     let (live1, lost, live2) = (
         d.rms_dbfs(200, 900),
@@ -3457,9 +3474,10 @@ fn skipped_ticks_leave_no_hole_in_the_audio() {
     assert!(d.audio_pts_ms.len() > 200, "{}", d.audio_pts_ms.len());
     assert!(jumps.is_empty(), "{jumps:?}");
     assert!(
-        d.audio_ms().abs_diff(want_ms) <= AV_TOLERANCE_MS,
-        "audio {} ms",
-        d.audio_ms()
+        d.audio_ms_fed().abs_diff(want_ms) <= AV_TOLERANCE_MS,
+        "audio {} ms (+ {} ms of priming dropped)",
+        d.audio_ms(),
+        aac_priming_ms()
     );
 }
 

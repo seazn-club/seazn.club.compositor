@@ -4020,6 +4020,11 @@ and frame size in the test, not from the rule's nanosecond arithmetic. The audio
 read off its length after pushing past each (`the_audio_history_is_bounded_by_count_and_by_span`; each loop mutated
 once).
 
+The first frame kept stamps at 9.3 ms (frame 2, 42.7 ms, less the 33.3 ms delay), and the 2 frames dropped hold 42.7 ms
+of priming plus about 9 ms of leading programme audio that the encoder's delay hid in them: a recording's audio reads
+42 ms shorter than what was fed (`aac_priming_ms`, derived from the declared delay: the three length asserts in
+`programme_output.rs` add it back, their 40 ms tolerance unchanged; the final review's I3).
+
 **Owed.** (1) A Cloudflare stg run of the 2.2 s programme GOP: segment length, TARGETDURATION and camera-to-viewer
 delay (24.5 s before), no `ERR_GOP_OUT_OF_RANGE`, and the encoder's CPU under real sessions (Owed 132). (2) VMAF and the
 paced-key legs at 66 frames (`measure.py` G2/Q2/U2 now read `PROGRAMME_GOP_MS` 2 200). (3) A real-encoder test of the
