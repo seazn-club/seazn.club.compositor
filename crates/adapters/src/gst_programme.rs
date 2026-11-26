@@ -601,6 +601,7 @@ impl GstProgramme {
         encoder.set_property("sync-lookahead", X264_SYNC_LOOKAHEAD_FRAMES);
         encoder.set_property("bitrate", profile.video_kbps);
         encoder.set_property("key-int-max", profile.gop_frames());
+        self.shared.ring.set_gop_frames(profile.gop_frames());
         encoder.set_property("bframes", 0u32);
         encoder.set_property("vbv-buf-capacity", X264_VBV_PROPERTY_MS);
         encoder.set_property("option-string", format!("{X264_OPTIONS}:{X264_NO_SCENE_CUT}"));
