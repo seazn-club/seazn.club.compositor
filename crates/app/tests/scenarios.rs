@@ -3387,7 +3387,7 @@ fn a_failing_upload_logs_once_and_never_stalls_the_pipeline() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// C6 (F-041): the phone republishes after Cloudflare's hold; the picture's time from republish to live
+// C6 (F-041): the phone returns to Cloudflare; the picture's time from a servable publisher to live
 // ---------------------------------------------------------------------------------------------
 
 /// A connect to Cloudflare's SRT playback, first byte and first decoded frame, as F-032 measured
@@ -3395,75 +3395,109 @@ fn a_failing_upload_logs_once_and_never_stalls_the_pipeline() {
 /// (the probes and relay runs), 2 460 ms and 3 025 ms after the build.
 const CF_FIRST_BYTE_MS: u64 = 2_460;
 const CF_FIRST_FRAME_MS: u64 = 3_025;
-/// Web's reply to a beat, as modelled here: a scenario constant, not a product number.
+/// Web's reply to a beat, as modelled here: a scenario constant, not a product number. The chain from
+/// the phone's publish to web's counter (Cloudflare's webhook, the phone's own beat, the handler's
+/// round trips) is NOT in it: the counter is raised at the instant the plan says.
 const WEB_REPLY_MS: u64 = 50;
 /// The frames' period at 30 fps, as the driver's own tick grid.
 const FRAME_MS: u64 = 33;
 
-/// What one run of the republish scenario read.
+/// One return of the camera, as the scenario's Cloudflare and web play it.
+#[derive(Debug, Clone)]
+struct Plan {
+    /// The instants web's counter rises by one (Cloudflare's `connected`, the phone's own `publishing`
+    /// beat: web raises it twice for one return by design, and once more for each flap).
+    edges: Vec<u64>,
+    /// A build made at or after this instant is served (first byte and frame as F-032's medians); one
+    /// made before it never is. The publisher is stable and, inside the hold, the hold is over.
+    served_from: u64,
+    /// Cloudflare closes the readers attached inside its hold at this instant (F-032 finding 1): the
+    /// current build gets the handshaken error that ends the hold. `None` after the hold.
+    hold_close: Option<u64>,
+}
+
+/// What one run of a plan read.
 #[derive(Debug)]
 struct Republish {
-    /// The first tick at or after the republish whose programme phase is Live, less the republish.
+    /// The first tick at or after `served_from` whose programme phase is Live, less `served_from`.
     to_live: u64,
-    /// The beats the driver asked for from the republish to Live.
+    /// The beats the driver asked for from `served_from` to Live.
     beats: usize,
-    /// The input builds in all.
+    /// The input builds in all, from the camera's first.
     builds: usize,
 }
 
-/// The camera runs 2 s, drops, and Cloudflare serves no reader a byte until the publisher is back at
-/// `republish` (the hold's end passed: a return 45 s after the drop is past F-032's 31.2 s hold, so a
-/// build made after it is served, and a reader attached before the publisher is never served: the
-/// model's worst, no lottery). Web's counter reads 0 until `republish`, 1 from it, on every beat's
-/// reply, through the real driver, supervisor and link: the beat's cadence decides when the relay
-/// learns the phone is back, which is what is measured.
-fn republish_run(t: Thresholds, session: SessionConfig, republish: u64) -> Republish {
+/// The camera runs 2 s, drops, and the plan's Cloudflare plays out through the real driver, supervisor
+/// and link: web's counter on every beat's reply is the number of the plan's edges at the tick, so the
+/// beat's cadence decides when the relay learns the phone is back, which is what is measured.
+fn plan_run(t: Thresholds, session: SessionConfig, plan: &Plan) -> Republish {
     let mut sim = Sim::new(t.clone(), session);
     let drop_at = SESSION_AT + 2_000;
     // (instant, message), delivered in order before the first tick after the instant.
     let mut pending: Vec<(u64, Inbound)> = Vec::new();
-    // Each served stream: its generation and the instant its first frame is due.
+    // Each served stream: its generation and the instant its next frame is due.
     let mut streams: Vec<(u64, u64)> = Vec::new();
     // Gen 1 is the camera that runs until the drop.
     pending.push((SESSION_AT + 1, ev(Event::InputConnected { gen: 1 })));
     pending.extend(every(SESSION_AT + 1, drop_at, FRAME_MS, || frame(1)));
+    let held = BuildFacts {
+        handshake_completed: true,
+        carried_media: false,
+    };
+    let mut closed = plan.hold_close.is_none();
+    let mut latest_gen = 1;
     let mut seen = sim.log.len();
     let mut live_at = None;
-    let end = republish + 3 * t.input_connect_timeout_ms;
+    let last_edge = plan.edges.iter().copied().max().unwrap_or(0);
+    let end = plan.served_from.max(last_edge) + 3 * t.input_connect_timeout_ms;
     while live_at.is_none() {
         let tick_at = sim.d.next_tick_at();
-        assert!(tick_at < end, "no Live by {end} (republish {republish})");
+        assert!(tick_at < end, "no Live by {end} ({plan:?})");
+        if !closed && tick_at >= plan.hold_close.expect("set") {
+            closed = true;
+            let at = plan.hold_close.expect("set");
+            pending.push((
+                at,
+                ev(Event::InputError {
+                    gen: latest_gen,
+                    facts: held,
+                }),
+            ));
+        }
         pending.sort_by_key(|e| e.0);
         while pending.first().is_some_and(|e| e.0 < tick_at) {
             let (at, msg) = pending.remove(0);
             sim.step(msg, at.max(sim.now));
         }
         // The streams a build made: frames on a 33 ms grid from the first frame's instant.
-        for (gen, first) in streams.iter_mut() {
-            while *first < tick_at {
-                pending.push((*first, frame(*gen)));
-                *first += FRAME_MS;
+        for (gen, next) in streams.iter_mut() {
+            while *next < tick_at {
+                pending.push((*next, frame(*gen)));
+                *next += FRAME_MS;
             }
         }
         sim.tick(tick_at);
         for call in sim.log.calls_from(seen) {
             match call {
-                // A beat's reply carries web's counter: 0 until the republish, 1 from it.
+                // A beat's reply carries web's counter: the edges so far.
                 Call::Control(ControlRequest::Heartbeat(..)) => {
-                    let count = u64::from(tick_at >= republish);
+                    let count = plan.edges.iter().filter(|&&e| e <= tick_at).count() as u64;
                     pending.push((tick_at + WEB_REPLY_MS, edge(count)));
                 }
-                // A build made once the publisher is back is served; one before it never is.
-                Call::InputRebuild(gen, _) if gen > 1 && tick_at >= republish => {
-                    pending.push((tick_at + CF_FIRST_BYTE_MS, ev(Event::InputMedia { gen })));
-                    pending.push((tick_at + CF_FIRST_FRAME_MS, ev(Event::InputConnected { gen })));
-                    streams.push((gen, tick_at + CF_FIRST_FRAME_MS));
+                // A build made once the publisher is servable is served; one before it never is.
+                Call::InputRebuild(gen, _) if gen > 1 => {
+                    latest_gen = gen;
+                    if tick_at >= plan.served_from {
+                        pending.push((tick_at + CF_FIRST_BYTE_MS, ev(Event::InputMedia { gen })));
+                        pending.push((tick_at + CF_FIRST_FRAME_MS, ev(Event::InputConnected { gen })));
+                        streams.push((gen, tick_at + CF_FIRST_FRAME_MS));
+                    }
                 }
                 _ => {}
             }
         }
         seen = sim.log.len();
-        if tick_at >= republish && sim.d.programme_phase() == ProgrammePhase::Live {
+        if tick_at >= plan.served_from && sim.d.programme_phase() == ProgrammePhase::Live {
             live_at = Some(tick_at);
         }
     }
@@ -3471,78 +3505,187 @@ fn republish_run(t: Thresholds, session: SessionConfig, republish: u64) -> Repub
     let beats = sim
         .times_of(|c| matches!(c, Call::Control(ControlRequest::Heartbeat(..))))
         .into_iter()
-        .filter(|&b| b >= republish && b <= live)
+        .filter(|&b| b >= plan.served_from && b <= live)
         .count();
     Republish {
-        to_live: live - republish,
+        to_live: live - plan.served_from,
         beats,
         builds: sim.log.count(|c| matches!(c, Call::InputRebuild(..))),
     }
 }
 
-/// The picture's return after a republish past the hold, swept over the beat's phase (the republish at
-/// every 250 ms across one cadence, so the worst phase for each rule is among them): within the
-/// recovery gap, the web reply, the first frame and the return's hold-off, and a tick each side. The
-/// same sweep with the rule off (the window 0: today's cadence) must exceed that budget, or the
-/// scenario could not see the defect. Both profiles. Nothing here is typed from the code under test:
-/// the budget is the thresholds' and the scenario's own constants.
+/// The scenario's thresholds with the recovery rule off: today's cadence, the control.
+fn rule_off(t: &Thresholds) -> Thresholds {
+    Thresholds {
+        input_recovery_beat_window_ms: 0,
+        ..t.clone()
+    }
+}
+
+/// A plan swept over the beat's phase (the first edge at every 250 ms across one cadence, so the worst
+/// phase for each rule is among them), both profiles, the rule on and off: each run's result, in order.
+fn sweep(t: &Thresholds, shape: impl Fn(u64) -> Plan) -> Vec<(u64, Republish, Republish)> {
+    let off = rule_off(t);
+    let mut out = Vec::new();
+    for profile in [OutputProfile::P720, OutputProfile::P1080] {
+        let session = SessionConfig {
+            output: profile,
+            ..session_720p()
+        };
+        for k in 0..=(t.heartbeat_interval_ms / 250) {
+            let plan = shape(k * 250);
+            let on = plan_run(t.clone(), session.clone(), &plan);
+            let was = plan_run(off.clone(), session.clone(), &plan);
+            out.push((k * 250, on, was));
+        }
+    }
+    out
+}
+
+fn worst(runs: &[(u64, Republish, Republish)]) -> (u64, u64) {
+    (
+        runs.iter().map(|r| r.1.to_live).max().expect("runs"),
+        runs.iter().map(|r| r.2.to_live).max().expect("runs"),
+    )
+}
+
+/// The picture's return after the phone is servable past the hold (45 s after the drop, F-032's hold is
+/// 31.2 s at most): within one recovery beat and a connect. Modelled: one deterministic Cloudflare at
+/// F-032's medians, the counter raised at the instant of the edge (the webhook's and handler's latency
+/// are NOT here), swept over the beat's phase. The same sweep with the rule off (the window 0: today's
+/// cadence) must exceed the budget, or the scenario could not see the defect. The budget is from the
+/// thresholds and the scenario's own constants.
 #[test]
 fn a_republish_after_the_hold_is_live_within_one_recovery_beat_and_a_connect() {
     let t = th();
     let tick = 2 * OutputProfile::P720.frame_period_ms().ceil() as u64;
     let budget =
         t.input_recovery_beat_gap_ms() + WEB_REPLY_MS + CF_FIRST_FRAME_MS + t.resume_after_ms + 2 * tick;
-    let off = Thresholds {
-        input_recovery_beat_window_ms: 0,
-        ..t.clone()
-    };
-    let drop_at = SESSION_AT + 2_000;
-    let first = drop_at + 45_000;
-    let mut checked = 0;
-    for profile in [OutputProfile::P720, OutputProfile::P1080] {
-        let session = SessionConfig {
-            output: profile,
-            ..session_720p()
-        };
-        let (mut worst_on, mut worst_off) = (0, 0);
-        for k in 0..=(t.heartbeat_interval_ms / 250) {
-            let republish = first + k * 250;
-            let on = republish_run(t.clone(), session.clone(), republish);
-            let was = republish_run(off.clone(), session.clone(), republish);
-            eprintln!(
-                "{}p republish +{}: live after {} ms ({} beats, {} builds); rule off {} ms ({} beats)",
-                profile.height,
-                k * 250,
-                on.to_live,
-                on.beats,
-                on.builds,
-                was.to_live,
-                was.beats
-            );
-            assert!(
-                on.to_live >= CF_FIRST_FRAME_MS + t.resume_after_ms,
-                "live before a served frame: {on:?}"
-            );
-            assert!(on.builds >= 2, "a build after the camera's: {on:?}");
-            worst_on = worst_on.max(on.to_live);
-            worst_off = worst_off.max(was.to_live);
-            checked += 1;
-        }
+    let first = SESSION_AT + 2_000 + 45_000;
+    let runs = sweep(&t, |k| Plan {
+        edges: vec![first + k],
+        served_from: first + k,
+        hold_close: None,
+    });
+    for (k, on, was) in &runs {
         eprintln!(
-            "{}p: worst with the rule {worst_on} ms, without {worst_off} ms, budget {budget} ms",
-            profile.height
+            "post-hold, edge +{k}: live after {} ms ({} beats, {} builds); rule off {} ms ({} beats, {} builds)",
+            on.to_live, on.beats, on.builds, was.to_live, was.beats, was.builds
         );
         assert!(
-            worst_on <= budget,
-            "{}p: {worst_on} ms over the budget {budget}",
-            profile.height
+            on.to_live >= CF_FIRST_FRAME_MS + t.resume_after_ms,
+            "live before a served frame: {on:?}"
+        );
+        assert!(on.builds >= 2, "a build after the camera's: {on:?}");
+    }
+    let (on, off) = worst(&runs);
+    eprintln!(
+        "post-hold: worst with the rule {on} ms, without {off} ms, budget {budget} ms ({} runs)",
+        runs.len()
+    );
+    assert!(on <= budget, "{on} ms over the budget {budget}");
+    assert!(
+        off > budget,
+        "the rule off ({off}) fits the budget {budget}: the scenario is blind"
+    );
+    assert_eq!(runs.len(), 2 * (t.heartbeat_interval_ms / 250 + 1) as usize);
+}
+
+/// A return INSIDE the hold (the 26 s stg case): the publisher is back 10 s after the drop but Cloudflare
+/// serves no reader before the hold closes (31 s after the last frame, F-032's 29.9 to 31.2 s); the
+/// readers attached close then, and the hold-end rule rebuilds a base wait later. The rule changes
+/// NOTHING the picture waits on here: it is hold-bound, and the table says so. Asserted: never later
+/// than today, never more builds than today, and the gain is nil to within a beat's own phase. This is
+/// the claim's other half; F-041 and the index row restate the headline from it.
+#[test]
+fn a_return_inside_the_hold_is_hold_bound_and_not_worse() {
+    let t = th();
+    let drop_at = SESSION_AT + 2_000;
+    let close = drop_at + 31_000;
+    let runs = sweep(&t, |k| Plan {
+        edges: vec![drop_at + 10_000 + k],
+        served_from: close,
+        hold_close: Some(close),
+    });
+    for (k, on, was) in &runs {
+        eprintln!(
+            "in-hold, edge +{k}: live {} ms after the close ({} builds); rule off {} ms ({} builds)",
+            on.to_live, on.builds, was.to_live, was.builds
         );
         assert!(
-            worst_off > budget,
-            "{}p: the rule off ({worst_off}) fits the budget {budget}: the scenario is blind",
-            profile.height
+            on.to_live <= was.to_live,
+            "later with the rule: {on:?} against {was:?}"
+        );
+        assert!(
+            on.builds <= was.builds,
+            "more builds with the rule: {on:?} against {was:?}"
         );
     }
-    eprintln!("republish runs checked: {checked}");
-    assert_eq!(checked, 2 * (t.heartbeat_interval_ms / 250 + 1) as usize);
+    let (on, off) = worst(&runs);
+    eprintln!(
+        "in-hold: worst with the rule {on} ms after the close, without {off} ms ({} runs)",
+        runs.len()
+    );
+    // Hold-bound: both are at least one served connect after the close, whatever the rule.
+    assert!(runs
+        .iter()
+        .all(|r| r.1.to_live >= CF_FIRST_FRAME_MS + t.resume_after_ms));
+    assert_eq!(runs.len(), 2 * (t.heartbeat_interval_ms / 250 + 1) as usize);
+}
+
+/// A flapping publisher: web raises the counter three times inside one outage (Cloudflare's `connected`,
+/// the phone's `publishing` beat, a re-`connected` after a flap, the shape of stg case A), 2 s apart, and
+/// the publisher is servable only from the last. Measured against today's cadence, over the beat's phase:
+///
+/// - **Builds:** each edge latches ONE nudge and one nudge is one build, so the rule can add at most the
+///   edges' count to today's builds (the back-off's own schedule is unchanged). Observed: 7 against 6 or 7.
+/// - **Latency, honestly:** the discard of a connect with no byte is once an outage (Owed 108, owner-ruled),
+///   and a beat a second sends the FIRST edge alone, so its discard lands on a build made before the
+///   publisher is servable and the later edges wait out the 9 s connect timeout. Today's 5 s grid coalesces
+///   the edges inside a reply, which is lucky in about a fifth of the phases (4.1 to 4.9 s) and unlucky in
+///   the rest (up to 12.9 s). So the rule is NOT never-worse phase by phase here: it is a constant 9.2 to
+///   9.9 s where today is 4.1 to 12.9 s. What holds, and is asserted: its worst is no later than today's
+///   (9.9 against 12.9 s). The mean is a wash (9.5 s against 9.5 s, 55 ms later) and is printed, not
+///   asserted, and the phases it loses (10 of 42) are counted and printed.
+#[test]
+fn a_flapping_publisher_costs_one_build_an_edge_at_most_and_its_worst_is_not_later() {
+    let t = th();
+    let drop_at = SESSION_AT + 2_000;
+    let base = drop_at + 45_000;
+    let runs = sweep(&t, |k| Plan {
+        edges: vec![base + k, base + k + 2_000, base + k + 4_000],
+        served_from: base + k + 4_000,
+        hold_close: None,
+    });
+    let mut later = 0;
+    for (k, on, was) in &runs {
+        eprintln!(
+            "flap, first edge +{k}: live {} ms ({} builds); rule off {} ms ({} builds)",
+            on.to_live, on.builds, was.to_live, was.builds
+        );
+        assert!(
+            on.builds <= was.builds + 3,
+            "more than one build an edge over today: {on:?} against {was:?}"
+        );
+        later += usize::from(on.to_live > was.to_live);
+    }
+    let (worst_on, worst_off) = worst(&runs);
+    let (sum_on, sum_off): (u64, u64) = runs
+        .iter()
+        .fold((0, 0), |a, r| (a.0 + r.1.to_live, a.1 + r.2.to_live));
+    eprintln!(
+        "flap: {} runs, later than today in {later}; worst {worst_on} ms against {worst_off}; mean {} against {} ms",
+        runs.len(),
+        sum_on / runs.len() as u64,
+        sum_off / runs.len() as u64
+    );
+    assert!(
+        worst_on <= worst_off,
+        "the rule's worst {worst_on} is later than today's {worst_off}"
+    );
+    assert!(
+        later >= 1,
+        "the loss this test names was not seen: the shape is blind"
+    );
+    assert_eq!(runs.len(), 2 * (t.heartbeat_interval_ms / 250 + 1) as usize);
 }

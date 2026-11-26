@@ -524,10 +524,16 @@ impl Supervisor {
         }
     }
 
-    /// C6: inside the recovery window (`track_input_outage`'s clock, `input_recovery_beat_window_ms`).
+    /// C6: inside the recovery window (`track_input_outage`'s clock, `input_recovery_beat_window_ms`),
+    /// and web has sent a counter to nudge with. The only thing a faster beat buys is a rise of
+    /// `phoneLiveEdge` in its reply, and web omits the field for a session with no phone-live history
+    /// (`heartbeat.ts`), so a link whose counter is still `None` has nothing to be answered (the PR #115
+    /// review, I2).
     fn recovery_beats(&self, now: Ms) -> bool {
-        self.input_down_since
-            .is_some_and(|since| elapsed(now, since) < self.t.input_recovery_beat_window_ms)
+        self.input_nudge().counter.is_some()
+            && self
+                .input_down_since
+                .is_some_and(|since| elapsed(now, since) < self.t.input_recovery_beat_window_ms)
     }
 
     fn booting(&mut self, event: Event, now: Ms, attempt: u32, retry_at: Option<Ms>, fx: &mut Vec<Effect>) {

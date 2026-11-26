@@ -83,8 +83,12 @@ pub struct Thresholds {
     /// hold and the connect's first frame). The window is one minute: the 11 outages of 15 s or more in
     /// 30 days of stg beats ended 15 to 70 s after the frozen picture (F-041's query), and the hold's own
     /// close comes 29.9 to 31.2 s after the drop (F-032, finding 1) with a connect after it. After the
-    /// window the plain cadence returns, so a dead input costs web 60 extra beats an outage, never a beat
-    /// a second for an hour. Zero turns it off. The window's edge is a C6 choice, not a measurement: the
+    /// window the plain cadence returns, so a dead input costs web 60 extra beats an outage. Each outage
+    /// re-arms it, so a camera that flaps all session beats at the gap all session: the bound there is
+    /// the gap itself, never faster than one beat a gap (web's samples cap is priced at a beat a second
+    /// for the 3 h hard cap), and `recovery_beat.rs` holds it over an hour of flapping. Only a session
+    /// whose replies carry a counter beats faster (web omits it with no phone-live history). Zero turns
+    /// it off. The window's edge is a C6 choice, not a measurement: the
     /// owner's to move.
     pub input_recovery_beat_window_ms: Ms,
     /// PDF failure table: "alert if it repeats > 3 times in 5 min" (alert when count EXCEEDS this).

@@ -3857,15 +3857,43 @@ on a 5 s grid.
 
 **What C6 changes.** One rule, in the domain (`Supervisor::beat_if_due`): while the camera is down
 (`input_down_since`, set when the link leaves Running after having run), inside
-`input_recovery_beat_window_ms` (60 s), a beat is due `input_recovery_beat_gap_ms` (the phase beat's 1 s,
-derived) after the last one. It costs web at most 60 extra beats an outage, and none to a link that never ran
-(a phone that has not started), a camera that runs, or the final hold; after the window the 5 s cadence returns.
-Measured through the real driver, supervisor and link (`app/tests/scenarios.rs`
-`a_republish_after_the_hold_is_live_within_one_recovery_beat_and_a_connect`), with a Cloudflare that serves a
-build made after the publisher is back at F-032's medians (first byte 2 460 ms, first frame 3 025 ms) and none
-before it, the republish swept over a beat's phase in 250 ms steps, 720p and 1080p: **republish to live, rule off
-(today): 4.1 to 8.9 s, worst 8.9 s; rule on: 4.1 to 4.9 s, worst 4.9 s**, against a budget derived from the
-thresholds of 5.2 s.
+`input_recovery_beat_window_ms` (60 s), and only for a session whose replies have carried a `phoneLiveEdge`
+counter (web omits it with no phone-live history, so there is nothing to answer: the review's I2), a beat is due
+`input_recovery_beat_gap_ms` (the phase beat's 1 s, derived) after the last one. It costs web at most 60 extra
+beats an outage, and none to a link that never ran, a camera that runs, a session with no counter, or the final
+hold; after the window the 5 s cadence returns. Each outage re-arms the window, so a camera that flaps all session
+beats at the gap all session: the bound there is the gap floor (never faster than one beat a gap, held over an
+hour of flapping in `recovery_beat.rs`), which is the rate web's samples cap is already priced at (a beat a second
+for the 3 h hard cap), not a new one.
+
+**What it improves, and what it does not (PR #115 review, I1 and I3).** Measured through the real driver,
+supervisor and link (`app/tests/scenarios.rs`), Cloudflare MODELLED at F-032's medians (a build made once the
+publisher is servable is served: first byte 2 460 ms, first frame 3 025 ms; one made earlier never is), the first
+edge swept over a beat's phase in 250 ms steps, 720p and 1080p (42 runs: 21 phases of one deterministic
+Cloudflare, not 42 samples of it). The counter is raised at the instant the plan says; web's webhook delivery,
+the phone's own beat and the handler's round trips are NOT in the numbers, only a 50 ms reply. Read them as
+design numbers, not as a stg result (Owed 129):
+
+| Return | Rule off (today) | Rule on | Changed? |
+|---|---|---|---|
+| Past the hold, one edge (`a_republish_after_the_hold_...`) | 4.1 to 8.9 s after the publisher is servable, worst 8.9 s | 4.1 to 4.9 s, worst 4.9 s (budget 5.2 s, derived) | **Yes: up to 4 s, the beat grid** |
+| Inside the hold, edge at drop + 10 s, close at + 31 s (`a_return_inside_the_hold_...`) | 5.07 s after the close, every phase | 5.07 s, every phase; builds equal | **No. Hold-bound, as case B was** |
+| Flapping, three edges 2 s apart (`a_flapping_publisher_...`) | 4.1 to 12.9 s, mean 9.5 s | 9.2 to 9.9 s, mean 9.5 s | **Worst 3 s better; later in 10 of 42 phases; mean 55 ms later; builds 6 or 7 against 7** |
+
+So the 26 s stg case (a return inside the hold) is not improved, and the headline 8.9 to 4.9 s is the post-hold
+class only (5 of the 11 long outages in F-041's 30 days). The rule never makes the hold shorter.
+
+**The nudge's discard and the flapping row, plainly.** The discard of a connect with no byte is once an outage
+(Owed 108, owner-ruled) and a nudge acts at the first reply that carries a rise. With a beat a second, the FIRST
+edge is therefore sent alone, its discard lands on a build made before the publisher is servable, and the later
+edges (spent discard) wait for that connect's 9 s timeout. Today's 5 s grid coalesces edges 2 s apart into one
+nudge in about a fifth of the phases, which is lucky (4.1 to 4.9 s), and in the rest sends the first edge alone
+too (up to 12.9 s, because its reply lands later in the hold). So yes, spending the discard on the first edge
+loses something against today's lucky phases (the 10 of 42), and wins against the unlucky ones; the rule trades a
+lottery for a constant. Rebuilds are bounded by the counter, not by the back-off: each rise latches one nudge and
+one nudge is one build, so at most one extra build an edge (web raises the counter twice for one return by
+design). Re-arming the discard on each rise would fix the flapping row but changes the owner-ruled link rule for
+rule-off sessions too: left, and named (Owed 130).
 
 **What C6 does not change, and why.**
 

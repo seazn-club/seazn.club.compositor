@@ -34,6 +34,11 @@ struct Run {
 
 impl Run {
     fn booted(step: Ms, th: Thresholds) -> Self {
+        Self::booted_with(step, th, true)
+    }
+
+    /// `counter`: whether web's replies have carried a `phoneLiveEdge` yet (a baseline of 0 at boot).
+    fn booted_with(step: Ms, th: Thresholds, counter: bool) -> Self {
         let hb = th.heartbeat_interval_ms;
         let s = Supervisor::new(th).decide(Event::Tick, 0).next;
         let d = s.decide(
@@ -44,8 +49,13 @@ impl Run {
             0,
         );
         assert_eq!(d.next.lifecycle(), Lifecycle::Running, "setup: booted");
+        let next = if counter {
+            d.next.decide(Event::PhoneLiveEdge { count: 0 }, 0).next
+        } else {
+            d.next
+        };
         Self {
-            s: d.next,
+            s: next,
             now: 0,
             step,
             beats: Vec::new(),
@@ -348,4 +358,93 @@ fn the_window_is_open_at_its_start_and_shut_at_its_end() {
     );
     eprintln!("window boundary checked: {}", checked + 1);
     assert_eq!(checked, 5);
+}
+
+/// Web omits `phoneLiveEdge` for a session with no phone-live history, so a link that has had no
+/// counter has nothing a faster beat could be answered with: it beats at the plain cadence through an
+/// outage. The same outage with a counter beats at the gap (the positive pair), and the first counter
+/// to arrive mid-outage starts the faster beats from that reply (the PR #115 review, I2).
+#[test]
+fn an_outage_with_no_counter_from_web_keeps_the_plain_cadence() {
+    let th = t();
+    let gap = th.input_recovery_beat_gap_ms();
+    let mut checked = 0;
+    for step in STEPS {
+        let mut r = Run::booted_with(step, th.clone(), false);
+        let last = r.run_then_drop(6_000);
+        let down = stall_tick(last, step, &th);
+        r.run_to(down + 30_000);
+        let gs = gaps(&r.beats_in(down, FAR));
+        assert!(gs.len() >= 4, "step {step}: setup, {} gaps", gs.len());
+        for g in gs {
+            assert!(
+                g >= th.heartbeat_interval_ms,
+                "step {step}: {g} ms between beats with no counter from web"
+            );
+            checked += 1;
+        }
+        // The positive pair: the counter arrives mid-outage and the beats go to the gap.
+        let from = r.now;
+        r.send(Event::PhoneLiveEdge { count: 0 });
+        r.run_to(from + 15_000);
+        let after = gaps(&r.beats_in(from + th.heartbeat_interval_ms + step, FAR));
+        assert!(after.len() >= 5, "step {step}: setup, beats after the counter");
+        for g in after {
+            assert!(g <= gap + step, "step {step}: {g} ms after the counter arrived");
+            checked += 1;
+        }
+    }
+    eprintln!("no-counter gaps checked: {checked}");
+    assert!(checked >= 4 * 10);
+}
+
+/// The per-SESSION bound, not only the per-outage one (the PR #115 review, I3 and m1): every Running
+/// to down transition re-arms the window, so a camera that flaps for an hour beats at the gap for the
+/// whole hour. What bounds that is the gap floor itself: over any stretch the beats are at most one a
+/// gap. Web prices exactly that (a beat a second for the 3 h hard cap, its samples-per-session cap), so
+/// it is a bound web already carries, not a new rate. The camera here is up 6 s and silent 12 s, 200
+/// cycles at each tick period, and every outage re-arms.
+#[test]
+fn a_flapping_camera_for_an_hour_never_beats_faster_than_the_gap() {
+    let th = t();
+    let gap = th.input_recovery_beat_gap_ms();
+    let hour = 3_600_000;
+    let mut checked = 0;
+    let mut outages_total = 0;
+    for step in [250, 1_000] {
+        let mut r = Run::booted(step, th.clone());
+        let mut outages = 0;
+        while r.now < hour {
+            r.camera = true;
+            let up_to = r.now + 6_000;
+            r.run_to(up_to);
+            r.camera = false;
+            let to = r.now + 12_000;
+            r.run_to(to);
+            outages += 1;
+        }
+        for g in gaps(&r.beats) {
+            assert!(g >= gap, "step {step}: {g} ms between beats, under the gap {gap}");
+            checked += 1;
+        }
+        let ceiling = (r.now / gap + 1) as usize;
+        assert!(
+            r.beats.len() <= ceiling,
+            "step {step}: {} beats in {} ms, over {ceiling}",
+            r.beats.len(),
+            r.now
+        );
+        // Anti-vacuity: the window really was re-armed over and over (beats closer than the cadence).
+        let fast = gaps(&r.beats)
+            .into_iter()
+            .filter(|&g| g < th.heartbeat_interval_ms)
+            .count();
+        assert!(
+            fast >= outages * 5,
+            "step {step}: only {fast} recovery gaps over {outages} outages"
+        );
+        outages_total += outages;
+    }
+    eprintln!("flapping hour: gaps checked {checked}, outages {outages_total}");
+    assert!(checked >= 2_000 && outages_total >= 400);
 }
