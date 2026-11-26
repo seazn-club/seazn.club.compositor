@@ -44,6 +44,10 @@ COMMON = {
 }
 CF_GOP_FLOOR_MS = 2000  # config.rs CF_KEYFRAME_INTERVAL_MIN_MS (Cloudflare: GOP between 2 and 10 s)
 PRODUCT_FLOOR_MS = 2200  # config.rs FORCED_KEYFRAME_MIN_INTERVAL_MS
+# C5 Phase B (the shipped guard, `gst_output::own_key_in_flight`): the adapter asks for no keyframe while
+# the GOP's own is due within the encoder's delay of the newest video it has taken.
+GOP_MS = 3000  # config.rs PROGRAMME_GOP_MS
+DELAY_MS = 800  # config.rs X264_DELAY_MS = (X264_RC_LOOKAHEAD_FRAMES 15 + X264_THREADS 9) frames at 30 fps
 
 
 def legs(vcpus=6):
@@ -79,6 +83,15 @@ def legs(vcpus=6):
             "id": "X1",
             "name": "extra (not a brief leg): as L2, sync-lookahead=0",
             "props": {**nt, "sync-lookahead": 0},
+        },
+        {
+            # C5 Phase B: the shipped encoder (L2 with X1's sync-lookahead=0 and threads 9) asked for its
+            # forced keys the way the product now asks: not while the GOP's own is in the delay.
+            "id": "P1",
+            "name": "the product (C5): as X1, forced keys asked behind the in-flight guard",
+            "props": {**nt, "sync-lookahead": 0},
+            "guard": True,
+            "paced_only": True,
         },
         {
             "id": "R0",
@@ -261,6 +274,8 @@ def cmd_quality(a):
     results = []
     checked = 0
     for leg in legs():
+        if leg.get("paced_only"):
+            continue
         for cname, cpath in clips.items():
             frames = os.path.getsize(cpath) // FRAME_BYTES
             with tempfile.TemporaryDirectory() as d:
@@ -446,6 +461,21 @@ def free_run(Gst, GstVideo, leg, feed, seconds):
     return out
 
 
+def key_in_flight(outs, gop_ms=GOP_MS, delay_ms=DELAY_MS):
+    """`gst_output::own_key_in_flight` on the observed outputs (wall, running_time_ns, key): the GOP's own
+    keyframe, a GOP after the last one out, is due after the newest video out and within the delay of
+    it. With no video out yet nothing is asked either (the product's `None` branch: the first frame,
+    a keyframe, starts the stream)."""
+    rts = [o[1] for o in outs if o[1] is not None]
+    keys = [o[1] for o in outs if o[2] and o[1] is not None]
+    if not rts:
+        return True
+    if not keys:
+        return False
+    newest, due = max(rts), max(keys) + gop_ms * 1_000_000
+    return newest < due <= newest + delay_ms * 1_000_000
+
+
 def key_episode(Gst, GstVideo, leg, feed, offset_s):
     """One fresh encoder; a forced key asked `offset_s` after its first frame, the way
     `gst_programme.rs` asks (an upstream force-key-unit event from the parser's src pad, running time
@@ -458,8 +488,13 @@ def key_episode(Gst, GstVideo, leg, feed, offset_s):
     deadline_frames = n_req + 7 * FPS
     n = 0
     forced = None
+    skipped = False
     while n < deadline_frames:
-        if n == n_req:
+        if n == n_req and leg.get("guard") and key_in_flight(r.snapshot()):
+            # The product asks nothing here (`gst_output::ask_key`): the GOP's own keyframe serves.
+            skipped = True
+            t_send = time.monotonic()
+        elif n == n_req:
             ev = GstVideo.video_event_new_upstream_force_key_unit(req_rt, True, 0)
             t_send = time.monotonic()
             if not r.parse.get_static_pad("src").send_event(ev):
@@ -472,7 +507,7 @@ def key_episode(Gst, GstVideo, leg, feed, offset_s):
             if keys:
                 forced = min(keys, key=lambda o: o[1])
                 break
-    row = {"offset_s": offset_s}
+    row = {"offset_s": offset_s, "skipped": skipped}
     if forced is None:
         row["forced_key"] = None
     else:
@@ -604,7 +639,12 @@ def cmd_table(a):
                 d = statistics.fmean(e["delay_ms"] for e in got)
                 g = [e["gop_ms"] for e in got if e["gop_ms"] is not None]
                 gops += g
-                cells.append(f"{d:.0f} ({min(g):.0f})" + ("" if len(got) == len(rs) else f" {len(got)}/{len(rs)}"))
+                sk = sum(1 for e in got if e.get("skipped"))
+                cells.append(
+                    f"{d:.0f} ({min(g):.0f})"
+                    + ("" if len(got) == len(rs) else f" {len(got)}/{len(rs)}")
+                    + (f" [{sk} not asked]" if sk else "")
+                )
             under = sum(1 for g in gops if g < CF_GOP_FLOOR_MS)
             out.append(f"| {lid} | " + " | ".join(cells) + f" | {fmt(min(gops) if gops else None, 0)} | {under} of {len(gops)} |")
         out.append("")
@@ -639,7 +679,7 @@ def cmd_selftest(_):
     assert x264_options(b"nothing here") is None
     # legs: five of the brief, one extra, R0, one profile each, the product's floor and GOP carried
     ls = legs()
-    assert [lg["id"] for lg in ls] == ["L1", "L2", "L3", "L4", "L5", "L5a", "X1", "R0"]
+    assert [lg["id"] for lg in ls] == ["L1", "L2", "L3", "L4", "L5", "L5a", "X1", "P1", "R0"]
     assert COMMON["key-int-max"] == 3 * FPS and COMMON["min-force-key-unit-interval"] == PRODUCT_FLOOR_MS * 1_000_000
     p = {lg["id"]: lg["props"] for lg in ls}
     assert p["L1"]["tune"] == "zerolatency" and "tune" not in p["L2"]
@@ -647,6 +687,16 @@ def cmd_selftest(_):
     assert "nal-hrd=vbr" in p["L5"]["option-string"] and "filler" not in p["L5"]["option-string"]
     assert p["L5a"]["option-string"].count("filler=0") == 1 and "filler=1" in COMMON["option-string"]
     assert 'option-string="nal-hrd=cbr:filler=0:scenecut=0"' in enc_props(ls[5])
+    # key_in_flight, from the rule in frames: keyframe 0 of a 90-frame GOP, a 24-frame delay (outputs as
+    # (wall, running_time_ns, key)): in flight for the newest frames 66..89 and no other, nothing out yet
+    # counts as in flight (the product asks nothing before its first video).
+    ns = lambda n: n * 1_000_000_000 // FPS
+    def outs(newest):
+        return [(0.0, ns(i), i == 0) for i in range(newest + 1)]
+    yes = [n for n in range(0, 180) if key_in_flight(outs(n))]
+    assert yes == list(range(66, 90)), yes
+    assert key_in_flight([]) is True
+    assert key_in_flight([(0.0, ns(3), False)]) is False
     print("selftest: ok")
 
 
