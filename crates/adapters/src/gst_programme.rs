@@ -3,7 +3,8 @@
 //!
 //! - video: `appsrc(base) + appsrc(overlay) → compositor → AYUV (BT.709) → videoconvert → I420
 //!   (BT.709) → queue(leaky) → x264enc → h264parse → appsink(venc)`;
-//! - audio: `appsrc(audio) → audioconvert → voaacenc → aacparse → appsink(aenc)`.
+//! - audio: `appsrc(audio) → audioconvert → voaacenc → aacparse → appsink(aenc)`, each AAC frame
+//!   stamped the encoder's delay early (`without_aac_delay`, C8), so the sound lands on its picture.
 //!
 //! **Its own clock.** Every buffer is timestamped by tick index, `pts = index × period`, so the
 //! output stays constant-rate however the loop is paced. The appsrcs are not live: nothing in this
