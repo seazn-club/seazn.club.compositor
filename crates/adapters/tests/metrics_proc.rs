@@ -290,6 +290,48 @@ fn the_camera_rates_are_the_totals_rise_over_the_beat_window() {
     assert_eq!(checked, 5);
 }
 
+/// Task E, the camera's picture size: the sampler passes on the size its camera reader gives, as
+/// read, sample by sample (a new size replaces the old, none reads as none), and a sampler with no
+/// camera reader (fake mode) carries none. The sizes are the camera's own and differ from each other
+/// and from the programme's, so a sampler that held the first one, or put out the programme's, reads
+/// wrong.
+#[test]
+fn the_sampler_passes_the_cameras_picture_size_as_read_and_none_without_a_reader() {
+    use adapters::metrics_proc::CameraTotals;
+    use app::ports::PictureSize;
+    use std::sync::Mutex;
+    assert_eq!(
+        ProcMetrics::new(Arc::new(Stats::default()))
+            .sample()
+            .input_picture,
+        None,
+        "no camera reader"
+    );
+    let size = |width, height| Some(PictureSize { width, height });
+    let script = [
+        None,
+        size(1_920, 1_080),
+        size(720, 1_280),
+        size(720, 1_280),
+        None,
+        size(640, 360),
+    ];
+    let reading = Arc::new(Mutex::new(None));
+    let r = Arc::clone(&reading);
+    let mut m = ProcMetrics::new(Arc::new(Stats::default())).with_camera(move || CameraTotals {
+        picture: *r.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        ..CameraTotals::default()
+    });
+    let mut checked = 0;
+    for want in script {
+        *reading.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = want;
+        assert_eq!(m.sample().input_picture, want, "sample {checked}");
+        checked += 1;
+    }
+    eprintln!("picture samples checked: {checked}");
+    assert_eq!(checked, script.len());
+}
+
 /// C2 (S4), the seam: a reader `with_camera` is read by the real sampler, once a sample. Totals that
 /// rise between two samples a window apart come out as rates; the bracket of the test's clock reads
 /// bounds each, as `the_beats_fps_…` does.
@@ -310,6 +352,7 @@ fn the_sampler_reads_the_camera_reader_once_a_sample() {
             // C3 (S5): totals passed on as read.
             withheld_spans: n / 10,
             queue_overruns: n / 25,
+            picture: None,
         }
     });
     let after = Instant::now();

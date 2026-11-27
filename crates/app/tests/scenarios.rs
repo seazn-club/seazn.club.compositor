@@ -1,5 +1,6 @@
 //! The driver (C08) folding the REAL `Supervisor` through fakes for every port, on a manual clock.
 //! Every duration comes from `Thresholds::default()` (or a named override), never from the driver.
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -8,8 +9,8 @@ use app::airings::Airings;
 use app::driver::Driver;
 use app::frame_grab::{spawn, FrameGrabs, FrameWorker, GrabRun};
 use app::ports::{
-    ControlRequest, FrameUploadError, Inbound, Measured, MemorySplit, Metrics, PlayoutTotals, ProcStatus,
-    SessionConfig,
+    ControlRequest, FrameUploadError, Inbound, Measured, MemorySplit, Metrics, PictureSize, PlayoutTotals,
+    ProcStatus, SessionConfig,
 };
 use domain::airings::{AiringLine, AiringSource, AiringStyle};
 use domain::config::{
@@ -1904,6 +1905,121 @@ fn the_camera_as_received_is_logged_once_a_beat_when_measured() {
     assert_eq!(lines(), want, "the final beat's line");
     eprintln!("input received beats checked: {}", script.len() + 1);
     assert_eq!(want.len(), 8);
+}
+
+/// A `Metrics` that reports the camera's picture size on every sample, whatever the link is doing: an
+/// adapter that still holds the last size its decoder announced, after the camera has gone.
+struct ScriptedPicture(PictureSize);
+
+impl Metrics for ScriptedPicture {
+    fn sample(&mut self) -> Measured {
+        Measured {
+            input_picture: Some(self.0),
+            ..metrics()
+        }
+    }
+}
+
+/// Task E: the beat carries the camera's picture size only while its input is connected. The sampler
+/// reports a size on EVERY sample (the worst case: a stale one), and each beat's request is judged
+/// against that beat's own report: the size rides it when, and only when, the report's input is
+/// `Connected`. The run covers a connecting beat, a connected one, a backed-off one (the loss lands
+/// half a back-off before the beat), and the rebuilt (connecting again) one after it, so the empty
+/// case and the return are both read; a run that never saw one of the three statuses is a failure.
+#[test]
+fn the_cameras_picture_size_rides_only_a_beat_whose_input_is_connected() {
+    let t = th();
+    // The camera's own size: not the programme's 1280x720 (`session_720p`), so a size that had been
+    // swapped for the output's would read wrong.
+    let size = PictureSize {
+        width: 1_920,
+        height: 1_080,
+    };
+    let log = Log::default();
+    let mut p = ports(&log, metrics());
+    p.metrics = Box::new(ScriptedPicture(size));
+    let mut sim = Sim {
+        d: Driver::new(t.clone(), p, FAR, 0),
+        log: log.clone(),
+        marks: Vec::new(),
+        tick_times: Vec::new(),
+        now: 0,
+        exit: None,
+    };
+    sim.tick(0);
+    sim.step(Inbound::Session(session_720p()), SESSION_AT);
+    let is_beat = |c: &Call| matches!(c, Call::Control(ControlRequest::Heartbeat(..)));
+    let beats = |sim: &Sim| -> Vec<(HealthReport, Measured)> {
+        sim.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Control(ControlRequest::Heartbeat(h, m)) => Some((h, *m)),
+                _ => None,
+            })
+            .collect()
+    };
+    let limit = 10 * t.heartbeat_interval_ms + SESSION_AT;
+    let first = sim.tick_until(limit, is_beat);
+    // The camera's first frame, then frames while it lives (the stall rule would give a silent one
+    // up on its own), then the loss half a back-off before the third beat, and the run to past the
+    // fourth: the beats are at `first` + 0, 1, 2 and 3 intervals.
+    let lost_at = first + 2 * t.heartbeat_interval_ms - t.input_backoff_base_ms / 2;
+    let mut events = vec![(first + 1, ev(Event::InputConnected { gen: 1 }))];
+    events.extend(every(first + 2, lost_at, 100, || {
+        ev(Event::InputFrame { gen: 1 })
+    }));
+    events.push((
+        lost_at,
+        ev(Event::InputLost {
+            gen: 1,
+            reason: LossReason::Error,
+        }),
+    ));
+    sim.drive(
+        first + 3 * t.heartbeat_interval_ms + t.heartbeat_interval_ms / 2,
+        events,
+    );
+    let seen = beats(&sim);
+    eprintln!(
+        "beats at {:?}: {:?}",
+        sim.times_of(is_beat),
+        seen.iter().map(|b| b.0.input).collect::<Vec<_>>()
+    );
+    // The four on the interval, and the edge beat that announces the phase change when the camera
+    // connects (a beat is also sent on that edge).
+    assert!(seen.len() >= 4, "the beats at {:?}", sim.times_of(is_beat));
+    let mut counts = BTreeMap::new();
+    for (h, m) in &seen {
+        assert_eq!(
+            m.input_picture,
+            (h.input == LinkStatus::Connected).then_some(size),
+            "a beat whose input is {:?}",
+            h.input
+        );
+        *counts.entry(format!("{:?}", h.input)).or_insert(0u32) += 1;
+    }
+    eprintln!("beats checked by input status: {counts:?}");
+    for link in ["Connecting", "Connected", "Backoff"] {
+        assert!(
+            counts.contains_key(link),
+            "no beat saw the input {link}: {counts:?}"
+        );
+    }
+    // The same size is on the `input received` line, and on the beats whose size rides: one line per
+    // connected beat, none for the others (the sample measures nothing else, so a beat that hides the
+    // size has no line). This is where a camera's size is read off a live relay's log, which is what
+    // shows the adapter's picture handle is wired at all.
+    let connected = counts["Connected"];
+    assert!(connected >= 2, "premise: more than one connected beat");
+    let want = format!(
+        "input received fps=- kbps=- picture={}x{}",
+        size.width, size.height
+    );
+    assert_eq!(
+        lines_starting(&log, "input received"),
+        vec![want; connected as usize],
+        "one line per connected beat, none for the rest"
+    );
 }
 
 /// A `Metrics` whose `fps` (the real output rate, Owed 86) the test sets between beats.

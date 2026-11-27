@@ -543,7 +543,10 @@ fn camera_repeat(msg: &str, at_ms: i64) -> Option<CameraRepeatLine> {
     })
 }
 
-/// The `input received …` line's playout tail (C4), its last four tokens.
+/// The `input received …` line's playout tail (C4), its last four tokens. A field the driver writes
+/// after it is a line this does not read: the driver writes Task E's picture BEFORE the tail, and
+/// `the_drivers_received_line_keeps_its_playout_tail_readable_whatever_else_it_carries` builds the
+/// driver's real line to prove it.
 fn playout_tail(msg: &str, at_ms: i64) -> Option<PlayoutLine> {
     let rest = msg.strip_prefix("input received fps=")?;
     let (_, tail) = rest.split_once(" audio_pad_bytes=")?;
@@ -1765,6 +1768,91 @@ mod tests {
             f.camera_repeats.len() + f.camera_playout.len()
         );
         assert_eq!(pinned, 4);
+    }
+
+    /// Task E, fix round 2: the driver's OWN `input received` line gives camera-burst its playout tail
+    /// whatever else a beat carries. Fix round 1 appended ` picture=<w>x<h>` after the tail; the tail's
+    /// reader takes the line's last four tokens, so every line with a picture stopped being one and
+    /// camera-burst's `playout_lines` read 1 against 59 (harness run 45903811541). The line is built
+    /// by the driver's own producer for every combination a beat can carry, never typed here; what
+    /// it must read is each combination's own totals.
+    #[test]
+    fn the_drivers_received_line_keeps_its_playout_tail_readable_whatever_else_it_carries() {
+        use app::driver::received_line;
+        use app::ports::{Measured, PictureSize, PlayoutTotals};
+        let rise = PlayoutTotals {
+            repeat_ticks: 2,
+            audio_pad_bytes: 6_400,
+            audio_overflow_bytes: 800,
+            audio_late_bytes: 1_200,
+            reanchors: 3,
+        };
+        let size = PictureSize {
+            width: 1_280,
+            height: 720,
+        };
+        let (mut lines, mut tails, mut with_picture) = (0, 0, 0);
+        for fps in [None, Some(29.9)] {
+            for kbps in [None, Some(3_500)] {
+                for loss in [false, true] {
+                    for picture in [None, Some(size)] {
+                        for playout in [None, Some(rise)] {
+                            let m = Measured {
+                                input_received_fps: fps,
+                                input_received_kbps: kbps,
+                                input_withheld_spans: loss.then_some(0),
+                                input_queue_overruns: loss.then_some(2),
+                                input_picture: picture,
+                                ..Default::default()
+                            };
+                            // The one combination with nothing to say writes no line at all.
+                            let Some(text) = received_line(&m, playout) else {
+                                assert!(
+                                    fps.is_none()
+                                        && kbps.is_none()
+                                        && !loss
+                                        && picture.is_none()
+                                        && playout.is_none(),
+                                    "a beat with something to say wrote no line: {m:?}"
+                                );
+                                continue;
+                            };
+                            lines += 1;
+                            let got: Vec<_> = log_facts(&line(1_000, &text))
+                                .camera_playout
+                                .iter()
+                                .map(|l| {
+                                    (
+                                        l.audio_pad_bytes,
+                                        l.audio_overflow_bytes,
+                                        l.audio_late_bytes,
+                                        l.reanchors,
+                                    )
+                                })
+                                .collect();
+                            let want: Vec<_> = playout
+                                .map(|p| {
+                                    (
+                                        p.audio_pad_bytes,
+                                        p.audio_overflow_bytes,
+                                        p.audio_late_bytes,
+                                        p.reanchors,
+                                    )
+                                })
+                                .into_iter()
+                                .collect();
+                            assert_eq!(got, want, "the playout tail of: {text}");
+                            tails += want.len();
+                            with_picture += usize::from(picture.is_some() && playout.is_some());
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("received lines checked: {lines}, playout tails read: {tails}, with a picture beside the tail: {with_picture}");
+        // 2 x 2 x 2 x 2 x 2 combinations, less the one that says nothing; half of them carry a playout
+        // beat, and half of those a picture.
+        assert_eq!((lines, tails, with_picture), (31, 16, 8));
     }
 
     /// C4's gate (owner ruling, 2026-11-25): the playout's return is the `reanchor(gap` note, with the

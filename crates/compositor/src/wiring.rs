@@ -31,7 +31,7 @@ use adapters::gst_input::GstInput;
 use adapters::gst_programme::GstProgramme;
 use adapters::metrics_proc::{CameraTotals, ProcMetrics};
 use adapters::phase_http::{origin_of, AllowedOrigin, PhaseHttp, RELAY_PHASE_PORT};
-use adapters::stats::{InputLoss, ReceivedBytes, Stats};
+use adapters::stats::{InputLoss, InputPicture, ReceivedBytes, Stats};
 use app::airings::Airings;
 use app::control_worker;
 use app::driver::Driver;
@@ -478,21 +478,42 @@ struct Media {
 }
 
 /// The camera's counters (C2, S4): the frames the input wrote into the programme's camera slot and
-/// the bytes its `srtsrc` put out, every build's.
-struct Camera {
+/// the bytes its `srtsrc` put out, every build's. Public for a test of what its totals carry
+/// (`tests/wiring.rs`).
+#[derive(Debug)]
+pub struct Camera {
     frames: FrameStore,
     received: Arc<ReceivedBytes>,
     /// C3 (S5): the decoder's withheld spans and the pre-decoder queue's overruns, every build's.
     loss: Arc<InputLoss>,
+    /// Task E: the size of the camera's decoded picture, as the open build's decoder announced it.
+    picture: Arc<InputPicture>,
 }
 
 impl Camera {
-    fn totals(&self) -> CameraTotals {
+    /// The counters of the camera whose frames land in `frames`, all at their start.
+    pub fn new(frames: FrameStore) -> Self {
+        Self {
+            frames,
+            received: Arc::new(ReceivedBytes::default()),
+            loss: Arc::new(InputLoss::default()),
+            picture: Arc::new(InputPicture::default()),
+        }
+    }
+
+    /// The handle the input records the picture's size into (`GstInput::with_picture`).
+    pub fn picture(&self) -> Arc<InputPicture> {
+        Arc::clone(&self.picture)
+    }
+
+    /// What the metrics read once a beat.
+    pub fn totals(&self) -> CameraTotals {
         CameraTotals {
             frames_written: self.frames.camera_written(),
             bytes_received: self.received.total(),
             withheld_spans: self.loss.withheld_spans(),
             queue_overruns: self.loss.queue_overruns(),
+            picture: self.picture.size(),
         }
     }
 }
@@ -521,20 +542,18 @@ fn live_media(
     let tap = programme_tap(&mut programme, airings.frames());
     let stats = programme.stats();
     let slot = ProfileSlot::default();
-    let camera = Camera {
-        frames: frames.clone(),
-        received: Arc::new(ReceivedBytes::default()),
-        loss: Arc::new(InputLoss::default()),
-    };
+    let camera = Camera::new(frames.clone());
     let (input_tx, input_log, input_t) = (tx.clone(), log.clone(), t.clone());
     let received = Arc::clone(&camera.received);
     let loss = Arc::clone(&camera.loss);
+    let picture = camera.picture();
     let build: InputBuilder = Box::new(move |p: &OutputProfile| -> Box<dyn InputSource> {
         Box::new(
             GstInput::new(frames.clone(), input_tx.clone(), &input_t, p.width, p.height)
                 .with_log(input_log.adapter_sink())
                 .with_received_bytes(Arc::clone(&received))
-                .with_loss_counts(Arc::clone(&loss)),
+                .with_loss_counts(Arc::clone(&loss))
+                .with_picture(Arc::clone(&picture)),
         )
     });
     Media {

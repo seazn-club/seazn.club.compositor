@@ -26,6 +26,16 @@
 //! channel can never hold the camera slot still: a dropped frame is counted, and `InputConnected` and
 //! `InputMedia` are tried again on the next sample and the next buffer.
 //!
+//! **The camera's own size** (Task E). The appsink's caps are the programme's box, whatever the camera
+//! sends, so the size of the picture as the phone makes it is read one step earlier: a probe on the
+//! decoder's src pad takes each caps event (`avdec_h264`'s output, before `videoconvertscale`) and
+//! records its width and height into the shared `InputPicture` (`with_picture`) for the open build and
+//! for a build the domain gave up and may take back (its first caps can arrive inside the back-off,
+//! before the take-back re-opens the gate), never for a retired one. A retire (`rebuild`, `stop`, the
+//! drop) clears it, so a new build starts with none until its own decoder announces one. A loss or an
+//! abandon does not clear it: the beat's driver keeps the size only while the input link is
+//! connected. A phone turned over inside a build moves it (a new caps event; `tests/input.rs`).
+//!
 //! **Error or EOS is decided when the error is posted** (PR #30 review I1). On a peer close `srtsrc`
 //! posts an error and `basesrc` then pushes an EOS, which reaches the video appsink 1–7 ms later. The
 //! bus's sync handler, on the posting thread and before that EOS exists, closes the gate for the
@@ -115,7 +125,7 @@ pub use crate::input_threads::WorkerCounts;
 use crate::input_threads::{role_counts, task_counts};
 use crate::input_threads::{task_pool, TaskRole, BUILDS};
 use crate::redact::{percent_encoded, Scrubber};
-use crate::stats::{InputLoss, ReceivedBytes, WithheldSpans};
+use crate::stats::{InputLoss, InputPicture, ReceivedBytes, WithheldSpans};
 
 /// The queue before the video decoder holds at most `CAMERA_VIDEO_QUEUE_MS` of compressed video and
 /// then BLOCKS the source, never drops (C3, S5 item 2; the plan's "All leaky" amended 2026-11-24): a
@@ -190,6 +200,29 @@ struct Shared {
 }
 
 impl Shared {
+    /// A gate closed and nothing given up, every count at 0, the log on stderr.
+    fn new(frames: FrameStore, tx: Sender<Inbound>) -> Self {
+        Self {
+            gate: Mutex::new(None),
+            given_up: Mutex::new(None),
+            tx,
+            frames,
+            log: stderr_log(),
+            scrubber: Arc::new(Mutex::new(Scrubber::default())),
+            reapers: Arc::new(AtomicUsize::new(0)),
+            frames_dropped: AtomicU64::new(0),
+            dropping: AtomicBool::new(false),
+            gate_dropped: AtomicU64::new(0),
+            last_frame_gen: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
+            taken_back: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            reaper_delay_ms: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            start_hold: Mutex::new(None),
+        }
+    }
+
     fn log(&self, line: &str) {
         let clean = locked(&self.scrubber).scrub(line);
         (self.log)(&clean);
@@ -237,6 +270,26 @@ impl Shared {
         *given_up = None;
         *open = Some(build);
         true
+    }
+
+    /// Records the size a build's decoder announced (Task E), when that build may: the open build, and
+    /// a build the domain gave up that still runs. The second is deliberate. A connect that timed out
+    /// is given up before its first picture; the camera's first picture inside the back-off is what
+    /// tells the domain it is back (`InputAgain`), and its caps event comes before that picture, with
+    /// the gate shut. A take-back re-opens the gate after the event has passed, so a size kept only
+    /// under the open gate would leave the connected camera with none for the whole build. The driver
+    /// keeps the size off the beat while the link is not connected, so recording it early shows
+    /// nothing early. A retired build (`shut`) is neither, and writes nothing. Both locks are held
+    /// across the write, in `give_up`'s order, so a retire's shut-then-clear cannot fall between the
+    /// check and the store. False when nothing was written (a build that may not write, or a size that
+    /// is no size).
+    fn record_picture(&self, build: u64, picture: &InputPicture, width: i32, height: i32) -> bool {
+        let gate = locked(&self.gate);
+        let given_up = locked(&self.given_up);
+        if *gate != Some(build) && *given_up != Some(build) {
+            return false;
+        }
+        picture.set(width, height)
     }
 
     /// No build passes and none is given up: the gate for a retire (`rebuild`, `stop`, the drop).
@@ -339,6 +392,16 @@ fn srt_connected(src: &gst::Element) -> bool {
         .is_some_and(|s| s.has_field("rtt-ms"))
 }
 
+/// The width and height a caps names, 0 for a side it does not (a refused size to `InputPicture`).
+fn caps_size(caps: &gst::CapsRef) -> (i32, i32) {
+    let side = |name| {
+        caps.structure(0)
+            .and_then(|s| s.get::<i32>(name).ok())
+            .unwrap_or(0)
+    };
+    (side("width"), side("height"))
+}
+
 /// The live `InputSource` (C10).
 pub struct GstInput {
     shared: Arc<Shared>,
@@ -357,6 +420,9 @@ pub struct GstInput {
     received: Arc<ReceivedBytes>,
     /// The camera's losses before the picture (C3, S5; `with_loss_counts`).
     loss: Arc<InputLoss>,
+    /// The size of the camera's decoded picture, as the open build's decoder announced it (Task E;
+    /// `with_picture`).
+    picture: Arc<InputPicture>,
     /// A withheld span's least length: the programme's freeze (`Thresholds::frozen_after_ms`).
     withheld_min: Duration,
 }
@@ -391,25 +457,7 @@ impl GstInput {
     /// into. It loads the pipeline's plugins (`INPUT_FACTORIES`), so build it before the loop starts.
     pub fn new(frames: FrameStore, tx: Sender<Inbound>, t: &Thresholds, out_w: u32, out_h: u32) -> Self {
         let input = Self {
-            shared: Arc::new(Shared {
-                gate: Mutex::new(None),
-                given_up: Mutex::new(None),
-                tx,
-                frames,
-                log: stderr_log(),
-                scrubber: Arc::new(Mutex::new(Scrubber::default())),
-                reapers: Arc::new(AtomicUsize::new(0)),
-                frames_dropped: AtomicU64::new(0),
-                dropping: AtomicBool::new(false),
-                gate_dropped: AtomicU64::new(0),
-                last_frame_gen: AtomicU64::new(0),
-                abandoned: AtomicU64::new(0),
-                taken_back: AtomicU64::new(0),
-                #[cfg(feature = "test-hooks")]
-                reaper_delay_ms: AtomicU64::new(0),
-                #[cfg(feature = "test-hooks")]
-                start_hold: Mutex::new(None),
-            }),
+            shared: Arc::new(Shared::new(frames, tx)),
             latency_ms: t.input_srt_latency_ms,
             out_w,
             out_h,
@@ -420,6 +468,7 @@ impl GstInput {
             events_dropped: 0,
             received: Arc::new(ReceivedBytes::default()),
             loss: Arc::new(InputLoss::default()),
+            picture: Arc::new(InputPicture::default()),
             withheld_min: Duration::from_millis(t.frozen_after_ms),
         };
         input.preload();
@@ -437,6 +486,15 @@ impl GstInput {
     /// shared with the metrics (`ProcMetrics::with_camera`). Call it before the first `rebuild`.
     pub fn with_loss_counts(mut self, loss: Arc<InputLoss>) -> Self {
         self.loss = loss;
+        self
+    }
+
+    /// Records the size of the camera's decoded picture into `picture` (Task E), shared with the metrics
+    /// (`ProcMetrics::with_camera`): what the open build's decoder announced, before the scaler fits it
+    /// into the programme's box, and nothing once the build is retired. Call it before the first
+    /// `rebuild`.
+    pub fn with_picture(mut self, picture: Arc<InputPicture>) -> Self {
+        self.picture = picture;
         self
     }
 
@@ -646,6 +704,9 @@ impl GstInput {
     /// Closes the gate and tells the current build's thread to tear its pipeline down. Returns at once.
     fn retire_current(&mut self) {
         self.shared.shut();
+        // After the gate: a caps event of the retired build finds it shut and records nothing, so
+        // this forgets the size for good (Task E).
+        self.picture.clear();
         if let Some(live) = self.current.take() {
             if live.running {
                 // Counted before the flag is set: the build's thread counts down once it sees it.
@@ -765,6 +826,22 @@ impl GstInput {
                 gst::PadProbeReturn::Ok
             })
             .ok_or("the decoder's output probe was refused")?;
+        // Task E: the size the decoder announces, before `videoconvertscale` fits the picture into the
+        // programme's box (the appsink's own caps are the programme's, whatever the camera sends). One
+        // caps event opens the stream and another follows each change (a phone turned over, a
+        // transcode change). Written by the open build, or by one the domain gave up and may take back
+        // (`Shared::record_picture`), never by a retired one.
+        let (picture, open) = (Arc::clone(&self.picture), Arc::clone(&self.shared));
+        vdec.static_pad("src")
+            .ok_or("avdec_h264 has no src pad")?
+            .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                if let Some(gst::EventView::Caps(caps)) = info.event().map(|e| e.view()) {
+                    let (w, h) = caps_size(caps.caps());
+                    open.record_picture(build, &picture, w, h);
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or("the decoder's caps probe was refused")?;
         // The owner's ruling, 2026-10-19 (Owed 48): a frame with damaged macroblocks is dropped, so
         // after a loss the slot holds the last good picture for a moment instead of airing smears.
         vdec.set_property("output-corrupt", false);
@@ -1465,7 +1542,134 @@ fn appsink(name: &str) -> Result<gst_app::AppSink, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_url;
+    use super::{check_url, Shared};
+    use crate::frame_store::FrameStore;
+    use crate::stats::InputPicture;
+    use app::ports::PictureSize;
+
+    fn shared() -> Shared {
+        Shared::new(FrameStore::default(), crossbeam_channel::bounded(8).0)
+    }
+
+    fn open(s: &Shared, build: u64) {
+        *s.gate.lock().unwrap() = Some(build);
+    }
+
+    fn size(width: u32, height: u32) -> Option<PictureSize> {
+        Some(PictureSize { width, height })
+    }
+
+    /// Task E, which build's decoder may write the camera's size: the open build, and a build the
+    /// domain gave up while it still runs (its camera may come back by `take_back`, and its first
+    /// caps can arrive inside the back-off, before the gate is re-opened); never a retired build, a
+    /// build that is neither, or a size that is no size. Each case reads the size a fresh
+    /// `InputPicture` ends with.
+    #[test]
+    fn a_decoders_size_is_recorded_for_the_open_or_given_up_build_only() {
+        let mut checked = 0;
+        let mut case =
+            |what: &str, run: &dyn Fn(&Shared, &InputPicture) -> bool, want: Option<PictureSize>| {
+                let (s, p) = (shared(), InputPicture::default());
+                let recorded = run(&s, &p);
+                assert_eq!(recorded, want.is_some(), "{what}: recorded");
+                assert_eq!(p.size(), want, "{what}: the size");
+                checked += 1;
+            };
+        // The empty case: no build is live, whichever generation asks.
+        case("nothing live", &|s, p| s.record_picture(1, p, 640, 360), None);
+        // The open build writes, and only it.
+        case(
+            "the open build",
+            &|s, p| {
+                open(s, 1);
+                s.record_picture(1, p, 640, 360)
+            },
+            size(640, 360),
+        );
+        case(
+            "another build while 1 is open",
+            &|s, p| {
+                open(s, 1);
+                s.record_picture(2, p, 640, 360)
+            },
+            None,
+        );
+        // Given up (the connect timed out): the build still runs and may be taken back, so its size
+        // is kept; the build before and after it are not.
+        case(
+            "given up",
+            &|s, p| {
+                open(s, 1);
+                s.give_up(1);
+                s.record_picture(1, p, 1_920, 1_080)
+            },
+            size(1_920, 1_080),
+        );
+        case(
+            "another build while 1 is given up",
+            &|s, p| {
+                open(s, 1);
+                s.give_up(1);
+                s.record_picture(2, p, 1_920, 1_080)
+            },
+            None,
+        );
+        // Retired (`rebuild`, `stop`, the drop): neither open nor given up, so nothing is written.
+        case(
+            "retired while open",
+            &|s, p| {
+                open(s, 1);
+                s.shut();
+                s.record_picture(1, p, 640, 360)
+            },
+            None,
+        );
+        case(
+            "retired after a give-up",
+            &|s, p| {
+                open(s, 1);
+                s.give_up(1);
+                s.shut();
+                s.record_picture(1, p, 640, 360)
+            },
+            None,
+        );
+        // An error after the give-up clears the mark (`error_of`): that build is lost, not kept.
+        case(
+            "a given-up build that then errored",
+            &|s, p| {
+                open(s, 1);
+                s.give_up(1);
+                *s.given_up.lock().unwrap() = None;
+                s.record_picture(1, p, 640, 360)
+            },
+            None,
+        );
+        // A side that is no size is refused, and forgets the size before it.
+        case(
+            "a zero width",
+            &|s, p| {
+                open(s, 1);
+                p.set(640, 360);
+                s.record_picture(1, p, 0, 360)
+            },
+            None,
+        );
+        // A take-back re-opens the gate and keeps the size the build's decoder announced meanwhile.
+        case(
+            "taken back",
+            &|s, p| {
+                open(s, 1);
+                s.give_up(1);
+                let recorded = s.record_picture(1, p, 1_920, 1_080);
+                assert!(s.reopen(1), "the take-back");
+                recorded
+            },
+            size(1_920, 1_080),
+        );
+        eprintln!("record_picture cases checked: {checked}");
+        assert_eq!(checked, 10);
+    }
 
     #[test]
     fn only_a_bare_srt_host_and_port_is_taken() {

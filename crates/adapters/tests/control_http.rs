@@ -1018,13 +1018,15 @@ fn the_sessions_credentials_are_scrubbed_by_value_from_the_final_beat_and_errors
 #[test]
 fn the_camera_keys_are_posted_only_by_a_plane_with_them_on() {
     use domain::input_link::{GiveUp, GiveUpReason};
-    const KEYS: [&str; 6] = [
+    const KEYS: [&str; 8] = [
         "inputGiveUpReason",
         "inputGiveUpGen",
         "inputReceivedFps",
         "inputReceivedKbps",
         "inputWithheldSpans",
         "inputQueueOverruns",
+        "inputWidth",
+        "inputHeight",
     ];
     let h = HealthReport {
         input_give_up: Some(GiveUp {
@@ -1038,6 +1040,11 @@ fn the_camera_keys_are_posted_only_by_a_plane_with_them_on() {
         input_received_kbps: Some(2_500),
         input_withheld_spans: Some(7),
         input_queue_overruns: Some(3),
+        // Task E: a phone's own size, not the 1280x720 programme's.
+        input_picture: Some(app::ports::PictureSize {
+            width: 1_920,
+            height: 1_080,
+        }),
         ..Measured::default()
     };
     let mut checked = 0;
@@ -1066,6 +1073,8 @@ fn the_camera_keys_are_posted_only_by_a_plane_with_them_on() {
                 assert_eq!(posted["inputReceivedKbps"], 2_500);
                 assert_eq!(posted["inputWithheldSpans"], 7);
                 assert_eq!(posted["inputQueueOverruns"], 3);
+                assert_eq!(posted["inputWidth"], 1_920);
+                assert_eq!(posted["inputHeight"], 1_080);
             } else {
                 assert_eq!(posted, heartbeat_wire(beat, &m), "{keys:?}");
                 for k in KEYS {

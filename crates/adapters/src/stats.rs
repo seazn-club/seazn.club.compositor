@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use app::ports::PlayoutTotals;
+use app::ports::{PictureSize, PlayoutTotals};
 use domain::config::OUTPUT_FPS_MIN_WINDOW_MS;
 
 use crate::playout::Counts;
@@ -81,6 +81,49 @@ impl InputLoss {
 
     pub fn queue_overruns(&self) -> u64 {
         self.queue_overruns.load(Ordering::Relaxed)
+    }
+}
+
+/// The size of the camera's decoded picture, as its decoder announced it, before the input's scaler
+/// fits it into the programme's box (Task E: the beat's `inputWidth` and `inputHeight`). One value
+/// for the process, shared as `ReceivedBytes` is: every `GstInput` the process builds writes it
+/// (`GstInput::with_picture`) and `ProcMetrics` reads it once a beat (`CameraTotals`). `None` until a
+/// build's decoder has announced a size, and again once the build that announced it is retired.
+#[derive(Debug, Default)]
+pub struct InputPicture(AtomicU64);
+
+impl InputPicture {
+    /// Records `width` x `height` as the camera's picture. A side that is not a whole positive number
+    /// is no size: it is refused (false) and the last one is forgotten, so a caps without a usable
+    /// size reads as absent, never as the camera before it.
+    pub fn set(&self, width: i32, height: i32) -> bool {
+        match (u32::try_from(width), u32::try_from(height)) {
+            (Ok(w @ 1..), Ok(h @ 1..)) => {
+                self.0.store(u64::from(w) << 32 | u64::from(h), Ordering::Relaxed);
+                true
+            }
+            _ => {
+                self.clear();
+                false
+            }
+        }
+    }
+
+    /// Forgets the size: no build is there to announce one.
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    /// The last size recorded; `None` before one, after a clear, and after a refused one. The packed
+    /// word is never 0 for a size (its width is at least 1), so 0 is free to mean none.
+    pub fn size(&self) -> Option<PictureSize> {
+        match self.0.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(PictureSize {
+                width: (v >> 32) as u32,
+                height: v as u32,
+            }),
+        }
     }
 }
 
@@ -464,6 +507,50 @@ mod tests {
         checked += 1;
         eprintln!("withheld-span steps checked: {checked}");
         assert_eq!(checked, 6);
+    }
+
+    // Task E: the camera's picture size in sequence: nothing before a build, a set size read back
+    // whole, the newer size replacing it (a rotation or a transcode change sends new caps), a refused
+    // one forgetting it, and a clear. The sizes are a camera's own, in both orientations, and none is
+    // the programme's, so a read that returned the output's box would not match.
+    #[test]
+    fn the_cameras_picture_size_is_the_last_one_announced_and_absent_when_not_known() {
+        let p = InputPicture::default();
+        assert_eq!(p.size(), None, "nothing before a build announced one");
+        let size = |width, height| Some(PictureSize { width, height });
+        let mut checked = 0;
+        for (w, h) in [(640, 360), (1_920, 1_080), (720, 1_280), (3_840, 2_160)] {
+            assert!(p.set(w, h), "{w}x{h} is a size");
+            assert_eq!(p.size(), size(w as u32, h as u32), "{w}x{h}");
+            checked += 1;
+        }
+        // Each side alone is read back as its own side (a width/height swap would show here).
+        assert!(p.set(1_000, 7));
+        assert_eq!(p.size(), size(1_000, 7));
+        checked += 1;
+        // A refused size forgets the last one.
+        for (w, h) in [
+            (0, 720),
+            (1_280, 0),
+            (-1, 720),
+            (1_280, -720),
+            (0, 0),
+            (i32::MIN, i32::MIN),
+        ] {
+            assert!(p.set(1_280, 720));
+            assert!(!p.set(w, h), "{w}x{h} is not a size");
+            assert_eq!(p.size(), None, "{w}x{h} forgets the size before it");
+            checked += 1;
+        }
+        // A clear forgets it, and clearing nothing is harmless (a second call).
+        assert!(p.set(1_280, 720));
+        p.clear();
+        assert_eq!(p.size(), None);
+        p.clear();
+        assert_eq!(p.size(), None);
+        checked += 2;
+        eprintln!("picture sizes checked: {checked}");
+        assert_eq!(checked, 4 + 1 + 6 + 2);
     }
 
     #[test]

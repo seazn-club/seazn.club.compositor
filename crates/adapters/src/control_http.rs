@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use app::ports::{
     redacted_origin, ControlPlane, FetchError, FrameUpload, FrameUploadError, HeartbeatError, InputSpec,
-    Measured, Reply, SessionConfig, TargetSpec, FINAL_BEAT_TIMEOUT_MS,
+    Measured, PictureSize, Reply, SessionConfig, TargetSpec, FINAL_BEAT_TIMEOUT_MS,
 };
 use domain::airings::{AiringBatch, AiringLine};
 use domain::config::{OutputProfile, FRAME_UPLOAD_TIMEOUT_MS};
@@ -46,6 +46,10 @@ const JSON_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// The contract's `exitDetail` `maxLength` (100 characters, i.e. Unicode scalar values; F-006, #966
 /// review M1): within it, any text fits web's zod bound of 200 UTF-16 units.
 const EXIT_DETAIL_MAX_CHARS: usize = 100;
+/// The proposed contract's `maximum` on `inputWidth` and `inputHeight` (16 384 px a side; their
+/// `minimum` is 1; `docs/specs/2026-11-26-heartbeat-input-picture.proposed.json`). A size outside
+/// them is no camera's: it would be a 400 and the beat lost, so neither side is sent.
+const INPUT_PICTURE_MAX_PX: u32 = 16_384;
 /// The most of a reply body read. The contract's largest reply, the session, is about 1 KiB; this
 /// bounds what a misbehaving server can make the compositor buffer (AGENTS.md §4: nothing unbounded).
 /// A longer body reads as cut, which is transient.
@@ -145,6 +149,13 @@ fn measurement(x: Option<f64>) -> Option<Value> {
     x.filter(|v| v.is_finite() && *v >= 0.0).map(Value::from)
 }
 
+/// The picture size the proposed contract admits: each side a whole number from 1 to
+/// `INPUT_PICTURE_MAX_PX`.
+fn picture_fits(p: &PictureSize) -> bool {
+    let side = 1..=INPUT_PICTURE_MAX_PX;
+    side.contains(&p.width) && side.contains(&p.height)
+}
+
 /// The beat's `fps` (the programme's real output rate over the beat window, Owed 86), a measurement
 /// sent to one decimal: the coordinator's decision, 2026-10-24, on the PR #69 review's I2, so R1's
 /// chip reads "30 fps" or "11.5 fps", never the raw f64. Rounded after the measurement check, so a
@@ -171,7 +182,7 @@ pub fn heartbeat_wire_with(report: &HealthReport, measured: &Measured, airings: 
 
 /// `heartbeat_wire` with the camera's keys on (C2, S4; `RELAY_INPUT_BEAT`): `inputGiveUpReason`,
 /// `inputGiveUpGen`, `inputReceivedFps` and `inputReceivedKbps`, and (C3, S5) `inputWithheldSpans`
-/// and `inputQueueOverruns`, each when known.
+/// and `inputQueueOverruns`, and (Task E) `inputWidth` with `inputHeight`, each when known.
 pub fn heartbeat_wire_input(report: &HealthReport, measured: &Measured) -> Value {
     wire(
         report,
@@ -276,6 +287,11 @@ fn wire(
         }
         if let Some(n) = measured.input_queue_overruns {
             put("inputQueueOverruns", int(n));
+        }
+        // Task E: the camera's decoded picture size, as a pair or not at all.
+        if let Some(p) = measured.input_picture.filter(picture_fits) {
+            put("inputWidth", p.width.into());
+            put("inputHeight", p.height.into());
         }
     }
     // The exit keys ride only a `stopped` beat (the contract's if/then; web answers 400 otherwise).

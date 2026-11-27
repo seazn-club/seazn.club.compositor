@@ -5,7 +5,7 @@ use adapters::control_http::{
     programme_phase_wire,
 };
 use adapters::sponsor_line::{parse_sponsor_line, END_KEYS, SOURCE_WORDS, START_KEYS, STYLE_WORDS};
-use app::ports::{FetchError, Measured, PlayoutTotals};
+use app::ports::{FetchError, Measured, PictureSize, PlayoutTotals};
 use domain::airings::{
     is_utc_instant, AiringBatch, AiringBuffer, AiringLine, AiringSource, AiringStyle, LineRefusal,
     AIRING_BREAK_KIND_MAX_UNITS, AIRING_BUFFER_CAP, AIRING_ID_MAX_UNITS,
@@ -191,6 +191,11 @@ fn full_measured() -> Measured {
         input_received_kbps: Some(3_500),
         input_withheld_spans: Some(4),
         input_queue_overruns: Some(2),
+        // Task E: a camera's own size, not the 1280x720 programme's.
+        input_picture: Some(PictureSize {
+            width: 1_920,
+            height: 1_080,
+        }),
     }
 }
 
@@ -474,6 +479,8 @@ fn a_measured_zero_is_sent_as_zero() {
         input_received_kbps: Some(0),
         input_withheld_spans: Some(0),
         input_queue_overruns: Some(0),
+        // Not on a default beat either (Task E): `an_input_beat_carries_the_pictures_size_…`.
+        input_picture: None,
     };
     let wire = heartbeat_wire(&report(), &m);
     let mut checked = 0;
@@ -591,16 +598,35 @@ fn camera_playout_stays_off_the_wire() {
 
 // ---- C2 (S4): the camera's keys, proposed for web's T44 ----
 
-/// The four keys C2 proposes for the contract (`docs/specs/2026-11-24-heartbeat-input-keys.proposed.json`,
-/// outside `contracts/`, which is never hand-edited).
-fn proposed_input_keys() -> serde_json::Map<String, Value> {
+/// The files that propose the camera's keys for the contract, outside `contracts/` (never hand-edited):
+/// C2's four and C3's two (`docs/specs/2026-11-24-heartbeat-input-keys.proposed.json`, web's T44 pinned
+/// that file's bytes, so it stays as it was) and Task E's two (the picture size, its own file).
+const PROPOSAL_FILES: [&str; 2] = [
+    "2026-11-24-heartbeat-input-keys.proposed.json",
+    "2026-11-26-heartbeat-input-picture.proposed.json",
+];
+
+/// One proposal file's keys.
+fn proposed_keys_in(file: &str) -> serde_json::Map<String, Value> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/specs/2026-11-24-heartbeat-input-keys.proposed.json");
+        .join("../../docs/specs")
+        .join(file);
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
     doc["properties"]
         .as_object()
         .expect("the proposal's properties")
         .clone()
+}
+
+/// Every camera key proposed for the contract, the files' together (no key is in two of them).
+fn proposed_input_keys() -> serde_json::Map<String, Value> {
+    let mut all = serde_json::Map::new();
+    for f in PROPOSAL_FILES {
+        for (k, v) in proposed_keys_in(f) {
+            assert!(all.insert(k.clone(), v).is_none(), "{k} is proposed twice");
+        }
+    }
+    all
 }
 
 /// The vendored contract with the proposal's keys added to `heartbeat` (what web will enforce once
@@ -642,8 +668,8 @@ fn the_camera_keys_stay_off_a_default_beat_and_the_vendored_contract_refuses_the
         .expect("the heartbeat's properties")
         .clone();
     let proposed = proposed_input_keys();
-    // C2's four and C3's two (S5: the loss totals).
-    assert_eq!(proposed.len(), 6, "the proposal's keys: {:?}", proposed.keys());
+    // C2's four, C3's two (S5: the loss totals) and Task E's two (the picture size).
+    assert_eq!(proposed.len(), 8, "the proposals' keys: {:?}", proposed.keys());
     let mut checked = 0;
     for r in all_give_up_reasons() {
         let h = HealthReport {
@@ -655,6 +681,10 @@ fn the_camera_keys_stay_off_a_default_beat_and_the_vendored_contract_refuses_the
             input_received_kbps: Some(2_500),
             input_withheld_spans: Some(3),
             input_queue_overruns: Some(1),
+            input_picture: Some(PictureSize {
+                width: 1_920,
+                height: 1_080,
+            }),
             ..Measured::default()
         };
         let wire = heartbeat_wire(&h, &m);
@@ -763,6 +793,103 @@ fn an_input_beat_writes_the_proposed_keys_and_only_their_words() {
     }
     eprintln!("input beats checked: {checked}");
     assert_eq!(checked, 6 * 3 + 3);
+}
+
+/// Task E: the camera's picture size on an input beat. Both sides ride together as whole numbers
+/// inside the proposal's own bounds (read from the proposal, never typed here), nothing rides with no
+/// size known, a default beat (`RELAY_INPUT_BEAT` unset) never carries either whatever the sampler
+/// holds, and a size outside the bounds is dropped as a PAIR (a 400 would lose the whole beat). The
+/// sizes are a phone's own, in both orientations, and none is the 1280x720 programme.
+#[test]
+fn an_input_beat_carries_the_pictures_size_as_a_pair_inside_the_proposals_bounds() {
+    let v = heartbeat_with_proposal();
+    let default_v = schema_def("heartbeat");
+    let proposal = proposed_keys_in("2026-11-26-heartbeat-input-picture.proposed.json");
+    assert_eq!(
+        proposal.keys().cloned().collect::<Vec<_>>(),
+        ["inputHeight", "inputWidth"],
+        "the file declares the two keys, nothing else"
+    );
+    let bound = |key: &str, which: &str| proposal[key]["anyOf"][0][which].as_u64().expect(which) as u32;
+    let (min, max) = (bound("inputWidth", "minimum"), bound("inputWidth", "maximum"));
+    assert_eq!(
+        (bound("inputHeight", "minimum"), bound("inputHeight", "maximum")),
+        (min, max),
+        "the two sides share their bounds"
+    );
+    assert!(
+        min >= 1 && max > min,
+        "premise: the proposal's bounds {min}..{max}"
+    );
+    let beat = |size: Option<PictureSize>| {
+        heartbeat_wire_input(
+            &report(),
+            &Measured {
+                input_picture: size,
+                ..Measured::default()
+            },
+        )
+    };
+    let size = |width, height| Some(PictureSize { width, height });
+    let mut checked = 0;
+    // In bounds: each side its own, the pair validates against the contract plus the proposal.
+    for (w, h) in [
+        (1_920, 1_080),
+        (720, 1_280),
+        (640, 360),
+        (min, min),
+        (max, max),
+        (max, min),
+        (min, max),
+    ] {
+        let wire = beat(size(w, h));
+        assert_eq!(wire["inputWidth"], w, "{w}x{h}: {wire}");
+        assert_eq!(wire["inputHeight"], h, "{w}x{h}: {wire}");
+        assert!(violations(&v, &wire).is_empty(), "{w}x{h}: {wire}");
+        checked += 1;
+    }
+    // No size known: neither key, and the beat validates.
+    let none = beat(None);
+    assert!(
+        none.get("inputWidth").is_none() && none.get("inputHeight").is_none(),
+        "{none}"
+    );
+    assert!(violations(&v, &none).is_empty(), "{none}");
+    checked += 1;
+    // Outside the bounds: dropped as a pair, whichever side is out, and the beat still validates.
+    for (w, h) in [
+        (0, 720),
+        (1_280, 0),
+        (0, 0),
+        (max + 1, 720),
+        (1_280, max + 1),
+        (u32::MAX, u32::MAX),
+    ] {
+        let wire = beat(size(w, h));
+        assert!(
+            wire.get("inputWidth").is_none() && wire.get("inputHeight").is_none(),
+            "{w}x{h} is outside {min}..{max}: {wire}"
+        );
+        assert!(violations(&v, &wire).is_empty(), "{w}x{h}: {wire}");
+        checked += 1;
+    }
+    // A default beat never carries them, whatever the sampler holds, and validates against the
+    // vendored contract as it stands.
+    let default = heartbeat_wire(
+        &report(),
+        &Measured {
+            input_picture: size(1_920, 1_080),
+            ..Measured::default()
+        },
+    );
+    assert!(
+        default.get("inputWidth").is_none() && default.get("inputHeight").is_none(),
+        "{default}"
+    );
+    assert!(violations(&default_v, &default).is_empty(), "{default}");
+    checked += 1;
+    eprintln!("picture beats checked: {checked}");
+    assert_eq!(checked, 7 + 1 + 6 + 1);
 }
 
 /// "Never inserts a key whose value is unknown": a NaN or an infinity is not a measurement (JSON has
